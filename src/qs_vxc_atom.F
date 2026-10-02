@@ -1294,6 +1294,8 @@ CONTAINS
                                  cross_displacement = composite_grid_coords(:, composite_row) - &
                                                       particle_set(source_atom)%r - &
                                                       image_translation
+                                 ! Reject inactive images before allocating interpolation scratch.
+                                 IF (SQRT(SUM(cross_displacement**2)) > cross_cutoff) CYCLE
                                  CALL interpolate_gapw_atom_grid_fields( &
                                     grid_atom, harmonics, cross_displacement, cross_cutoff, nspins, &
                                     rho_h, rho_s, drho_h, drho_s, tau_h, tau_s, &
@@ -1780,6 +1782,8 @@ CONTAINS
                                     cross_displacement = &
                                        composite_grid_coords(:, composite_row) - &
                                        particle_set(source_atom)%r - image_translation
+                                    ! Reject inactive images before allocating interpolation scratch.
+                                    IF (SQRT(SUM(cross_displacement**2)) > cross_cutoff) CYCLE
                                     CALL interpolate_gapw_atom_grid_fields( &
                                        grid_atom, harmonics, cross_displacement, cross_cutoff, &
                                        nspins, rho_h, rho_s, drho_h, drho_s, tau_h, tau_s, &
