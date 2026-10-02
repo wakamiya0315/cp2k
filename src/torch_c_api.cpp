@@ -34,6 +34,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #if defined(__OPENBLAS)
 // PyTorch's oneMKL batch ABI is not compatible with OpenBLAS's same-named
 // entry points. Expand grouped GEMMs into the portable CBLAS interface.
@@ -141,6 +145,15 @@ static void initialize_torch_threads_from_env() {
   int num_threads = 0;
   if (get_positive_int_env("CP2K_TORCH_NUM_THREADS", num_threads)) {
     at::set_num_threads(num_threads);
+  } else {
+#if defined(_OPENMP)
+    // LibTorch shares the OpenMP runtime with CP2K. Without an explicit thread
+    // count, its lazy initialization resets the OpenMP pool to MKL's thread
+    // count (MKL_NUM_THREADS), which serializes CP2K after the first Torch call
+    // and corrupts per-thread work sized before that call (for example the
+    // native SKALA COMMON_GRID layout). Keep the thread count CP2K runs with.
+    at::set_num_threads(omp_get_max_threads());
+#endif
   }
   if (get_positive_int_env("CP2K_TORCH_NUM_INTEROP_THREADS", num_threads)) {
     at::set_num_interop_threads(num_threads);
