@@ -3574,8 +3574,10 @@ CONTAINS
       radial_indices = 0
       radial_weights = 0.0_dp
       IF (PRESENT(radial_derivative_weights)) radial_derivative_weights = 0.0_dp
-      angular_weights = 0.0_dp
-      IF (PRESENT(angular_derivative_weights)) angular_derivative_weights = 0.0_dp
+      ! The angular weights are not zeroed: both callers read them only for an active point,
+      ! and an active point assigns every entry below. Zeroing them on every call, mostly for
+      ! points outside the atomic grid that return at once, took about half of the CPU time
+      ! of native SKALA with GAPW_XC.
       nradial = 0
       active = .FALSE.
       n = grid_atom%nr
