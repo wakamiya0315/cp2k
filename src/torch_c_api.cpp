@@ -28,8 +28,15 @@
 #include <cfenv>
 #include <climits>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <map>
 #include <mutex>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -83,6 +90,77 @@ cblas_dgemm_batch(const CBLAS_ORDER order, const CBLAS_TRANSPOSE *trans_a,
 typedef torch::Tensor torch_c_tensor_t;
 typedef c10::Dict<std::string, torch::Tensor> torch_c_dict_t;
 typedef torch::jit::Module torch_c_model_t;
+
+// Retain only the most recent SCF energy evaluation. Force evaluations are not
+// captured: the SCF driver closes the capture before calculating properties.
+static bool skala_capture_enabled = false;
+static std::mutex skala_capture_mutex;
+static std::vector<std::map<std::string, torch::Tensor>> skala_feature_batches;
+static std::vector<double> skala_batch_xc;
+
+static void write_feature_npy(const std::filesystem::path &path,
+                              const torch::Tensor &tensor) {
+  const char *dtype = nullptr;
+  switch (tensor.scalar_type()) {
+  case torch::kFloat64:
+    dtype = "<f8";
+    break;
+  case torch::kFloat32:
+    dtype = "<f4";
+    break;
+  case torch::kInt64:
+    dtype = "<i8";
+    break;
+  case torch::kInt32:
+    dtype = "<i4";
+    break;
+  default:
+    throw std::runtime_error("Unsupported Skala feature dtype");
+  }
+  const uint16_t endian_probe = 1;
+  if (*reinterpret_cast<const char *>(&endian_probe) != 1) {
+    throw std::runtime_error("Skala feature NPY writer requires little endian");
+  }
+  std::ostringstream header;
+  header << "{'descr': '" << dtype
+         << "', 'fortran_order': False, 'shape': (";
+  for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+    header << tensor.size(dim) << ",";
+  }
+  header << "), }";
+  std::string value = header.str();
+  value.append((64 - ((10 + value.size() + 1) % 64)) % 64, ' ');
+  value += '\n';
+  if (value.size() > UINT16_MAX) {
+    throw std::runtime_error("Skala feature NPY header is too long");
+  }
+  std::ofstream file(path, std::ios::binary);
+  file.exceptions(std::ios::failbit | std::ios::badbit);
+  file.write("\x93NUMPY\x01\x00", 8);
+  const char length[2] = {static_cast<char>(value.size() & 255),
+                          static_cast<char>(value.size() >> 8)};
+  file.write(length, 2);
+  file.write(value.data(), value.size());
+  if (tensor.numel() > 0) {
+    file.write(static_cast<const char *>(tensor.const_data_ptr()),
+               tensor.numel() * tensor.element_size());
+  }
+}
+
+static void capture_skala_features(const torch_c_dict_t &inputs,
+                                   const torch::Tensor &output) {
+  std::map<std::string, torch::Tensor> batch;
+  for (const auto &entry : inputs) {
+    // clone is necessary: CP2K reuses the Fortran arrays in the next SCF step.
+    batch.emplace(entry.key(),
+                  entry.value().detach().to(torch::kCPU).contiguous().clone());
+  }
+  const auto weights = inputs.at("grid_weights").to(output.device());
+  const double xc = (output.detach() * weights).sum().item<double>();
+  std::lock_guard<std::mutex> lock(skala_capture_mutex);
+  skala_feature_batches.push_back(std::move(batch));
+  skala_batch_xc.push_back(xc);
+}
 
 class TorchFloatingPointMaskGuard {
 public:
@@ -369,6 +447,53 @@ static void *get_data_ptr(const torch_c_tensor_t *tensor,
 
 #ifdef __cplusplus
 extern "C" {
+
+void torch_c_skala_feature_begin() {
+  const char *path = std::getenv("CP2K_SKALA_FEATURE_DUMP");
+  skala_capture_enabled = path != nullptr && path[0] != '\0';
+  if (skala_capture_enabled) {
+    skala_feature_batches.clear();
+    skala_batch_xc.clear();
+  }
+}
+
+bool torch_c_skala_feature_flush() {
+  const bool enabled = skala_capture_enabled;
+  skala_capture_enabled = false;
+  if (!enabled || skala_feature_batches.empty()) {
+    return false;
+  }
+  const std::filesystem::path root(std::getenv("CP2K_SKALA_FEATURE_DUMP"));
+  std::filesystem::create_directories(root);
+  std::ofstream manifest(root / "features.json");
+  manifest.exceptions(std::ios::failbit | std::ios::badbit);
+  manifest << std::setprecision(17)
+           << "{\"schema\": \"cp2k-skala-features-v1\", \"protocol\": 2, "
+           << "\"phase\": \"last_scf_energy_evaluation\", \"batches\": [\n";
+  for (size_t batch = 0; batch < skala_feature_batches.size(); ++batch) {
+    if (batch > 0) {
+      manifest << ",\n";
+    }
+    manifest << "{\"xc_hartree\": " << skala_batch_xc[batch]
+             << ", \"tensors\": {";
+    bool first = true;
+    for (const auto &entry : skala_feature_batches[batch]) {
+      const std::string name = "batch_" + std::to_string(batch) + "_" +
+                               entry.first + ".npy";
+      write_feature_npy(root / name, entry.second);
+      if (!first) {
+        manifest << ", ";
+      }
+      first = false;
+      manifest << "\"" << entry.first << "\": \"" << name << "\"";
+    }
+    manifest << "}}";
+  }
+  manifest << "\n]}\n";
+  skala_feature_batches.clear();
+  skala_batch_xc.clear();
+  return true;
+}
 #endif
 
 /*******************************************************************************
@@ -756,6 +881,9 @@ void torch_c_model_forward_mol_tensor(torch_c_model_t *model,
   assert(*output == NULL);
   *output = new torch_c_tensor_t(
       model->get_method(method_name)({*inputs}).toTensor());
+  if (skala_capture_enabled && std::strcmp(method_name, "get_exc_density") == 0) {
+    capture_skala_features(*inputs, **output);
+  }
 }
 
 /*******************************************************************************

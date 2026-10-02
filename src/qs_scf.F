@@ -46,6 +46,7 @@
 ! **************************************************************************************************
 MODULE qs_scf
    USE atomic_kind_types,               ONLY: atomic_kind_type
+   USE cell_types,                      ONLY: cell_type
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
@@ -56,7 +57,8 @@ MODULE qs_scf
                                               copy_fm_to_dbcsr,&
                                               cp_dbcsr_m_by_n_from_row_template,&
                                               dbcsr_deallocate_matrix_set
-   USE cp_files,                        ONLY: close_file
+   USE cp_files,                        ONLY: close_file, open_file
+   USE cp2k_info,                       ONLY: compile_revision
    USE cp_fm_pool_types,                ONLY: cp_fm_pool_p_type
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
@@ -94,7 +96,8 @@ MODULE qs_scf
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
-                                              section_vals_val_get
+                                              section_vals_val_get,&
+                                              section_vals_write
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
@@ -233,6 +236,7 @@ MODULE qs_scf
                                               tb_native_scc_mixer_active,&
                                               tb_scf_mixer_error,&
                                               tb_update_charges
+   USE torch_api,                       ONLY: torch_skala_feature_begin, torch_skala_feature_flush
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -420,6 +424,7 @@ CONTAINS
       REAL(KIND=dp), PARAMETER :: adiis_stagnation_ratio = 1.0E-2_dp
 
       CHARACTER(LEN=default_string_length)               :: description, name
+      CHARACTER(LEN=default_path_length)                 :: skala_feature_dir
       INTEGER :: accepted_ot_kp_searches, ext_master_id, handle, handle2, i_tmp, ic, irep, ispin, &
          iter_count, kp_ot_entry_reason, n_rep_hf, oda_base_slot, ot_kp_subspace_refresh_count, &
          ot_kp_subspace_refresh_iter_count, output_unit, scf_energy_message_tag, total_steps
@@ -488,6 +493,10 @@ CONTAINS
                       results=results, &
                       pw_env=pw_env, &
                       para_env=para_env)
+      CALL GET_ENVIRONMENT_VARIABLE("CP2K_SKALA_FEATURE_DUMP", skala_feature_dir)
+      IF (LEN_TRIM(skala_feature_dir) > 0 .AND. para_env%num_pe /= 1) THEN
+         CPABORT("Skala feature capture currently requires one MPI rank")
+      END IF
       tblite_native_mixer = dft_control%qs_control%xtb_control%do_tblite .AND. &
                             scf_env%method /= ot_method_nr .AND. &
                             tb_native_scc_mixer_active(dft_control)
@@ -636,6 +645,7 @@ CONTAINS
             total_steps = total_steps + 1
             just_energy = energy_only
 
+            CALL torch_skala_feature_begin()
             CALL qs_ks_update_qs_env(qs_env, just_energy=just_energy, &
                                      calculate_forces=.FALSE.)
 
@@ -1080,6 +1090,10 @@ CONTAINS
          END IF
       END IF
 
+      IF (torch_skala_feature_flush()) THEN
+         CALL skala_feature_metadata(qs_env, converged, total_scf_steps, scf_control%eps_scf)
+      END IF
+
       ! Skip Harris functional calculation if ground-state is NOT converged
       IF (qs_env%energy_correction) THEN
          CALL get_qs_env(qs_env, ec_env=ec_env)
@@ -1103,6 +1117,140 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE scf_env_do_scf
+
+! **************************************************************************************************
+!> \brief Record the retained SCF energy, convergence, input and occupations.
+!> The native atom-composite route stores its entire XC integral in exc1.
+!> Its one-centre XC is therefore included once, not added to the same integral again.
+! **************************************************************************************************
+   SUBROUTINE skala_feature_metadata(qs_env, converged, total_scf_steps, eps_scf)
+      TYPE(qs_environment_type), POINTER :: qs_env
+      LOGICAL, INTENT(IN) :: converged
+      INTEGER, INTENT(IN) :: total_scf_steps
+      REAL(KIND=dp), INTENT(IN) :: eps_scf
+
+      CHARACTER(LEN=default_path_length) :: directory
+      INTEGER :: unit, ispin, imo, ikp, i, status
+      TYPE(cell_type), POINTER :: cell
+      TYPE(dft_control_type), POINTER :: dft_control
+      TYPE(qs_energy_type), POINTER :: energy
+      TYPE(section_vals_type), POINTER :: input
+      TYPE(mo_set_type), DIMENSION(:), POINTER :: mos
+      TYPE(kpoint_type), POINTER :: kpoints
+      LOGICAL :: do_kpoints
+
+      CALL GET_ENVIRONMENT_VARIABLE("CP2K_SKALA_FEATURE_DUMP", directory, STATUS=status)
+      CPASSERT(status == 0)
+      CALL get_qs_env(qs_env, cell=cell, dft_control=dft_control, energy=energy, input=input, &
+                      mos=mos, kpoints=kpoints, do_kpoints=do_kpoints)
+      OPEN (NEWUNIT=unit, FILE=TRIM(directory)//"/metadata.json", STATUS="REPLACE", ACTION="WRITE")
+      WRITE (unit, '(A)') '{"schema": "cp2k-skala-metadata-v1",'
+      WRITE (unit, '(A)') '"code_revision": "'//TRIM(compile_revision)//'",'
+      WRITE (unit, '(A)') '"phase": "last_scf_energy_evaluation",'
+      WRITE (unit, '(A)') '"scf_converged": '//TRIM(MERGE('true ', 'false', converged))//','
+      WRITE (unit, '(A,I0,A)') '"scf_steps": ', total_scf_steps, ','
+      WRITE (unit, '(A,I0,A)') '"nspins": ', dft_control%nspins, ','
+      WRITE (unit, '(A,I0,A)') '"charge": ', dft_control%charge, ','
+      WRITE (unit, '(A,I0,A)') '"multiplicity": ', dft_control%multiplicity, ','
+      WRITE (unit, '(A,ES26.17E3,A)') '"eps_scf": ', eps_scf, ','
+      WRITE (unit, '(A,ES26.17E3,A)') '"total_hartree": ', energy%total, ','
+      WRITE (unit, '(A,ES26.17E3,A)') '"xc_hartree": ', energy%exc + energy%exc1, ','
+      WRITE (unit, '(A,ES26.17E3,A)') '"non_xc_hartree": ', energy%total - energy%exc - energy%exc1, ','
+      WRITE (unit, '(A)') '"cell_bohr": ['
+      DO i = 1, 3
+         WRITE (unit, '(A,ES26.17E3,A,ES26.17E3,A,ES26.17E3,A)', ADVANCE='NO') &
+            '[', cell%hmat(1, i), ',', cell%hmat(2, i), ',', cell%hmat(3, i), ']'
+         IF (i < 3) WRITE (unit, '(A)', ADVANCE='NO') ','
+      END DO
+      WRITE (unit, '(A)') '], "energy_terms_hartree": {'
+      CALL skala_write_energy_term(unit, 'exc', energy%exc)
+      CALL skala_write_energy_term(unit, 'exc1', energy%exc1)
+      CALL skala_write_energy_term(unit, 'core', energy%core)
+      CALL skala_write_energy_term(unit, 'core_overlap', energy%core_overlap)
+      CALL skala_write_energy_term(unit, 'core_overlap0', energy%core_overlap0)
+      CALL skala_write_energy_term(unit, 'core_self', energy%core_self)
+      CALL skala_write_energy_term(unit, 'core_cneo', energy%core_cneo)
+      CALL skala_write_energy_term(unit, 'hartree', energy%hartree)
+      CALL skala_write_energy_term(unit, 'hartree_1c', energy%hartree_1c)
+      CALL skala_write_energy_term(unit, 'e_hartree', energy%e_hartree)
+      CALL skala_write_energy_term(unit, 'ex', energy%ex)
+      CALL skala_write_energy_term(unit, 'repulsive', energy%repulsive)
+      CALL skala_write_energy_term(unit, 'dispersion', energy%dispersion)
+      CALL skala_write_energy_term(unit, 'dispersion_sc', energy%dispersion_sc)
+      CALL skala_write_energy_term(unit, 'gcp', energy%gcp)
+      CALL skala_write_energy_term(unit, 'srb', energy%srb)
+      CALL skala_write_energy_term(unit, 'eeq', energy%eeq)
+      CALL skala_write_energy_term(unit, 'el_stat', energy%el_stat)
+      CALL skala_write_energy_term(unit, 'qmmm_el', energy%qmmm_el)
+      CALL skala_write_energy_term(unit, 'qmmm_nu', energy%qmmm_nu)
+      CALL skala_write_energy_term(unit, 'image_charge', energy%image_charge)
+      CALL skala_write_energy_term(unit, 'mulliken', energy%mulliken)
+      CALL skala_write_energy_term(unit, 'cdft', energy%cdft)
+      CALL skala_write_energy_term(unit, 'ee', energy%ee)
+      CALL skala_write_energy_term(unit, 'ee_core', energy%ee_core)
+      CALL skala_write_energy_term(unit, 'efield', energy%efield)
+      CALL skala_write_energy_term(unit, 'efield_core', energy%efield_core)
+      CALL skala_write_energy_term(unit, 's2_restraint', energy%s2_restraint)
+      CALL skala_write_energy_term(unit, 'dft_plus_u', energy%dft_plus_u)
+      CALL skala_write_energy_term(unit, 'exc_aux_fit', energy%exc_aux_fit)
+      CALL skala_write_energy_term(unit, 'exc1_aux_fit', energy%exc1_aux_fit)
+      CALL skala_write_energy_term(unit, 'sccs_hartree', energy%sccs_hartree)
+      CALL skala_write_energy_term(unit, 'sccs_pol', energy%sccs_pol)
+      CALL skala_write_energy_term(unit, 'sccs_cav', energy%sccs_cav)
+      CALL skala_write_energy_term(unit, 'sccs_dis', energy%sccs_dis)
+      CALL skala_write_energy_term(unit, 'sccs_rep', energy%sccs_rep)
+      CALL skala_write_energy_term(unit, 'sccs_sol', energy%sccs_sol)
+      CALL skala_write_energy_term(unit, 'ktS', energy%ktS)
+      CALL skala_write_energy_term(unit, 'efermi', energy%efermi)
+      CALL skala_write_energy_term(unit, 'band', energy%band)
+      CALL skala_write_energy_term(unit, 'dftb3', energy%dftb3)
+      CALL skala_write_energy_term(unit, 'nonscf_correction', energy%nonscf_correction)
+      CALL skala_write_energy_term(unit, 'mp2', energy%mp2)
+      CALL skala_write_energy_term(unit, 'singles_corr', energy%singles_corr)
+      CALL skala_write_energy_term(unit, 'excited_state', energy%excited_state)
+      CALL skala_write_energy_term(unit, 'kinetic', energy%kinetic)
+      CALL skala_write_energy_term(unit, 'surf_dipole', energy%surf_dipole)
+      CALL skala_write_energy_term(unit, 'embed_corr', energy%embed_corr)
+      CALL skala_write_energy_term(unit, 'xtb_xb_inter', energy%xtb_xb_inter)
+      CALL skala_write_energy_term(unit, 'xtb_nonbonded', energy%xtb_nonbonded)
+      WRITE (unit, '(A,ES26.17E3,A)') '"xtb_spinpol": ', energy%xtb_spinpol, '}}'
+      CLOSE (unit)
+
+      ! section_vals_write requires a positive unit (NEWUNIT returns a negative one).
+      unit = -1
+      CALL open_file(TRIM(directory)//"/force_eval.inp", file_status="REPLACE", &
+                     file_action="WRITE", unit_number=unit)
+      CALL section_vals_write(input, unit_nr=unit, hide_root=.FALSE., hide_defaults=.FALSE.)
+      CALL close_file(unit)
+      OPEN (NEWUNIT=unit, FILE=TRIM(directory)//"/occupations.tsv", STATUS="REPLACE", ACTION="WRITE")
+      WRITE (unit, '(A)') '# kpoint spin orbital occupation kweight kx ky kz; fractional k coordinates'
+      IF (do_kpoints) THEN
+         DO ikp = 1, kpoints%nkp
+            DO ispin = 1, dft_control%nspins
+               DO imo = 1, SIZE(kpoints%kp_env(ikp)%kpoint_env%mos(1, ispin)%occupation_numbers)
+                  WRITE (unit, '(3(I0,1X),5(ES26.17E3,1X))') ikp, ispin, imo, &
+                     kpoints%kp_env(ikp)%kpoint_env%mos(1, ispin)%occupation_numbers(imo), &
+                     kpoints%wkp(ikp), kpoints%xkp(:, ikp)
+               END DO
+            END DO
+         END DO
+      ELSE
+         DO ispin = 1, SIZE(mos)
+            DO imo = 1, SIZE(mos(ispin)%occupation_numbers)
+               WRITE (unit, '(3(I0,1X),5(ES26.17E3,1X))') 1, ispin, imo, &
+                  mos(ispin)%occupation_numbers(imo), 1.0_dp, 0.0_dp, 0.0_dp, 0.0_dp
+            END DO
+         END DO
+      END IF
+      CLOSE (unit)
+   END SUBROUTINE skala_feature_metadata
+
+   SUBROUTINE skala_write_energy_term(unit, name, value)
+      INTEGER, INTENT(IN) :: unit
+      CHARACTER(LEN=*), INTENT(IN) :: name
+      REAL(KIND=dp), INTENT(IN) :: value
+      WRITE (unit, '(A,ES26.17E3,A)') '"'//name//'": ', value, ','
+   END SUBROUTINE skala_write_energy_term
 
 ! **************************************************************************************************
 !> \brief grow an automatic k-point smearing virtual space and rebuild dimensioned state

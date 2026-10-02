@@ -89,10 +89,42 @@ MODULE torch_api
              torch_model_remap_device_constants
    PUBLIC :: torch_model_get_attr, torch_model_read_metadata
    PUBLIC :: torch_cuda_device_count, torch_cuda_is_available
+   PUBLIC :: torch_skala_feature_begin, torch_skala_feature_flush
    PUBLIC :: torch_allow_tf32, torch_model_freeze, torch_model_freeze_preserving_method, &
              torch_use_cuda
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Begin optional capture of the next Skala SCF energy evaluation.
+! **************************************************************************************************
+   SUBROUTINE torch_skala_feature_begin()
+#if defined(__LIBTORCH)
+      INTERFACE
+         SUBROUTINE torch_c_skala_feature_begin() BIND(C, name="torch_c_skala_feature_begin")
+         END SUBROUTINE torch_c_skala_feature_begin
+      END INTERFACE
+      CALL torch_c_skala_feature_begin()
+#endif
+   END SUBROUTINE torch_skala_feature_begin
+
+! **************************************************************************************************
+!> \brief Write the retained protocol-2 tensors once and stop capturing.
+! **************************************************************************************************
+   FUNCTION torch_skala_feature_flush() RESULT(written)
+      LOGICAL :: written
+#if defined(__LIBTORCH)
+      INTERFACE
+         FUNCTION torch_c_skala_feature_flush() BIND(C, name="torch_c_skala_feature_flush") RESULT(value)
+            IMPORT :: C_BOOL
+            LOGICAL(C_BOOL) :: value
+         END FUNCTION torch_c_skala_feature_flush
+      END INTERFACE
+      written = torch_c_skala_feature_flush()
+#else
+      written = .FALSE.
+#endif
+   END FUNCTION torch_skala_feature_flush
 
    #:set typenames = ['int32', 'float', 'int64', 'double']
    #:set types_f = ['INTEGER(kind=int_4)', 'REAL(sp)', 'INTEGER(kind=int_8)', 'REAL(dp)']
