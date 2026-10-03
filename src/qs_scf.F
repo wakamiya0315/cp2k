@@ -605,6 +605,8 @@ CONTAINS
 
       scf_outer_loop: DO
 
+         ! Restart initialization can evaluate XC before the first inner step.
+         CALL torch_skala_feature_begin()
          CALL init_scf_loop(scf_env=scf_env, qs_env=qs_env, &
                             scf_section=scf_section, &
                             kp_ot_entry_reason=kp_ot_entry_reason)

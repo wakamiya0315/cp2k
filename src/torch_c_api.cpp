@@ -94,6 +94,7 @@ typedef torch::jit::Module torch_c_model_t;
 // Retain only the most recent SCF energy evaluation. Force evaluations are not
 // captured: the SCF driver closes the capture before calculating properties.
 static bool skala_capture_enabled = false;
+static bool skala_capture_reset_pending = false;
 static std::mutex skala_capture_mutex;
 static std::vector<std::map<std::string, torch::Tensor>> skala_feature_batches;
 static std::vector<double> skala_batch_xc;
@@ -158,6 +159,11 @@ static void capture_skala_features(const torch_c_dict_t &inputs,
   const auto weights = inputs.at("grid_weights").to(output.device());
   const double xc = (output.detach() * weights).sum().item<double>();
   std::lock_guard<std::mutex> lock(skala_capture_mutex);
+  if (skala_capture_reset_pending) {
+    skala_feature_batches.clear();
+    skala_batch_xc.clear();
+    skala_capture_reset_pending = false;
+  }
   skala_feature_batches.push_back(std::move(batch));
   skala_batch_xc.push_back(xc);
 }
@@ -452,8 +458,9 @@ void torch_c_skala_feature_begin() {
   const char *path = std::getenv("CP2K_SKALA_FEATURE_DUMP");
   skala_capture_enabled = path != nullptr && path[0] != '\0';
   if (skala_capture_enabled) {
-    skala_feature_batches.clear();
-    skala_batch_xc.clear();
+    // A cached KS update may make no model call. Keep its actual input snapshot
+    // until the first forward of a new evaluation replaces it.
+    skala_capture_reset_pending = true;
   }
 }
 

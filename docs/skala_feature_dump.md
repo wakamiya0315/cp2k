@@ -2,8 +2,11 @@
 
 Set `CP2K_SKALA_FEATURE_DUMP` to an absolute output directory to retain the
 protocol-2 input dictionaries of the last SCF energy evaluation. The SCF driver
-replaces the in-memory capture at each iteration and writes it once when the
-SCF loop ends. No capture is taken during the following force calculation.
+arms the in-memory capture before initialization and each iteration. The first
+actual model call replaces the previous evaluation; a cached KS update keeps
+the last real input snapshot. This includes an initial XC evaluation from a
+restart WFN. The driver writes it once when the SCF loop ends. No capture is
+taken during the following force calculation.
 Without this variable, no tensors are copied and no files are written.
 
 This implementation is intended for single-point native Skala calculations on
