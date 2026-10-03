@@ -47,6 +47,7 @@ MODULE skala_gpw_features
              skala_gpw_feature_build_atom_subchunk_bounds, skala_gpw_feature_release, &
              skala_gpw_feature_type, skala_gpw_smooth_partition_derivatives, &
              build_periodic_atom_image_layout, periodic_atom_image_partition, &
+             periodic_atom_image_partition_at_point, &
              periodic_atom_image_partition_from_layout, smooth_atom_partition, &
              smooth_partition_atomic_weight_scale, smooth_partition_atomic_weight_scale_derivative
 
@@ -2684,6 +2685,122 @@ CONTAINS
    END SUBROUTINE periodic_image_normalized_weights
 
 ! **************************************************************************************************
+!> \brief Periodic images that can share a grid point: for every atom, the image whose cell
+!>        contains the point and the images within periodic_partition_image_shell cells of it, plus
+!>        the target atom itself if it is not among them.
+!> \details A list centred on the target atom instead misses, for grid points far from it, the
+!>          images nearest to the point; those points then keep part of the target's weight, and
+!>          the grids of small cells integrate more than the cell (+4 % for one-atom fcc cells).
+!>          Centred on the point, the list holds every image that competes for the point, so the
+!>          weights of all atoms sum to one wherever the grids reach.
+!> \param grid_point ...
+!> \param atom_coords ...
+!> \param cell ...
+!> \param target_atom ...
+!> \param image_periodicity periodic directions (1) of the image list
+!> \param image_coords image positions (bohr)
+!> \param image_atom atom of each image
+!> \param image_shift lattice translation of each image in cell vectors
+!> \param target_image index of the target atom's own image
+! **************************************************************************************************
+   SUBROUTINE point_centred_image_layout(grid_point, atom_coords, cell, target_atom, &
+                                         image_periodicity, image_coords, image_atom, &
+                                         image_shift, target_image)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: grid_point
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: atom_coords
+      TYPE(cell_type), POINTER                           :: cell
+      INTEGER, INTENT(IN)                                :: target_atom
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: image_periodicity
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: image_coords
+      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: image_atom
+      INTEGER, ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: image_shift
+      INTEGER, INTENT(OUT)                               :: target_image
+
+      INTEGER                                            :: iatom, idir, image_count, image_index, &
+                                                            ix, iy, iz, natom
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: base_shifts
+      INTEGER, DIMENSION(3)                              :: reach
+      LOGICAL                                            :: target_listed
+      REAL(KIND=dp), DIMENSION(3)                        :: fractional
+
+      natom = SIZE(atom_coords, 2)
+      CPASSERT(ASSOCIATED(cell))
+      CPASSERT(target_atom >= 1 .AND. target_atom <= natom)
+      CPASSERT(ALL(image_periodicity == 0 .OR. image_periodicity == 1))
+      reach = periodic_partition_image_shell*image_periodicity
+      ALLOCATE (base_shifts(3, natom))
+      DO iatom = 1, natom
+         fractional = MATMUL(cell%h_inv, grid_point - atom_coords(:, iatom))
+         DO idir = 1, 3
+            base_shifts(idir, iatom) = image_periodicity(idir)*NINT(fractional(idir))
+         END DO
+      END DO
+      target_listed = ALL(ABS(base_shifts(:, target_atom)) <= reach)
+      image_count = natom*PRODUCT(2*reach + 1)
+      IF (.NOT. target_listed) image_count = image_count + 1
+      ALLOCATE (image_coords(3, image_count), image_atom(image_count), image_shift(3, image_count))
+      image_index = 0
+      target_image = 0
+      DO iatom = 1, natom
+         DO iz = base_shifts(3, iatom) - reach(3), base_shifts(3, iatom) + reach(3)
+            DO iy = base_shifts(2, iatom) - reach(2), base_shifts(2, iatom) + reach(2)
+               DO ix = base_shifts(1, iatom) - reach(1), base_shifts(1, iatom) + reach(1)
+                  image_index = image_index + 1
+                  image_atom(image_index) = iatom
+                  image_shift(:, image_index) = [ix, iy, iz]
+                  image_coords(:, image_index) = atom_coords(:, iatom) + &
+                                                 MATMUL(cell%hmat, REAL([ix, iy, iz], KIND=dp))
+                  IF (iatom == target_atom .AND. ix == 0 .AND. iy == 0 .AND. iz == 0) THEN
+                     target_image = image_index
+                  END IF
+               END DO
+            END DO
+         END DO
+      END DO
+      IF (.NOT. target_listed) THEN
+         image_index = image_index + 1
+         image_atom(image_index) = target_atom
+         image_shift(:, image_index) = 0
+         image_coords(:, image_index) = atom_coords(:, target_atom)
+         target_image = image_index
+      END IF
+      CPASSERT(image_index == image_count)
+      CPASSERT(target_image > 0)
+      DEALLOCATE (base_shifts)
+   END SUBROUTINE point_centred_image_layout
+
+! **************************************************************************************************
+!> \brief Periodic atom weight of one grid point with the image list centred on the point.
+!> \param grid_point ...
+!> \param atom_coords ...
+!> \param cell ...
+!> \param target_atom ...
+!> \param image_periodicity periodic directions (1) of the image list
+!> \param weight ...
+! **************************************************************************************************
+   SUBROUTINE periodic_atom_image_partition_at_point(grid_point, atom_coords, cell, target_atom, &
+                                                     image_periodicity, weight)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: grid_point
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: atom_coords
+      TYPE(cell_type), POINTER                           :: cell
+      INTEGER, INTENT(IN)                                :: target_atom
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: image_periodicity
+      REAL(KIND=dp), INTENT(OUT)                         :: weight
+
+      INTEGER                                            :: target_image
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: image_atom
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: image_shift
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: image_coords
+
+      CALL point_centred_image_layout(grid_point, atom_coords, cell, target_atom, &
+                                      image_periodicity, image_coords, image_atom, image_shift, &
+                                      target_image)
+      CALL periodic_atom_image_partition_from_layout(grid_point, image_coords, target_image, weight)
+      DEALLOCATE (image_coords, image_atom, image_shift)
+   END SUBROUTINE periodic_atom_image_partition_at_point
+
+! **************************************************************************************************
 !> \brief Build the image coordinates shared by all points of one target-atom block.
 !> \param atom_coords ...
 !> \param cell ...
@@ -2809,13 +2926,12 @@ CONTAINS
       REAL(KIND=dp), INTENT(OUT)                         :: weight
       INTEGER, DIMENSION(3), INTENT(IN), OPTIONAL        :: image_periodicity
 
-      INTEGER                                            :: target_image
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: image_coords
+      INTEGER, DIMENSION(3)                              :: periodicity
 
-      CALL build_periodic_atom_image_layout(atom_coords, cell, target_atom, image_periodicity, &
-                                            image_coords, target_image)
-      CALL periodic_atom_image_partition_from_layout(grid_point, image_coords, target_image, weight)
-      DEALLOCATE (image_coords)
+      periodicity = cell%perd
+      IF (PRESENT(image_periodicity)) periodicity = image_periodicity
+      CALL periodic_atom_image_partition_at_point(grid_point, atom_coords, cell, target_atom, &
+                                                  periodicity, weight)
 
    END SUBROUTINE periodic_atom_image_partition_value
 
@@ -2844,9 +2960,8 @@ CONTAINS
          OPTIONAL                                        :: dweight_datom, dweight_dstrain
       INTEGER, DIMENSION(3), INTENT(IN), OPTIONAL        :: image_periodicity
 
-      INTEGER :: active_count, active_image, active_index, base_shift(3), candidate_image, iatom, &
-         idir, iimage, image_count, image_index, ix, ix_max, ix_min, iy, iy_max, iy_min, iz, &
-         iz_max, iz_min, jatom, jdir, jimage, natom, target_image
+      INTEGER :: active_count, active_image, active_index, candidate_image, idir, iimage, &
+         image_count, jatom, jdir, jimage, natom, target_image
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: active_images, image_atom
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: image_shift
       INTEGER, DIMENSION(3)                              :: partition_periodicity
@@ -2857,7 +2972,7 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: image_coords, mean_log_derivative, &
                                                             rvecs, target_log_derivative, &
                                                             unit_rvecs
-      REAL(KIND=dp), DIMENSION(3) :: dmu_image_i, dmu_image_j, ds_image_i, ds_image_j, fractional, &
+      REAL(KIND=dp), DIMENSION(3) :: dmu_image_i, dmu_image_j, ds_image_i, ds_image_j, &
          image_translation, image_weight_derivative, pair, unit_pair
 
       natom = SIZE(atom_coords, 2)
@@ -2884,50 +2999,15 @@ CONTAINS
       IF (PRESENT(image_periodicity)) partition_periodicity = image_periodicity
       CPASSERT(ALL(partition_periodicity == 0 .OR. partition_periodicity == 1))
 
-      image_count = 1
-      DO idir = 1, 3
-         IF (partition_periodicity(idir) == 1) THEN
-            image_count = image_count*(2*periodic_partition_image_shell + 1)
-         END IF
-      END DO
-      image_count = natom*image_count
-      ALLOCATE (active_images(image_count), image_atom(image_count), image_shift(3, image_count), &
-                image_coords(3, image_count), distances(image_count), &
+      CALL point_centred_image_layout(grid_point, atom_coords, cell, target_atom, &
+                                      partition_periodicity, image_coords, image_atom, &
+                                      image_shift, target_image)
+      image_count = SIZE(image_coords, 2)
+      ALLOCATE (active_images(image_count), distances(image_count), &
                 normalized_weights(image_count), &
                 rvecs(3, image_count), unit_rvecs(3, image_count), &
                 mean_log_derivative(3, image_count), &
                 target_log_derivative(3, image_count))
-
-      image_index = 0
-      target_image = 0
-      DO iatom = 1, natom
-         fractional = MATMUL(cell%h_inv, &
-                             atom_coords(:, target_atom) - atom_coords(:, iatom))
-         DO idir = 1, 3
-            base_shift(idir) = partition_periodicity(idir)*NINT(fractional(idir))
-         END DO
-         ix_min = base_shift(1) - periodic_partition_image_shell*partition_periodicity(1)
-         ix_max = base_shift(1) + periodic_partition_image_shell*partition_periodicity(1)
-         iy_min = base_shift(2) - periodic_partition_image_shell*partition_periodicity(2)
-         iy_max = base_shift(2) + periodic_partition_image_shell*partition_periodicity(2)
-         iz_min = base_shift(3) - periodic_partition_image_shell*partition_periodicity(3)
-         iz_max = base_shift(3) + periodic_partition_image_shell*partition_periodicity(3)
-         DO iz = iz_min, iz_max
-            DO iy = iy_min, iy_max
-               DO ix = ix_min, ix_max
-                  image_index = image_index + 1
-                  image_atom(image_index) = iatom
-                  image_shift(:, image_index) = [ix, iy, iz]
-                  image_coords(:, image_index) = atom_coords(:, iatom) + &
-                                                 MATMUL(cell%hmat, REAL([ix, iy, iz], KIND=dp))
-                  IF (iatom == target_atom .AND. ALL(image_shift(:, image_index) == 0)) THEN
-                     target_image = image_index
-                  END IF
-               END DO
-            END DO
-         END DO
-      END DO
-      CPASSERT(image_index == image_count)
       DO iimage = 1, image_count
          rvecs(:, iimage) = grid_point - image_coords(:, iimage)
          distances(iimage) = SQRT(SUM(rvecs(:, iimage)**2))
