@@ -2527,9 +2527,9 @@ CONTAINS
       CPASSERT(SIZE(image_coords, 2) == image_count)
       CPASSERT(SIZE(fade) == image_count)
       CPASSERT(SIZE(log_weights) == image_count)
-      nearest_image = MINLOC(distances, DIM=1)
+      nearest_image = MINLOC(distances, DIM=1, MASK=fade > 0.0_dp)
+      CPASSERT(nearest_image > 0)
       log_weights = -HUGE(1.0_dp)
-      CPASSERT(fade(nearest_image) > 0.0_dp)
       reference_log_weight = LOG(fade(nearest_image))
       DO jimage = 1, image_count
          IF (jimage == nearest_image) CYCLE
@@ -2631,9 +2631,10 @@ CONTAINS
          CPASSERT(SIZE(image_fade) == image_count)
          fade = image_fade
       END IF
-      nearest_image = MINLOC(distances, DIM=1)
+      ! The nearest image that takes part is the reference of the screening.
+      nearest_image = MINLOC(distances, DIM=1, MASK=fade > 0.0_dp)
+      CPASSERT(nearest_image > 0)
       reference_weight = fade(nearest_image)
-      CPASSERT(reference_weight > 0.0_dp)
       use_log_fallback = .FALSE.
       DO jimage = 1, image_count
          IF (jimage == nearest_image) CYCLE
