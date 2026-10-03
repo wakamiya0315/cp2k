@@ -41,11 +41,11 @@ MODULE skala_gpw_features
    REAL(KIND=dp), PARAMETER, PRIVATE    :: smooth_partition_taper_end = &
                                            10.0_dp*smooth_partition_eps
    INTEGER, PARAMETER, PRIVATE          :: periodic_partition_image_shell = 1
-   ! Fractional distance (along each periodic cell vector) between a grid point and an atom
-   ! image at which the image starts to fade out of the point-centred periodic partition, and
-   ! from which on it is absent.
-   REAL(KIND=dp), PARAMETER, PRIVATE    :: periodic_partition_fade_begin = 1.0_dp, &
-                                           periodic_partition_fade_end = 1.5_dp
+   ! Distance (bohr) between a grid point and an atom image at which the image starts to fade
+   ! out of the point-centred periodic partition, and from which on it is absent. Distances
+   ! fixed in bohr give the same partition for every periodic cell of a structure.
+   REAL(KIND=dp), PARAMETER, PRIVATE    :: periodic_partition_fade_begin = 10.0_dp, &
+                                           periodic_partition_fade_end = 14.0_dp
 
    PUBLIC :: skala_gpw_atom_subchunk_count, skala_gpw_atom_subchunk_layout, &
              skala_gpw_feature_build, skala_gpw_feature_build_atom_subchunk, &
@@ -2711,21 +2711,21 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Periodic images that can share a grid point, each with the factor with which it enters
-!>        the partition: every image closer to the point than periodic_partition_fade_end cell
-!>        vectors along each periodic direction, fully weighted up to
-!>        periodic_partition_fade_begin.
+!>        the partition: every image closer to the point than periodic_partition_fade_end,
+!>        fully weighted up to periodic_partition_fade_begin (both in bohr).
 !> \details A list centred on the target atom misses, for grid points far from it, the images
 !>          nearest to the point; those points then keep part of the target's weight, and the grids
 !>          of small cells integrate more than the cell (+4 % for one-atom fcc cells). A list
 !>          centred on the point holds every image that competes for it, but with a sharp edge the
 !>          weights jump where an image enters or leaves the list as the atoms or the cell move:
 !>          the energy is then not differentiable, and finite differences disagree with the
-!>          analytic forces and stress. The fade factor prod_d T(|g_d|), with
-!>          g = h^-1 (R_image - r_point) and T falling from 1 to 0 between the two limits with
-!>          Becke's switching shape, lets every image enter smoothly. There are at most three
-!>          images per periodic direction and atom. The cell vectors should be reduced (as for
-!>          fcc, bcc, hexagonal or nearly orthogonal cells), so that the images nearest to any
-!>          point have fractional distances below periodic_partition_fade_begin.
+!>          analytic forces and stress. The fade factor T(|R_image - r_point|), falling from 1 to 0
+!>          between the two distances with Becke's switching shape, lets every image enter
+!>          smoothly. The distances are fixed in bohr rather than in cell vectors, so that every
+!>          periodic cell of a structure gives the same list, partition and energy (limits in cell
+!>          vectors made one-atom fcc Al differ from its 2 x 2 x 2 supercell by 2.2e-5 Ha per
+!>          atom). A point farther than periodic_partition_fade_end from every atom gets no weight;
+!>          the density there is negligible.
 !> \param grid_point ...
 !> \param atom_coords ...
 !> \param cell ...
@@ -2736,7 +2736,7 @@ CONTAINS
 !> \param image_shift lattice translation of each image in cell vectors
 !> \param image_fade fade factor of each image
 !> \param image_fade_gradient derivative of the fade factor with respect to the image position at
-!>        fixed grid point and cell (1/bohr)
+!>        fixed grid point (1/bohr)
 !> \param target_image index of the target atom's own image; 0 if the point is beyond its range
 ! **************************************************************************************************
    SUBROUTINE point_centred_image_layout(grid_point, atom_coords, cell, target_atom, &
@@ -2759,89 +2759,89 @@ CONTAINS
       INTEGER, INTENT(OUT)                               :: target_image
 
       INTEGER                                            :: iatom, idir, image_count, image_index, &
-                                                            ix, iy, iz, natom
+                                                            ipass, ix, iy, iz, natom
       INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: shift_range
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: fractional
-      REAL(KIND=dp), DIMENSION(3)                        :: fade_1d, fade_1d_derivative, &
-                                                            fade_gradient_fractional, offset
+      REAL(KIND=dp)                                      :: distance, fade, fade_derivative
+      REAL(KIND=dp), DIMENSION(3)                        :: fractional, image_point, offset, reach
 
       natom = SIZE(atom_coords, 2)
       CPASSERT(ASSOCIATED(cell))
       CPASSERT(target_atom >= 1 .AND. target_atom <= natom)
       CPASSERT(ALL(image_periodicity == 0 .OR. image_periodicity == 1))
-      ALLOCATE (fractional(3, natom), shift_range(2, 3, natom))
-      image_count = 0
+      ! An image closer to the point than periodic_partition_fade_end lies within
+      ! periodic_partition_fade_end |b_d| cell vectors of it along direction d, with b_d the d-th
+      ! row of h^-1.
+      DO idir = 1, 3
+         reach(idir) = periodic_partition_fade_end*SQRT(SUM(cell%h_inv(idir, :)**2))
+      END DO
+      ALLOCATE (shift_range(2, 3, natom))
       DO iatom = 1, natom
          ! Image n of the atom lies at the fractional offset n - fractional from the point.
-         fractional(:, iatom) = MATMUL(cell%h_inv, grid_point - atom_coords(:, iatom))
+         fractional = MATMUL(cell%h_inv, grid_point - atom_coords(:, iatom))
          DO idir = 1, 3
             IF (image_periodicity(idir) == 1) THEN
-               shift_range(1, idir, iatom) = FLOOR(fractional(idir, iatom) - &
-                                                   periodic_partition_fade_end) + 1
-               shift_range(2, idir, iatom) = CEILING(fractional(idir, iatom) + &
-                                                     periodic_partition_fade_end) - 1
+               shift_range(1, idir, iatom) = CEILING(fractional(idir) - reach(idir))
+               shift_range(2, idir, iatom) = FLOOR(fractional(idir) + reach(idir))
             ELSE
                shift_range(:, idir, iatom) = 0
             END IF
          END DO
-         image_count = image_count + &
-                       PRODUCT(shift_range(2, :, iatom) - shift_range(1, :, iatom) + 1)
       END DO
-      ALLOCATE (image_coords(3, image_count), image_atom(image_count), &
-                image_shift(3, image_count), image_fade(image_count), &
-                image_fade_gradient(3, image_count))
-      image_index = 0
-      target_image = 0
-      DO iatom = 1, natom
-         DO iz = shift_range(1, 3, iatom), shift_range(2, 3, iatom)
-            DO iy = shift_range(1, 2, iatom), shift_range(2, 2, iatom)
-               DO ix = shift_range(1, 1, iatom), shift_range(2, 1, iatom)
-                  image_index = image_index + 1
-                  image_atom(image_index) = iatom
-                  image_shift(:, image_index) = [ix, iy, iz]
-                  image_coords(:, image_index) = atom_coords(:, iatom) + &
-                                                 MATMUL(cell%hmat, REAL([ix, iy, iz], KIND=dp))
-                  offset = REAL([ix, iy, iz], KIND=dp) - fractional(:, iatom)
-                  DO idir = 1, 3
-                     IF (image_periodicity(idir) == 1) THEN
-                        CALL periodic_image_fade_1d(ABS(offset(idir)), fade_1d(idir), &
-                                                    fade_1d_derivative(idir))
-                        fade_1d_derivative(idir) = SIGN(1.0_dp, offset(idir))* &
-                                                   fade_1d_derivative(idir)
+      ! The first pass counts the images closer than periodic_partition_fade_end, the second
+      ! stores them.
+      image_count = 0
+      DO ipass = 1, 2
+         IF (ipass == 2) THEN
+            ALLOCATE (image_coords(3, image_count), image_atom(image_count), &
+                      image_shift(3, image_count), image_fade(image_count), &
+                      image_fade_gradient(3, image_count))
+         END IF
+         image_index = 0
+         target_image = 0
+         DO iatom = 1, natom
+            DO iz = shift_range(1, 3, iatom), shift_range(2, 3, iatom)
+               DO iy = shift_range(1, 2, iatom), shift_range(2, 2, iatom)
+                  DO ix = shift_range(1, 1, iatom), shift_range(2, 1, iatom)
+                     image_point = atom_coords(:, iatom) + &
+                                   MATMUL(cell%hmat, REAL([ix, iy, iz], KIND=dp))
+                     offset = image_point - grid_point
+                     distance = SQRT(SUM(offset**2))
+                     IF (distance >= periodic_partition_fade_end) CYCLE
+                     image_index = image_index + 1
+                     IF (ipass == 1) CYCLE
+                     CALL periodic_image_fade(distance, fade, fade_derivative)
+                     image_atom(image_index) = iatom
+                     image_shift(:, image_index) = [ix, iy, iz]
+                     image_coords(:, image_index) = image_point
+                     image_fade(image_index) = fade
+                     IF (distance > layout_tol) THEN
+                        image_fade_gradient(:, image_index) = fade_derivative*offset/distance
                      ELSE
-                        fade_1d(idir) = 1.0_dp
-                        fade_1d_derivative(idir) = 0.0_dp
+                        image_fade_gradient(:, image_index) = 0.0_dp
+                     END IF
+                     IF (iatom == target_atom .AND. ix == 0 .AND. iy == 0 .AND. iz == 0) THEN
+                        target_image = image_index
                      END IF
                   END DO
-                  image_fade(image_index) = PRODUCT(fade_1d)
-                  fade_gradient_fractional(1) = fade_1d_derivative(1)*fade_1d(2)*fade_1d(3)
-                  fade_gradient_fractional(2) = fade_1d(1)*fade_1d_derivative(2)*fade_1d(3)
-                  fade_gradient_fractional(3) = fade_1d(1)*fade_1d(2)*fade_1d_derivative(3)
-                  ! The offset changes with the image position R as h^-1 R.
-                  image_fade_gradient(:, image_index) = MATMUL(TRANSPOSE(cell%h_inv), &
-                                                               fade_gradient_fractional)
-                  IF (iatom == target_atom .AND. ix == 0 .AND. iy == 0 .AND. iz == 0) THEN
-                     target_image = image_index
-                  END IF
                END DO
             END DO
          END DO
+         IF (ipass == 1) image_count = image_index
       END DO
       CPASSERT(image_index == image_count)
-      DEALLOCATE (fractional, shift_range)
+      DEALLOCATE (shift_range)
 
    END SUBROUTINE point_centred_image_layout
 
 ! **************************************************************************************************
-!> \brief Fade factor of a periodic image along one periodic direction: 1 up to the fractional
-!>        distance periodic_partition_fade_begin from the grid point, 0 from
-!>        periodic_partition_fade_end on, and Becke's switching shape in between, whose
-!>        derivatives vanish at both ends.
-!> \param distance fractional distance between grid point and image (>= 0)
+!> \brief Fade factor of a periodic image: 1 up to the distance periodic_partition_fade_begin
+!>        from the grid point, 0 from periodic_partition_fade_end on, and Becke's switching shape
+!>        in between, whose derivatives vanish at both ends.
+!> \param distance distance between grid point and image (bohr)
 !> \param fade ...
-!> \param fade_derivative derivative with respect to the distance
+!> \param fade_derivative derivative with respect to the distance (1/bohr)
 ! **************************************************************************************************
-   PURE SUBROUTINE periodic_image_fade_1d(distance, fade, fade_derivative)
+   PURE SUBROUTINE periodic_image_fade(distance, fade, fade_derivative)
       REAL(KIND=dp), INTENT(IN)                          :: distance
       REAL(KIND=dp), INTENT(OUT)                         :: fade, fade_derivative
 
@@ -2860,7 +2860,7 @@ CONTAINS
          fade_derivative = -becke_shape_derivative(mu)/width
       END IF
 
-   END SUBROUTINE periodic_image_fade_1d
+   END SUBROUTINE periodic_image_fade
 
 ! **************************************************************************************************
 !> \brief Periodic atom weight of one grid point among the images of point_centred_image_layout.
@@ -3050,8 +3050,8 @@ CONTAINS
 !> \param weight ...
 !> \param dweight_datom optional derivative at fixed grid point with respect to base atoms
 !> \param dweight_dstrain optional derivative with respect to strain through the lattice
-!>        translations of the images and, in the fade factors, through h^-1 at a fixed grid
-!>        point; the response of the atom positions follows from dweight_datom
+!>        translations of the images; the response of the atom positions follows from
+!>        dweight_datom
 !> \param image_periodicity optional image directions used by the auxiliary-grid partition
 ! **************************************************************************************************
    SUBROUTINE periodic_atom_image_partition(grid_point, atom_coords, cell, target_atom, weight, &
@@ -3074,12 +3074,10 @@ CONTAINS
                                                             factor_ji, mu, mu_raw, rab, switch
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: distances, image_fade, &
                                                             normalized_weights
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :) :: fade_mean_log_derivative, &
-         fade_target_log_derivative, image_coords, image_fade_gradient, mean_log_derivative, &
-         rvecs, target_log_derivative, unit_rvecs
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :) :: image_coords, image_fade_gradient, &
+         mean_log_derivative, rvecs, target_log_derivative, unit_rvecs
       REAL(KIND=dp), DIMENSION(3) :: dlog_i, dlog_j, dmu_image_i, dmu_image_j, ds_image_i, &
-         ds_image_j, fade_log, fade_weight_derivative, image_translation, &
-         image_weight_derivative, pair, unit_pair
+         ds_image_j, fade_log, image_translation, image_weight_derivative, pair, unit_pair
 
       CPASSERT(ASSOCIATED(cell))
       CPASSERT(target_atom >= 1 .AND. target_atom <= SIZE(atom_coords, 2))
@@ -3112,9 +3110,7 @@ CONTAINS
                 normalized_weights(image_count), &
                 rvecs(3, image_count), unit_rvecs(3, image_count), &
                 mean_log_derivative(3, image_count), &
-                target_log_derivative(3, image_count), &
-                fade_mean_log_derivative(3, image_count), &
-                fade_target_log_derivative(3, image_count))
+                target_log_derivative(3, image_count))
       DO iimage = 1, image_count
          rvecs(:, iimage) = grid_point - image_coords(:, iimage)
          distances(iimage) = SQRT(SUM(rvecs(:, iimage)**2))
@@ -3140,24 +3136,20 @@ CONTAINS
             END IF
          END DO
          CPASSERT(active_count > 0)
-         ! d log P_i / dR_k contracted with the weights (mean) and for the target. The parts that
-         ! come from the fade factors are kept apart, because the fade factors also depend on the
-         ! cell through h^-1, which the strain derivative needs.
+         ! d log P_i / dR_k contracted with the weights (mean) and for the target, including the
+         ! fade factors, which depend on the image positions like the switching functions.
          mean_log_derivative = 0.0_dp
          target_log_derivative = 0.0_dp
-         fade_mean_log_derivative = 0.0_dp
-         fade_target_log_derivative = 0.0_dp
          DO active_index = 1, active_count
             active_image = active_images(active_index)
             ! The image's own fade factor f_i in P_i.
             IF (image_fade(active_image) < 1.0_dp) THEN
                fade_log = image_fade_gradient(:, active_image)/image_fade(active_image)
-               fade_mean_log_derivative(:, active_image) = &
-                  fade_mean_log_derivative(:, active_image) + &
-                  normalized_weights(active_image)*fade_log
+               mean_log_derivative(:, active_image) = mean_log_derivative(:, active_image) + &
+                                                      normalized_weights(active_image)*fade_log
                IF (active_image == target_image) THEN
-                  fade_target_log_derivative(:, active_image) = &
-                     fade_target_log_derivative(:, active_image) + fade_log
+                  target_log_derivative(:, active_image) = &
+                     target_log_derivative(:, active_image) + fade_log
                END IF
             END IF
             ! Revisit the image pairs after normalization to contract the logarithmic
@@ -3199,13 +3191,12 @@ CONTAINS
                                                    normalized_weights(iimage)*dlog_i
                   mean_log_derivative(:, jimage) = mean_log_derivative(:, jimage) + &
                                                    normalized_weights(iimage)*dlog_j
-                  fade_mean_log_derivative(:, jimage) = fade_mean_log_derivative(:, jimage) + &
-                                                        normalized_weights(iimage)*fade_log
+                  mean_log_derivative(:, jimage) = mean_log_derivative(:, jimage) + &
+                                                   normalized_weights(iimage)*fade_log
                   IF (target_image == iimage) THEN
                      target_log_derivative(:, iimage) = target_log_derivative(:, iimage) + dlog_i
-                     target_log_derivative(:, jimage) = target_log_derivative(:, jimage) + dlog_j
-                     fade_target_log_derivative(:, jimage) = &
-                        fade_target_log_derivative(:, jimage) + fade_log
+                     target_log_derivative(:, jimage) = target_log_derivative(:, jimage) + &
+                                                        dlog_j + fade_log
                   END IF
                END IF
                IF (factor_ji > TINY(1.0_dp)) THEN
@@ -3216,44 +3207,36 @@ CONTAINS
                                                    normalized_weights(jimage)*dlog_i
                   mean_log_derivative(:, jimage) = mean_log_derivative(:, jimage) + &
                                                    normalized_weights(jimage)*dlog_j
-                  fade_mean_log_derivative(:, iimage) = fade_mean_log_derivative(:, iimage) + &
-                                                        normalized_weights(jimage)*fade_log
+                  mean_log_derivative(:, iimage) = mean_log_derivative(:, iimage) + &
+                                                   normalized_weights(jimage)*fade_log
                   IF (target_image == jimage) THEN
-                     target_log_derivative(:, iimage) = target_log_derivative(:, iimage) + dlog_i
+                     target_log_derivative(:, iimage) = target_log_derivative(:, iimage) + &
+                                                        dlog_i + fade_log
                      target_log_derivative(:, jimage) = target_log_derivative(:, jimage) + dlog_j
-                     fade_target_log_derivative(:, iimage) = &
-                        fade_target_log_derivative(:, iimage) + fade_log
                   END IF
                END IF
             END DO
          END DO
          DO jimage = 1, image_count
-            fade_weight_derivative = weight*(fade_target_log_derivative(:, jimage) - &
-                                             fade_mean_log_derivative(:, jimage))
             image_weight_derivative = weight*(target_log_derivative(:, jimage) - &
-                                              mean_log_derivative(:, jimage)) + &
-                                      fade_weight_derivative
+                                              mean_log_derivative(:, jimage))
             jatom = image_atom(jimage)
             dweight_datom(:, jatom) = dweight_datom(:, jatom) + &
                                       image_weight_derivative
             image_translation = MATMUL( &
                                 cell%hmat, REAL(image_shift(:, jimage), KIND=dp))
-            ! A strain eps changes h^-1 by -h^-1 eps; at a fixed grid point the fade factor of
-            ! the image then changes by (d f / d R) eps (r_point - R).
             DO idir = 1, 3
                DO jdir = 1, 3
                   dweight_dstrain(idir, jdir) = dweight_dstrain(idir, jdir) + &
                                                 image_weight_derivative(idir)* &
-                                                image_translation(jdir) + &
-                                                fade_weight_derivative(idir)*rvecs(jdir, jimage)
+                                                image_translation(jdir)
                END DO
             END DO
          END DO
       END IF
       DEALLOCATE (active_images, image_atom, image_shift, image_coords, image_fade, &
                   image_fade_gradient, distances, normalized_weights, rvecs, unit_rvecs, &
-                  mean_log_derivative, target_log_derivative, fade_mean_log_derivative, &
-                  fade_target_log_derivative)
+                  mean_log_derivative, target_log_derivative)
 
    END SUBROUTINE periodic_atom_image_partition
 
