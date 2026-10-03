@@ -1472,6 +1472,23 @@ CONTAINS
          CALL print_detailed_energy(qs_env, dft_control, input, energy, mulliken_order_p)
       END IF
 
+      ! The native atom-composite route also produces VXC storage for OT line searches.
+      ! Energy-only evaluations skip sum_up_and_integrate, which normally returns it.
+      IF (just_energy .AND. native_skala_grid) THEN
+         IF (ASSOCIATED(v_rspace_new)) THEN
+            DO ispin = 1, SIZE(v_rspace_new)
+               CALL auxbas_pw_pool%give_back_pw(v_rspace_new(ispin))
+            END DO
+            DEALLOCATE (v_rspace_new)
+         END IF
+         IF (ASSOCIATED(v_tau_rspace)) THEN
+            DO ispin = 1, SIZE(v_tau_rspace)
+               CALL auxbas_pw_pool%give_back_pw(v_tau_rspace(ispin))
+            END DO
+            DEALLOCATE (v_tau_rspace)
+         END IF
+      END IF
+
       CALL timestop(handle)
 
    END SUBROUTINE qs_ks_build_kohn_sham_matrix
