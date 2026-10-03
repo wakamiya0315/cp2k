@@ -1474,7 +1474,8 @@ CONTAINS
 
       ! The native atom-composite route also produces VXC storage for OT line searches.
       ! Energy-only evaluations skip sum_up_and_integrate, which normally returns it.
-      IF (just_energy .AND. native_skala_grid) THEN
+      IF (just_energy .AND. (native_gapw_atom_composite_reference .OR. &
+                            native_direct_valence_atom_composite)) THEN
          IF (ASSOCIATED(v_rspace_new)) THEN
             DO ispin = 1, SIZE(v_rspace_new)
                CALL auxbas_pw_pool%give_back_pw(v_rspace_new(ispin))
