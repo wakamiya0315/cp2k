@@ -108,7 +108,7 @@ MODULE qs_vxc_atom
                                               xc_rho_set_release,&
                                               xc_rho_set_type,&
                                               xc_rho_set_update
-!$ USE OMP_LIB, ONLY: omp_get_num_threads
+!$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_get_num_threads
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -125,6 +125,9 @@ MODULE qs_vxc_atom
                                   native_grid_interp_offset_min + 1
    ! A wrapped stencil can touch both end tiles and one adjacent interior tile when the final
    ! tile is shorter than the stencil. Three tiles per direction are therefore sufficient.
+   ! Thread-private copies of the plane-wave adjoint fields are used while all of them together
+   ! need at most this many bytes; larger grids are shared out in tiles.
+   REAL(KIND=dp), PARAMETER, PRIVATE :: adjoint_private_bytes_max = 1.0E9_dp
    INTEGER, PARAMETER, PRIVATE :: native_grid_adjoint_tile_edge = 64, &
                                   native_grid_adjoint_max_tiles_per_direction = 3, &
                                   native_grid_adjoint_max_bins_per_row = &
@@ -303,8 +306,8 @@ CONTAINS
          composite_nflat, composite_pw_nflat, composite_row, &
          gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
          ikind, ir, ispin, iw, jdir, myfun, na, natom, nr, nspins
-      INTEGER :: adjoint_handle, num_pe, section_handle, source_atom, target_atom, &
-                 xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: adjoint_handle, adjoint_threads, num_pe, section_handle, source_atom, &
+                 target_atom, xc_deriv_method_id, xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
@@ -316,7 +319,8 @@ CONTAINS
          atom_composite_reference, direct_valence_atom_composite, donlcc, evaluate_hard, &
          evaluate_soft, gradient_f, image_partition_atom_composite, lsd, my_calculate_forces, &
          native_grid_diagnostics, nlcc, one_center_kind, paw_atom, paw_pseudopotentials, &
-         requested_atom_composite_grid, reuse_partition, rho_g_valid, skala_atom_grid, &
+         adjoint_private, requested_atom_composite_grid, reuse_partition, rho_g_valid, &
+         skala_atom_grid, &
          source_matrix_local, tau_f, tau_r_valid, use_atom_composite_density, &
          use_atom_composite_gradient, use_atom_composite_tau, use_virial
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: composite_partition_included
@@ -350,6 +354,9 @@ CONTAINS
          composite_partition_force, composite_partition_force_local, &
          composite_smooth_density_cache, &
          composite_smooth_kin_cache, local_partition_datom
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: private_density_adjoint, &
+                                                            private_kin_adjoint
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: private_grad_adjoint
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), TARGET     :: smooth_density_adjoint_storage, &
                                                             smooth_kin_adjoint_storage
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :) :: composite_cross_grad, composite_grad, &
@@ -1818,11 +1825,71 @@ CONTAINS
             END DO
 !$OMP END PARALLEL DO
             CALL timeset("skala_vxc_pw_adj_scatter", adjoint_handle)
-            CALL build_native_grid_adjoint_bins( &
-               smooth_rho_r(1)%pw_grid, cell, composite_grid_coords, &
-               image_partition_atom_composite, adjoint_tile_count, adjoint_bin_offsets, &
-               adjoint_bin_rows)
-            adjoint_nbins = SIZE(adjoint_bin_offsets) - 1
+            ! Small plane-wave grids: every thread adds its rows to a private copy of the adjoint
+            ! fields, and the copies are summed in thread order. Large grids: the threads take
+            ! disjoint tiles of the grid, each with the rows whose stencils reach it, so that no
+            ! copies are needed; a row then contributes once per tile it touches.
+            adjoint_threads = 1
+!$          adjoint_threads = omp_get_max_threads()
+            adjoint_private = REAL(adjoint_threads, dp)*REAL(composite_pw_nflat, dp)* &
+                              REAL(5*adjoint_nchannels, dp)*8.0_dp <= adjoint_private_bytes_max
+            IF (adjoint_private) THEN
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP PRIVATE(composite_row, composite_smooth_density_adjoint_value, &
+!$OMP         composite_smooth_gradient_adjoint_value, composite_smooth_kin_adjoint_value, &
+!$OMP         adjoint_entry, adjoint_tile_lower, adjoint_tile_upper, interpolation_stencil, &
+!$OMP         private_density_adjoint, private_grad_adjoint, private_kin_adjoint, &
+!$OMP         adjoint_threads) &
+!$OMP SHARED(adjoint_nchannels, cell, composite_density_grad, composite_grad_grad, &
+!$OMP        composite_grid_coords, composite_kin_grad, composite_nflat, composite_pw_nflat, &
+!$OMP        image_partition_atom_composite, lsd, smooth_density_adjoint_storage, &
+!$OMP        smooth_grad_adjoint_storage, smooth_kin_adjoint_storage, smooth_rho_r)
+               adjoint_threads = 1
+!$             adjoint_threads = omp_get_num_threads()
+               ALLOCATE (private_density_adjoint(composite_pw_nflat, adjoint_nchannels), &
+                         private_grad_adjoint(composite_pw_nflat, 3, adjoint_nchannels), &
+                         private_kin_adjoint(composite_pw_nflat, adjoint_nchannels))
+               private_density_adjoint = 0.0_dp
+               private_grad_adjoint = 0.0_dp
+               private_kin_adjoint = 0.0_dp
+               adjoint_tile_lower = 0
+               adjoint_tile_upper = smooth_rho_r(1)%pw_grid%npts - 1
+!$OMP DO SCHEDULE(STATIC)
+               DO composite_row = 1, composite_nflat
+                  CALL create_native_grid_interpolation_stencil( &
+                     interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, &
+                     composite_grid_coords(:, composite_row), image_partition_atom_composite)
+                  CALL composite_row_smooth_adjoint( &
+                     composite_row, lsd, composite_density_grad, composite_grad_grad, &
+                     composite_kin_grad, composite_smooth_density_adjoint_value, &
+                     composite_smooth_gradient_adjoint_value, composite_smooth_kin_adjoint_value)
+                  CALL add_native_grid_fields_adjoint_tile( &
+                     private_density_adjoint, private_grad_adjoint, private_kin_adjoint, &
+                     smooth_rho_r(1)%pw_grid, interpolation_stencil, &
+                     composite_smooth_density_adjoint_value, &
+                     composite_smooth_gradient_adjoint_value, &
+                     composite_smooth_kin_adjoint_value, adjoint_nchannels, &
+                     adjoint_tile_lower, adjoint_tile_upper)
+               END DO
+!$OMP END DO
+!$OMP DO ORDERED SCHEDULE(STATIC, 1)
+               DO adjoint_entry = 1, adjoint_threads
+!$OMP ORDERED
+                  smooth_density_adjoint_storage = smooth_density_adjoint_storage + &
+                                                   private_density_adjoint
+                  smooth_grad_adjoint_storage = smooth_grad_adjoint_storage + private_grad_adjoint
+                  smooth_kin_adjoint_storage = smooth_kin_adjoint_storage + private_kin_adjoint
+!$OMP END ORDERED
+               END DO
+!$OMP END DO
+               DEALLOCATE (private_density_adjoint, private_grad_adjoint, private_kin_adjoint)
+!$OMP END PARALLEL
+            ELSE
+               CALL build_native_grid_adjoint_bins( &
+                  smooth_rho_r(1)%pw_grid, cell, composite_grid_coords, &
+                  image_partition_atom_composite, adjoint_tile_count, adjoint_bin_offsets, &
+                  adjoint_bin_rows)
+               adjoint_nbins = SIZE(adjoint_bin_offsets) - 1
 !$OMP PARALLEL DO SCHEDULE(DYNAMIC) DEFAULT(NONE) &
 !$OMP PRIVATE(adjoint_entry, composite_row, composite_smooth_density_adjoint_value, &
 !$OMP         composite_smooth_gradient_adjoint_value, composite_smooth_kin_adjoint_value, &
@@ -1832,44 +1899,32 @@ CONTAINS
 !$OMP        composite_grid_coords, composite_kin_grad, image_partition_atom_composite, lsd, &
 !$OMP        smooth_density_adjoint_storage, smooth_grad_adjoint_storage, &
 !$OMP        smooth_kin_adjoint_storage, smooth_rho_r)
-            DO adjoint_bin = 1, adjoint_nbins
-               CALL native_grid_adjoint_tile_bounds( &
-                  smooth_rho_r(1)%pw_grid, adjoint_bin, adjoint_tile_count, &
-                  adjoint_tile_lower, adjoint_tile_upper)
-               DO adjoint_entry = adjoint_bin_offsets(adjoint_bin), &
-                  adjoint_bin_offsets(adjoint_bin + 1) - 1
-                  composite_row = adjoint_bin_rows(adjoint_entry)
-                  CALL create_native_grid_interpolation_stencil( &
-                     interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, &
-                     composite_grid_coords(:, composite_row), image_partition_atom_composite)
-                  IF (lsd) THEN
-                     composite_smooth_density_adjoint_value = &
-                        composite_density_grad(composite_row, :)
-                     composite_smooth_gradient_adjoint_value = &
-                        composite_grad_grad(composite_row, :, :)
-                     composite_smooth_kin_adjoint_value = composite_kin_grad(composite_row, :)
-                  ELSE
-                     composite_smooth_density_adjoint_value = 0.0_dp
-                     composite_smooth_gradient_adjoint_value = 0.0_dp
-                     composite_smooth_kin_adjoint_value = 0.0_dp
-                     composite_smooth_density_adjoint_value(1) = &
-                        SUM(composite_density_grad(composite_row, :))
-                     composite_smooth_gradient_adjoint_value(:, 1) = &
-                        SUM(composite_grad_grad(composite_row, :, :), DIM=2)
-                     composite_smooth_kin_adjoint_value(1) = &
-                        SUM(composite_kin_grad(composite_row, :))
-                  END IF
-                  CALL add_native_grid_fields_adjoint_tile( &
-                     smooth_density_adjoint_storage, smooth_grad_adjoint_storage, &
-                     smooth_kin_adjoint_storage, smooth_rho_r(1)%pw_grid, interpolation_stencil, &
-                     composite_smooth_density_adjoint_value, &
-                     composite_smooth_gradient_adjoint_value, &
-                     composite_smooth_kin_adjoint_value, adjoint_nchannels, &
+               DO adjoint_bin = 1, adjoint_nbins
+                  CALL native_grid_adjoint_tile_bounds( &
+                     smooth_rho_r(1)%pw_grid, adjoint_bin, adjoint_tile_count, &
                      adjoint_tile_lower, adjoint_tile_upper)
+                  DO adjoint_entry = adjoint_bin_offsets(adjoint_bin), &
+                     adjoint_bin_offsets(adjoint_bin + 1) - 1
+                     composite_row = adjoint_bin_rows(adjoint_entry)
+                     CALL create_native_grid_interpolation_stencil( &
+                        interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, &
+                        composite_grid_coords(:, composite_row), image_partition_atom_composite)
+                     CALL composite_row_smooth_adjoint( &
+                        composite_row, lsd, composite_density_grad, composite_grad_grad, &
+                        composite_kin_grad, composite_smooth_density_adjoint_value, &
+                        composite_smooth_gradient_adjoint_value, composite_smooth_kin_adjoint_value)
+                     CALL add_native_grid_fields_adjoint_tile( &
+                        smooth_density_adjoint_storage, smooth_grad_adjoint_storage, &
+                        smooth_kin_adjoint_storage, smooth_rho_r(1)%pw_grid, interpolation_stencil, &
+                        composite_smooth_density_adjoint_value, &
+                        composite_smooth_gradient_adjoint_value, &
+                        composite_smooth_kin_adjoint_value, adjoint_nchannels, &
+                        adjoint_tile_lower, adjoint_tile_upper)
+                  END DO
                END DO
-            END DO
 !$OMP END PARALLEL DO
-            DEALLOCATE (adjoint_bin_offsets, adjoint_bin_rows)
+               DEALLOCATE (adjoint_bin_offsets, adjoint_bin_rows)
+            END IF
             CALL timestop(adjoint_handle)
             CALL timestop(section_handle)
             ! The contractions below check the adjoints; they are printed only with
@@ -3793,6 +3848,43 @@ CONTAINS
          IF (use_tau) kin_adjoint(1) = 0.5_dp*SUM(kin_grad(row, :))
       END IF
    END SUBROUTINE composite_row_cross_adjoint
+
+! **************************************************************************************************
+!> \brief Model derivatives of one composite row as seen by the plane-wave interpolation adjoint
+!>        (the smooth fields enter every spin channel; without spin they are summed).
+!> \param row composite row
+!> \param lsd spin-polarized calculation
+!> \param density_grad model derivative with respect to the composite density
+!> \param grad_grad model derivative with respect to the composite gradient
+!> \param kin_grad model derivative with respect to the composite kinetic-energy density
+!> \param density_adjoint ...
+!> \param gradient_adjoint ...
+!> \param kin_adjoint ...
+! **************************************************************************************************
+   SUBROUTINE composite_row_smooth_adjoint(row, lsd, density_grad, grad_grad, kin_grad, &
+                                           density_adjoint, gradient_adjoint, kin_adjoint)
+      INTEGER, INTENT(IN)                                :: row
+      LOGICAL, INTENT(IN)                                :: lsd
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: density_grad
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: grad_grad
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: kin_grad
+      REAL(dp), DIMENSION(2), INTENT(OUT)                :: density_adjoint
+      REAL(dp), DIMENSION(3, 2), INTENT(OUT)             :: gradient_adjoint
+      REAL(dp), DIMENSION(2), INTENT(OUT)                :: kin_adjoint
+
+      IF (lsd) THEN
+         density_adjoint = density_grad(row, :)
+         gradient_adjoint = grad_grad(row, :, :)
+         kin_adjoint = kin_grad(row, :)
+      ELSE
+         density_adjoint = 0.0_dp
+         gradient_adjoint = 0.0_dp
+         kin_adjoint = 0.0_dp
+         density_adjoint(1) = SUM(density_grad(row, :))
+         gradient_adjoint(:, 1) = SUM(grad_grad(row, :, :), DIM=2)
+         kin_adjoint(1) = SUM(kin_grad(row, :))
+      END IF
+   END SUBROUTINE composite_row_smooth_adjoint
 
 ! **************************************************************************************************
 !> \brief Empty the geometry cache of the atom-composite route.
