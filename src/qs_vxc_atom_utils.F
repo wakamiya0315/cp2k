@@ -433,9 +433,9 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'calc_tau_atom'
 
-      INTEGER                                            :: dir, handle, ia, ibas, igrid, ir, ispin, &
-                                                            na, nbas, ngrid, nr
-      REAL(dp)                                           :: tau_sum
+      INTEGER                                            :: dir, handle, ia, ibas, igrid0, ir, &
+                                                            ispin, na, nbas, ngrid, nr
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: tau_sum
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: work
 
       CALL timeset(routineN, handle)
@@ -452,41 +452,58 @@ CONTAINS
       ngrid = na*nr
       ALLOCATE (work(ngrid, nbas))
 
+      ! Each grid point sums its basis contributions in basis order, as a dot product would; the
+      ! points of one radial shell are summed together so that the arrays are read with unit
+      ! stride.
       DO ispin = 1, nspins
          DO dir = 1, 3
             CALL dgemm('N', 'T', ngrid, nbas, nbas, 0.5_dp, tau_cache%grad(:, :, dir), &
                        ngrid, rho_atom%cpc_h(ispin)%r_coef, nbas, 0.0_dp, work, ngrid)
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(2) SCHEDULE(STATIC) &
+!$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, tau_h, work) &
-!$OMP PRIVATE(ia, ibas, igrid, ir, tau_sum)
+!$OMP PRIVATE(ia, ibas, igrid0, ir, tau_sum)
+            ALLOCATE (tau_sum(na))
+!$OMP DO SCHEDULE(STATIC)
             DO ir = 1, nr
-               DO ia = 1, na
-                  igrid = ia + (ir - 1)*na
-                  tau_sum = 0.0_dp
-                  DO ibas = 1, nbas
-                     tau_sum = tau_sum + tau_cache%grad(igrid, ibas, dir)*work(igrid, ibas)
+               igrid0 = (ir - 1)*na
+               tau_sum = 0.0_dp
+               DO ibas = 1, nbas
+                  DO ia = 1, na
+                     tau_sum(ia) = tau_sum(ia) + &
+                                   tau_cache%grad(igrid0 + ia, ibas, dir)*work(igrid0 + ia, ibas)
                   END DO
-                  tau_h(ia, ir, ispin) = tau_h(ia, ir, ispin) + tau_sum
+               END DO
+               DO ia = 1, na
+                  tau_h(ia, ir, ispin) = tau_h(ia, ir, ispin) + tau_sum(ia)
                END DO
             END DO
-!$OMP END PARALLEL DO
+!$OMP END DO
+            DEALLOCATE (tau_sum)
+!$OMP END PARALLEL
 
             CALL dgemm('N', 'T', ngrid, nbas, nbas, 0.5_dp, tau_cache%grad(:, :, dir), &
                        ngrid, rho_atom%cpc_s(ispin)%r_coef, nbas, 0.0_dp, work, ngrid)
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(2) SCHEDULE(STATIC) &
+!$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, tau_s, work) &
-!$OMP PRIVATE(ia, ibas, igrid, ir, tau_sum)
+!$OMP PRIVATE(ia, ibas, igrid0, ir, tau_sum)
+            ALLOCATE (tau_sum(na))
+!$OMP DO SCHEDULE(STATIC)
             DO ir = 1, nr
-               DO ia = 1, na
-                  igrid = ia + (ir - 1)*na
-                  tau_sum = 0.0_dp
-                  DO ibas = 1, nbas
-                     tau_sum = tau_sum + tau_cache%grad(igrid, ibas, dir)*work(igrid, ibas)
+               igrid0 = (ir - 1)*na
+               tau_sum = 0.0_dp
+               DO ibas = 1, nbas
+                  DO ia = 1, na
+                     tau_sum(ia) = tau_sum(ia) + &
+                                   tau_cache%grad(igrid0 + ia, ibas, dir)*work(igrid0 + ia, ibas)
                   END DO
-                  tau_s(ia, ir, ispin) = tau_s(ia, ir, ispin) + tau_sum
+               END DO
+               DO ia = 1, na
+                  tau_s(ia, ir, ispin) = tau_s(ia, ir, ispin) + tau_sum(ia)
                END DO
             END DO
-!$OMP END PARALLEL DO
+!$OMP END DO
+            DEALLOCATE (tau_sum)
+!$OMP END PARALLEL
          END DO
       END DO
 
@@ -864,10 +881,13 @@ CONTAINS
                         gVXGg_h = 0.0_dp
                         gVXGg_s = 0.0_dp
 
-                        ! Cross Term
+                        ! Cross Term. The angular points are the inner loop so that the potentials
+                        ! are read with unit stride; every sum over the radial points keeps its
+                        ! order and therefore its value.
                         DO l = lmin12, lmax12
-                           DO ia = 1, na
-                              DO ir = 1, nr
+                           DO ir = 1, nr
+                              urad = grid_atom%oorad2l(ir, 1)
+                              DO ia = 1, na
                                  gVXCg_h(ia, l) = gVXCg_h(ia, l) + &
                                                   gg(ir, l)*vxc_h(ia, ir, ispin) + &
                                                   dgg(ir, l)* &
@@ -881,8 +901,6 @@ CONTAINS
                                                   (vxg_s(1, ia, ir, ispin)*harmonics%a(1, ia) + &
                                                    vxg_s(2, ia, ir, ispin)*harmonics%a(2, ia) + &
                                                    vxg_s(3, ia, ir, ispin)*harmonics%a(3, ia))
-
-                                 urad = grid_atom%oorad2l(ir, 1)
 
                                  gVXGg_h(1, ia, l) = gVXGg_h(1, ia, l) + &
                                                      vxg_h(1, ia, ir, ispin)* &
@@ -908,8 +926,8 @@ CONTAINS
                                                      vxg_s(3, ia, ir, ispin)* &
                                                      gg(ir, l)*urad
 
-                              END DO ! ir
-                           END DO ! ia
+                              END DO ! ia
+                           END DO ! ir
                         END DO ! l
 
                         matso_h = 0.0_dp
@@ -1040,7 +1058,7 @@ CONTAINS
          int_h = 0.0_dp
          int_s = 0.0_dp
          DO dir = 1, 3
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(3) SCHEDULE(STATIC) &
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
 !$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, vtau_h, weighted_grad) &
 !$OMP PRIVATE(ia, ibas, igrid, ir)
             DO ibas = 1, nbas
@@ -1056,7 +1074,7 @@ CONTAINS
             CALL dgemm('T', 'N', nbas, nbas, ngrid, 0.5_dp, tau_cache%grad(:, :, dir), &
                        ngrid, weighted_grad, ngrid, 1.0_dp, int_h, nbas)
 
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(3) SCHEDULE(STATIC) &
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
 !$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, vtau_s, weighted_grad) &
 !$OMP PRIVATE(ia, ibas, igrid, ir)
             DO ibas = 1, nbas
