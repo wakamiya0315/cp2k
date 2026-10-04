@@ -258,7 +258,8 @@ CONTAINS
          gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
          ikind, image_i1, image_i2, image_i3, image_shell(3), image_shift(3), ir, ispin, iw, jdir, &
          myfun, na, natom, nr, nspins
-      INTEGER :: num_pe, source_atom, target_atom, xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: num_pe, section_handle, source_atom, target_atom, xc_deriv_method_id, &
+                 xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
@@ -656,6 +657,8 @@ CONTAINS
             composite_base_grid_weights = 0.0_dp
             composite_atomic_grid_weights = 0.0_dp
 
+            ! Smooth fields and their gradients on the plane-wave grid, replicated on every rank.
+            CALL timeset("skala_vxc_pw_gather", section_handle)
             CALL qs_rho_get(rho_struct, rho_r=smooth_rho_r, rho_g=smooth_rho_g, &
                             tau_r=smooth_tau_r, rho_g_valid=rho_g_valid, &
                             tau_r_valid=tau_r_valid)
@@ -708,6 +711,7 @@ CONTAINS
                                                 composite_smooth_drho(idir)%array)
                END DO
             END IF
+            CALL timestop(section_handle)
          END IF
 
          ! Initialize energy contribution from the one center XC terms to zero
@@ -825,6 +829,7 @@ CONTAINS
                iatom = atom_list(iat)
 
                IF (one_center_kind) THEN
+                  IF (atom_composite_active) CALL timeset("skala_vxc_1c_fields", section_handle)
                   my_rho_atom_set(iatom)%exc_h = 0.0_dp
                   my_rho_atom_set(iatom)%exc_s = 0.0_dp
 
@@ -860,29 +865,18 @@ CONTAINS
                                            rho_nlcc(:, 2), drho_h, drho_s)
                      END IF
                   END DO
+                  IF (atom_composite_active) CALL timestop(section_handle)
                END IF
 
                IF (atom_composite_active) THEN
+                  CALL timeset("skala_vxc_partition", section_handle)
 !$OMP PARALLEL DO COLLAPSE(2) IF (image_partition_atom_composite) SCHEDULE(STATIC) DEFAULT(NONE) &
-!$OMP PRIVATE(composite_row, composite_point, composite_smooth_density_value, &
-!$OMP         composite_smooth_gradient_value, composite_smooth_kin_value, &
-!$OMP         idir, ispin, &
-!$OMP         gth_potential, nlcc_density, nlcc_gradient, nlcc_hessian, nlcc_spin_factor, &
-!$OMP         interpolation_stencil, partition_weight, sgp_potential, source_atom) &
-!$OMP SHARED(atom_composite_reference, cell, composite_atom_coords, composite_atom_kind, &
-!$OMP        composite_atom_start, composite_atomic_grid_weights, composite_base_grid_weights, &
-!$OMP        composite_density, composite_distances, composite_grad, &
-!$OMP        composite_grid_coords, composite_grid_weights, composite_kin, &
-!$OMP        composite_image_periodicity, composite_partition_atom_coords, &
-!$OMP        composite_partition_weights, &
-!$OMP        composite_smooth_density_cache, composite_smooth_drho, composite_smooth_drhoa, &
-!$OMP        composite_smooth_drhob, composite_smooth_gradient_cache, &
-!$OMP        composite_smooth_kin_cache, composite_smooth_rho, composite_smooth_rhoa, &
-!$OMP        composite_smooth_rhob, composite_smooth_tau, composite_smooth_tau_a, &
-!$OMP        composite_smooth_tau_b, drho_h, drho_s, grid_atom, iatom, &
-!$OMP        image_partition_atom_composite, lsd, my_kind_set, na, nlcc, nr, one_center_kind, &
-!$OMP        particle_set, rho_h, rho_s, smooth_rho_r, tau_h, tau_s, &
-!$OMP        use_atom_composite_density, use_atom_composite_gradient, use_atom_composite_tau)
+!$OMP PRIVATE(composite_row, composite_point, partition_weight) &
+!$OMP SHARED(cell, composite_atom_coords, composite_atom_start, &
+!$OMP        composite_atomic_grid_weights, composite_base_grid_weights, composite_distances, &
+!$OMP        composite_grid_coords, composite_grid_weights, composite_image_periodicity, &
+!$OMP        composite_partition_atom_coords, composite_partition_weights, grid_atom, iatom, &
+!$OMP        image_partition_atom_composite, na, nr, particle_set)
                   DO ir = 1, nr
                      DO ia = 1, na
                         composite_row = composite_atom_start(iatom) + (ir - 1)*na + ia - 1
@@ -913,6 +907,34 @@ CONTAINS
                         composite_grid_weights(composite_row) = &
                            composite_base_grid_weights(composite_row)* &
                            partition_weight
+                     END DO
+                  END DO
+!$OMP END PARALLEL DO
+                  CALL timestop(section_handle)
+
+                  CALL timeset("skala_vxc_pw_interp", section_handle)
+!$OMP PARALLEL DO COLLAPSE(2) IF (image_partition_atom_composite) SCHEDULE(STATIC) DEFAULT(NONE) &
+!$OMP PRIVATE(composite_row, composite_point, composite_smooth_density_value, &
+!$OMP         composite_smooth_gradient_value, composite_smooth_kin_value, &
+!$OMP         idir, ispin, &
+!$OMP         gth_potential, nlcc_density, nlcc_gradient, nlcc_hessian, nlcc_spin_factor, &
+!$OMP         interpolation_stencil, sgp_potential, source_atom) &
+!$OMP SHARED(atom_composite_reference, cell, composite_atom_kind, &
+!$OMP        composite_atom_start, &
+!$OMP        composite_density, composite_grad, &
+!$OMP        composite_grid_coords, composite_kin, &
+!$OMP        composite_smooth_density_cache, composite_smooth_drho, composite_smooth_drhoa, &
+!$OMP        composite_smooth_drhob, composite_smooth_gradient_cache, &
+!$OMP        composite_smooth_kin_cache, composite_smooth_rho, composite_smooth_rhoa, &
+!$OMP        composite_smooth_rhob, composite_smooth_tau, composite_smooth_tau_a, &
+!$OMP        composite_smooth_tau_b, drho_h, drho_s, iatom, &
+!$OMP        image_partition_atom_composite, lsd, my_kind_set, na, nlcc, nr, one_center_kind, &
+!$OMP        particle_set, rho_h, rho_s, smooth_rho_r, tau_h, tau_s, &
+!$OMP        use_atom_composite_density, use_atom_composite_gradient, use_atom_composite_tau)
+                  DO ir = 1, nr
+                     DO ia = 1, na
+                        composite_row = composite_atom_start(iatom) + (ir - 1)*na + ia - 1
+                        composite_point = composite_grid_coords(:, composite_row)
                         CALL create_native_grid_interpolation_stencil( &
                            interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, composite_point, &
                            image_partition_atom_composite)
@@ -1027,11 +1049,15 @@ CONTAINS
                      END DO
                   END DO
 !$OMP END PARALLEL DO
+                  CALL timestop(section_handle)
                   CPASSERT(nr*na == composite_atom_end(iatom) - composite_atom_start(iatom) + 1)
                END IF
 
                IF (.NOT. one_center_kind) CYCLE
 
+               ! In the atom-composite reference the one-center XC below runs with zero
+               ! potentials and its matrices are discarded later.
+               IF (atom_composite_reference) CALL timeset("skala_vxc_1c_discarded", section_handle)
                DO ir = 1, nr
                   IF (tau_f) THEN
                      CALL fill_rho_set(rho_set_h, lsd, nspins, needs, rho_h, drho_h, tau_h, na, ir)
@@ -1157,6 +1183,7 @@ CONTAINS
                      CALL dgaVtaudgb(vtau_h, vtau_s, int_hh, int_ss, tau_basis_cache, nspins)
                   END IF
                END IF ! energy_only
+               IF (atom_composite_reference) CALL timestop(section_handle)
                NULLIFY (r_h, r_s, dr_h, dr_s)
             END DO ! iat
 
@@ -1191,6 +1218,7 @@ CONTAINS
                       ASSOCIATED(gth_potential) .OR. ASSOCIATED(sgp_potential), &
                       zeff, zatom)) CYCLE
 
+                  CALL timeset("skala_vxc_1c_fields", section_handle)
                   CALL replicate_rho_atom_radial( &
                      para_env, my_rho_atom_set, my_kind_set(ikind), atom_list, natom, nspins)
                   nr = grid_atom%nr
@@ -1202,10 +1230,12 @@ CONTAINS
                   CALL reallocate(drho_s, 1, 4, 1, na, 1, nr, 1, nspins)
                   CALL reallocate(tau_h, 1, na, 1, nr, 1, nspins)
                   CALL reallocate(tau_s, 1, na, 1, nr, 1, nspins)
+                  CALL timestop(section_handle)
 
                   ! The one-center density matrices are already globally reduced. Distribute the
                   ! overlap work by target atom so that every rank constructs only its model rows.
                   DO iat = 1, natom
+                     CALL timeset("skala_vxc_1c_fields", section_handle)
                      source_atom = atom_list(iat)
                      rho_atom => my_rho_atom_set(source_atom)
                      NULLIFY (r_h, r_s, dr_h, dr_s, r_h_d, r_s_d)
@@ -1225,7 +1255,9 @@ CONTAINS
 
                      cross_cutoff = gapw_atom_grid_support_radius( &
                                     grid_atom, rho_h, rho_s, drho_h, drho_s, tau_h, tau_s)
+                     CALL timestop(section_handle)
                      IF (cross_cutoff <= 0.0_dp) CYCLE
+                     CALL timeset("skala_vxc_cross_fwd", section_handle)
                      composite_cross_cutoff_max = MAX(composite_cross_cutoff_max, cross_cutoff)
                      image_shell = 0
                      DO idir = 1, 3
@@ -1318,6 +1350,7 @@ CONTAINS
                         END DO
                      END DO
 !$OMP END PARALLEL DO
+                     CALL timestop(section_handle)
                   END DO
 
                   CALL release_tau_basis_cache(tau_basis_cache)
@@ -1325,6 +1358,7 @@ CONTAINS
             END IF
 
             IF (native_grid_diagnostics) THEN
+               CALL timeset("skala_vxc_diagnostics", section_handle)
                composite_cross_density_max = MAXVAL(ABS(composite_cross_density))
                composite_cross_grad_max = MAXVAL(ABS(composite_cross_grad))
                composite_cross_kin_max = MAXVAL(ABS(composite_cross_kin))
@@ -1339,6 +1373,7 @@ CONTAINS
                      composite_cross_cutoff_max, composite_cross_density_max, &
                      composite_cross_grad_max, composite_cross_kin_max
                END IF
+               CALL timestop(section_handle)
             END IF
             composite_density(:, :) = composite_density(:, :) + composite_cross_density(:, :)
             composite_grad(:, :, :) = composite_grad(:, :, :) + composite_cross_grad(:, :, :)
@@ -1350,6 +1385,7 @@ CONTAINS
                                        (composite_density(:, 1) + composite_density(:, 2)))
             CALL para_env%sum(atom_composite_nelec)
             IF (atom_composite_reference .AND. my_calculate_forces) THEN
+               CALL timeset("skala_vxc_model", section_handle)
                CALL skala_gapw_atom_composite_energy( &
                   my_xc_section, para_env, composite_density, composite_grad, composite_kin, &
                   composite_grid_coords, composite_grid_weights, composite_atomic_grid_weights, &
@@ -1357,6 +1393,8 @@ CONTAINS
                   composite_density_grad, composite_grad_grad, composite_kin_grad, &
                   composite_grid_coord_grad, composite_grid_weight_grad, &
                   composite_atomic_grid_weight_grad, composite_atom_coord_grad)
+               CALL timestop(section_handle)
+               CALL timeset("skala_vxc_force_grid", section_handle)
                ALLOCATE (composite_cross_force(3, SIZE(particle_set)), &
                          composite_explicit_force(3, SIZE(particle_set)), &
                          composite_grid_coord_force(3, SIZE(particle_set)), &
@@ -1612,6 +1650,7 @@ CONTAINS
                DEALLOCATE (composite_nlcc_center_force_local, composite_partition_force_local, &
                            local_partition_datom)
 !$OMP END PARALLEL
+               CALL timestop(section_handle)
                ! The target atom grids can overlap augmentation regions of other atoms
                ! and periodic images. Differentiate the same discrete interpolation used
                ! in the forward composite fields, including the explicit image strain.
@@ -1640,6 +1679,7 @@ CONTAINS
                      CALL reallocate(tau_s, 1, na, 1, nr, 1, nspins)
 
                      DO iat = 1, natom
+                        CALL timeset("skala_vxc_1c_fields", section_handle)
                         source_atom = atom_list(iat)
                         rho_atom => my_rho_atom_set(source_atom)
                         NULLIFY (r_h, r_s, dr_h, dr_s, r_h_d, r_s_d)
@@ -1659,7 +1699,9 @@ CONTAINS
 
                         cross_cutoff = gapw_atom_grid_support_radius( &
                                        grid_atom, rho_h, rho_s, drho_h, drho_s, tau_h, tau_s)
+                        CALL timestop(section_handle)
                         IF (cross_cutoff <= 0.0_dp) CYCLE
+                        CALL timeset("skala_vxc_force_cross", section_handle)
                         image_shell = 0
                         DO idir = 1, 3
                            IF (cell%perd(idir) == 1) THEN
@@ -1798,6 +1840,7 @@ CONTAINS
 !$OMP END CRITICAL(skala_atom_composite_cross_reduction)
                         DEALLOCATE (composite_cross_force_local)
 !$OMP END PARALLEL
+                        CALL timestop(section_handle)
                      END DO
                      CALL release_tau_basis_cache(tau_basis_cache)
                   END DO
@@ -1928,12 +1971,15 @@ CONTAINS
                            composite_partition_datom, composite_partition_dstrain, &
                            composite_partition_force, composite_partition_included)
             ELSE
+               CALL timeset("skala_vxc_model", section_handle)
                CALL skala_gapw_atom_composite_energy( &
                   my_xc_section, para_env, composite_density, composite_grad, composite_kin, &
                   composite_grid_coords, composite_grid_weights, composite_atomic_grid_weights, &
                   composite_local_grid_sizes, composite_local_atom_coords, atom_composite_exc, &
                   composite_density_grad, composite_grad_grad, composite_kin_grad)
+               CALL timestop(section_handle)
             END IF
+            CALL timeset("skala_vxc_pw_adj", section_handle)
             composite_pw_nflat = PRODUCT(smooth_rho_r(1)%pw_grid%npts)
             adjoint_nchannels = MERGE(2, 1, lsd)
             ALLOCATE (smooth_density_adjoint_storage(composite_pw_nflat, adjoint_nchannels), &
@@ -1994,6 +2040,8 @@ CONTAINS
             END DO
 !$OMP END PARALLEL DO
             DEALLOCATE (adjoint_bin_offsets, adjoint_bin_rows)
+            CALL timestop(section_handle)
+            CALL timeset("skala_vxc_diagnostics", section_handle)
             smooth_input_contraction = 0.0_dp
 !$OMP PARALLEL DO SCHEDULE(STATIC) REDUCTION(+:smooth_input_contraction) DEFAULT(NONE) &
 !$OMP PRIVATE(composite_smooth_density_value, composite_smooth_gradient_value, &
@@ -2033,6 +2081,8 @@ CONTAINS
                END DO
             END DO
 !$OMP END PARALLEL DO
+            CALL timestop(section_handle)
+            CALL timeset("skala_vxc_pw_adj", section_handle)
             smooth_density_adjoint => smooth_density_adjoint_storage
             smooth_grad_adjoint => smooth_grad_adjoint_storage
             smooth_kin_adjoint => smooth_kin_adjoint_storage
@@ -2071,6 +2121,7 @@ CONTAINS
             END DO
             CALL para_env%sum(smooth_grid_contraction)
             DEALLOCATE (smooth_vxc_rho, smooth_vxc_tau)
+            CALL timestop(section_handle)
 
             one_center_field_contraction = 0.0_dp
             one_center_matrix_contraction = 0.0_dp
@@ -2110,10 +2161,13 @@ CONTAINS
                   CALL reallocate(tau_s, 1, na, 1, nr, 1, nspins)
                   CALL reallocate(vtau_h, 1, na, 1, nr, 1, nspins)
                   CALL reallocate(vtau_s, 1, na, 1, nr, 1, nspins)
+                  CALL timeset("skala_vxc_1c_fields", section_handle)
                   CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics)
+                  CALL timestop(section_handle)
 
                   bo = get_limit(natom, para_env%num_pe, para_env%mepos)
                   DO iat = 1, natom
+                     CALL timeset("skala_vxc_1c_fields", section_handle)
                      iatom = atom_list(iat)
                      source_matrix_local = iat >= bo(1) .AND. iat <= bo(2)
                      rho_atom => my_rho_atom_set(iatom)
@@ -2132,7 +2186,9 @@ CONTAINS
                                               ir, r_h, r_s, rho_h, rho_s, dr_h, dr_s, &
                                               r_h_d, r_s_d, drho_h, drho_s)
                      END DO
+                     CALL timestop(section_handle)
 
+                     CALL timeset("skala_vxc_1c_adj_interp", section_handle)
                      vxc_h = 0.0_dp
                      vxc_s = 0.0_dp
                      vxg_h = 0.0_dp
@@ -2312,8 +2368,10 @@ CONTAINS
                      CALL para_env%sum(vxg_s)
                      CALL para_env%sum(vtau_h)
                      CALL para_env%sum(vtau_s)
+                     CALL timestop(section_handle)
                      IF (.NOT. source_matrix_local) CYCLE
 
+                     CALL timeset("skala_vxc_diagnostics", section_handle)
                      one_center_rho_grad_field_contraction = &
                         one_center_rho_grad_field_contraction + SUM(vxc_h*(rho_h - rho_s)) + &
                         SUM(vxg_h*(drho_h(1:3, :, :, :) - drho_s(1:3, :, :, :)))
@@ -2349,6 +2407,8 @@ CONTAINS
                         int_hh(ispin)%r_coef = 0.0_dp
                         int_ss(ispin)%r_coef = 0.0_dp
                      END DO
+                     CALL timestop(section_handle)
+                     CALL timeset("skala_vxc_1c_adj_ks", section_handle)
                      CALL gaVxcgb_GC(vxc_h, vxc_s, vxg_h, vxg_s, int_hh, int_ss, &
                                      grid_atom, basis_1c, harmonics, nspins)
                      DO ispin = 1, nspins
@@ -2376,10 +2436,12 @@ CONTAINS
                         END IF
                      END DO
                      DEALLOCATE (composite_int_h, composite_int_s)
+                     CALL timestop(section_handle)
                   END DO
                   CALL release_tau_basis_cache(tau_basis_cache)
                END DO
             END IF
+            CALL timeset("skala_vxc_diagnostics", section_handle)
             CALL para_env%sum(one_center_density_field_contraction)
             CALL para_env%sum(one_center_density_matrix_contraction)
             CALL para_env%sum(one_center_gradient_field_contraction)
@@ -2548,6 +2610,7 @@ CONTAINS
                   END IF
                END IF
             END IF
+            CALL timestop(section_handle)
             CALL xc_rho_set_release(smooth_rho_set, pw_pool=auxbas_pw_pool)
             DEALLOCATE (composite_atomic_grid_sizes, composite_atom_kind, &
                         composite_atom_kind_index, composite_atom_start, composite_atom_end, &
