@@ -302,6 +302,14 @@ CONTAINS
          ELSE
             nl_table_key = natom*task%jatom + task%iatom
          END IF
+         ! With k-points every periodic image has its own blocks. Separate keys for the images let
+         ! the threads share the images of one atom pair, which for cells with one or a few atoms
+         ! are almost all of the work; the tasks of one block keep their order.
+         IF (nimages > 1) THEN
+            img = cell_to_index(task%cell(1), task%cell(2), task%cell(3))
+            CPASSERT(img > 0)
+            nl_table_key = nl_table_key + INT(natom, int_8)*INT(natom + 1, int_8)*INT(img - 1, int_8)
+         END IF
          CALL nl_hash_table_add(nl_hash_table, nl_table_key, task)
       END DO
       CALL neighbor_list_iterator_release(nl_iterator)
