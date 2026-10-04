@@ -824,6 +824,9 @@ CONTAINS
             scf_env%skip_diis = .TRUE.
             CPWARN("the DIIS scheme is disabled, since EPS_DIIS < EPS_SCF")
          END IF
+         ! PULAY_P accelerates on the density-matrix residual; a Kohn-Sham DIIS step would leave
+         ! its history, so the two are not combined
+         IF (scf_env%mixing_store%dm_pulay) scf_env%skip_diis = .TRUE.
       END IF
 
    END SUBROUTINE qs_scf_ensure_mixing
@@ -1422,6 +1425,10 @@ CONTAINS
       END IF
 
       ! Some preparation for the mixing
+      IF (scf_env%mixing_method == direct_mixing_nr) THEN
+         ! a new SCF run starts the density-matrix Pulay history afresh
+         IF (scf_env%mixing_store%dm_pulay) scf_env%mixing_store%dm_pulay_ncall = 0
+      END IF
       IF (scf_env%mixing_method > 1) THEN
          IF (dft_control%qs_control%gapw) THEN
             CALL get_qs_env(qs_env=qs_env, rho_atom_set=rho_atom)
