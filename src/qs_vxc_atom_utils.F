@@ -25,6 +25,7 @@ MODULE qs_vxc_atom_utils
    USE qs_kind_types,                   ONLY: has_nlcc
    USE qs_rho_atom_types,               ONLY: rho_atom_coeff,&
                                               rho_atom_type
+   USE util,                            ONLY: sort
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -43,7 +44,13 @@ MODULE qs_vxc_atom_utils
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: grad
    END TYPE tau_basis_cache_type
 
+   ! The NLCC core density and its first two derivatives are dropped below this magnitude; it
+   ! sets the radius within which the cores of all atoms and their periodic images are added.
+   REAL(dp), PARAMETER, PRIVATE :: nlcc_field_eps = 1.0E-14_dp, nlcc_cutoff_step = 0.02_dp
+   INTEGER, PARAMETER, PRIVATE :: nlcc_cutoff_steps = 2500
+
    PUBLIC :: evaluate_nlcc_primitive_fields, gapw_atom_grid_support_radius, &
+             nlcc_primitive_cutoff, build_nlcc_image_list, nlcc_image_range, &
              create_tau_basis_cache, release_tau_basis_cache, &
              calc_rho_angular, calc_tau_atom, calc_rho_nlcc, &
              gaVxcgb_noGC, gaVxcgb_GC, dgaVtaudgb
@@ -139,6 +146,182 @@ CONTAINS
          hessian(idir, idir) = hessian(idir, idir) + 2.0_dp*rho_x
       END DO
    END SUBROUTINE evaluate_nlcc_primitive_fields
+
+! **************************************************************************************************
+!> \brief Radius beyond which the NLCC core density of a pseudopotential and its first two
+!>        derivatives stay below nlcc_field_eps; zero without NLCC.
+!> \param gth_potential optional GTH potential
+!> \param sgp_potential optional separable Gaussian potential
+!> \return cutoff radius in bohr
+! **************************************************************************************************
+   FUNCTION nlcc_primitive_cutoff(gth_potential, sgp_potential) RESULT(cutoff)
+      TYPE(gth_potential_type), INTENT(IN), POINTER      :: gth_potential
+      TYPE(sgp_potential_type), INTENT(IN), POINTER      :: sgp_potential
+      REAL(dp)                                           :: cutoff
+
+      INTEGER                                            :: istep
+      REAL(dp)                                           :: rho
+      REAL(dp), DIMENSION(3)                             :: gradient, origin, point
+      REAL(dp), DIMENSION(3, 3)                          :: hessian
+
+      ! The fields are radial: scan outwards along x and keep the radius after the last point
+      ! at which one of them still exceeds nlcc_field_eps.
+      cutoff = 0.0_dp
+      origin = 0.0_dp
+      DO istep = 1, nlcc_cutoff_steps
+         point = [istep*nlcc_cutoff_step, 0.0_dp, 0.0_dp]
+         CALL evaluate_nlcc_primitive_fields(point, origin, gth_potential, sgp_potential, &
+                                             rho, gradient, hessian)
+         IF (ABS(rho) > nlcc_field_eps .OR. MAXVAL(ABS(gradient)) > nlcc_field_eps .OR. &
+             MAXVAL(ABS(hessian)) > nlcc_field_eps) cutoff = (istep + 1)*nlcc_cutoff_step
+      END DO
+   END FUNCTION nlcc_primitive_cutoff
+
+! **************************************************************************************************
+!> \brief NLCC cores that reach the atomic grid of a target atom: every atom with an NLCC cutoff
+!>        and each of its periodic images (along the periodic directions) whose centre lies
+!>        within the grid radius plus that cutoff of the target atom, sorted by this distance.
+!> \param target_coord position of the target atom
+!> \param atom_coords positions of all atoms
+!> \param atom_cutoff NLCC cutoff of every atom, zero for atoms without NLCC
+!> \param hmat cell matrix, the cell vectors as columns
+!> \param h_inv inverse of hmat
+!> \param perd periodic directions (1) and isolated ones (0)
+!> \param grid_radius largest radius of the target atom's grid
+!> \param source atom of each image
+!> \param center position of each image
+!> \param translation cell translation of each image
+!> \param distance distance of each image from the target atom (ascending)
+!> \param cutoff NLCC cutoff of each image
+! **************************************************************************************************
+   SUBROUTINE build_nlcc_image_list(target_coord, atom_coords, atom_cutoff, hmat, h_inv, perd, &
+                                    grid_radius, source, center, translation, distance, cutoff)
+      REAL(dp), DIMENSION(3), INTENT(IN)                 :: target_coord
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: atom_coords
+      REAL(dp), DIMENSION(:), INTENT(IN)                 :: atom_cutoff
+      REAL(dp), DIMENSION(3, 3), INTENT(IN)              :: hmat, h_inv
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: perd
+      REAL(dp), INTENT(IN)                               :: grid_radius
+      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(INOUT)  :: source
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(INOUT)                                   :: center, translation
+      REAL(dp), ALLOCATABLE, DIMENSION(:), INTENT(INOUT) :: distance, cutoff
+
+      INTEGER                                            :: i1, i2, i3, iatom, idir, ientry, &
+                                                            nentry, pass
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: order, sorted_source
+      INTEGER, DIMENSION(3)                              :: base, shell
+      REAL(dp)                                           :: image_distance, reach
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: sorted_real
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sorted_vector
+      REAL(dp), DIMENSION(3)                             :: displacement, fractional, &
+                                                            image_translation
+
+      IF (ALLOCATED(source)) DEALLOCATE (source)
+      IF (ALLOCATED(center)) DEALLOCATE (center)
+      IF (ALLOCATED(translation)) DEALLOCATE (translation)
+      IF (ALLOCATED(distance)) DEALLOCATE (distance)
+      IF (ALLOCATED(cutoff)) DEALLOCATE (cutoff)
+      nentry = 0
+      DO pass = 1, 2
+         IF (pass == 2) THEN
+            ALLOCATE (source(nentry), center(3, nentry), translation(3, nentry), &
+                      distance(nentry), cutoff(nentry))
+            nentry = 0
+         END IF
+         DO iatom = 1, SIZE(atom_coords, 2)
+            IF (atom_cutoff(iatom) <= 0.0_dp) CYCLE
+            reach = grid_radius + atom_cutoff(iatom)
+            fractional = MATMUL(h_inv, target_coord - atom_coords(:, iatom))
+            DO idir = 1, 3
+               base(idir) = perd(idir)*NINT(fractional(idir))
+               shell(idir) = perd(idir)*(CEILING(reach*SQRT(SUM(h_inv(idir, :)**2))) + 1)
+            END DO
+            DO i3 = base(3) - shell(3), base(3) + shell(3)
+               DO i2 = base(2) - shell(2), base(2) + shell(2)
+                  DO i1 = base(1) - shell(1), base(1) + shell(1)
+                     image_translation = MATMUL(hmat, REAL([i1, i2, i3], dp))
+                     displacement = target_coord - atom_coords(:, iatom) - image_translation
+                     image_distance = SQRT(SUM(displacement**2))
+                     IF (image_distance > reach) CYCLE
+                     nentry = nentry + 1
+                     IF (pass == 2) THEN
+                        source(nentry) = iatom
+                        center(:, nentry) = atom_coords(:, iatom) + image_translation
+                        translation(:, nentry) = image_translation
+                        distance(nentry) = image_distance
+                        cutoff(nentry) = atom_cutoff(iatom)
+                     END IF
+                  END DO
+               END DO
+            END DO
+         END DO
+      END DO
+
+      ALLOCATE (order(nentry))
+      CALL sort(distance, nentry, order)
+      ALLOCATE (sorted_source(nentry), sorted_real(nentry), sorted_vector(3, nentry))
+      DO ientry = 1, nentry
+         sorted_source(ientry) = source(order(ientry))
+      END DO
+      source(:) = sorted_source
+      DO ientry = 1, nentry
+         sorted_real(ientry) = cutoff(order(ientry))
+      END DO
+      cutoff(:) = sorted_real
+      DO ientry = 1, nentry
+         sorted_vector(:, ientry) = center(:, order(ientry))
+      END DO
+      center(:, :) = sorted_vector
+      DO ientry = 1, nentry
+         sorted_vector(:, ientry) = translation(:, order(ientry))
+      END DO
+      translation(:, :) = sorted_vector
+      DEALLOCATE (order, sorted_real, sorted_source, sorted_vector)
+
+   END SUBROUTINE build_nlcc_image_list
+
+! **************************************************************************************************
+!> \brief First and last entry of a sorted NLCC image list whose distance from the target atom
+!>        lies within reach of a radius; first > last if there is none.
+!> \param distance distances of the list, ascending
+!> \param radius radius of a grid point around the target atom
+!> \param reach largest NLCC cutoff of the list
+!> \param first ...
+!> \param last ...
+! **************************************************************************************************
+   SUBROUTINE nlcc_image_range(distance, radius, reach, first, last)
+      REAL(dp), DIMENSION(:), INTENT(IN)                 :: distance
+      REAL(dp), INTENT(IN)                               :: radius, reach
+      INTEGER, INTENT(OUT)                               :: first, last
+
+      INTEGER                                            :: high, low, middle
+
+      ! first: smallest index with distance >= radius - reach
+      low = 1
+      high = SIZE(distance) + 1
+      DO WHILE (low < high)
+         middle = (low + high)/2
+         IF (distance(middle) < radius - reach) THEN
+            low = middle + 1
+         ELSE
+            high = middle
+         END IF
+      END DO
+      first = low
+      ! last: largest index with distance <= radius + reach
+      low = first
+      high = SIZE(distance) + 1
+      DO WHILE (low < high)
+         middle = (low + high)/2
+         IF (distance(middle) <= radius + reach) THEN
+            low = middle + 1
+         ELSE
+            high = middle
+         END IF
+      END DO
+      last = low - 1
+   END SUBROUTINE nlcc_image_range
 
 ! **************************************************************************************************
 !> \brief Compact support radius of one hard-minus-soft atom-grid field.

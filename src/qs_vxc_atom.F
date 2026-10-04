@@ -17,7 +17,9 @@ MODULE qs_vxc_atom
    USE cp_array_utils,                  ONLY: cp_3d_r_cp_type
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
-   USE external_potential_types,        ONLY: gth_potential_type,&
+   USE external_potential_types,        ONLY: gth_potential_p_type,&
+                                              gth_potential_type,&
+                                              sgp_potential_p_type,&
                                               sgp_potential_type
    USE input_constants,                 ONLY: cdft_alpha_constraint,&
                                               cdft_beta_constraint,&
@@ -73,8 +75,9 @@ MODULE qs_vxc_atom
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
    USE qs_vxc_atom_utils,               ONLY: &
-        calc_rho_angular, calc_rho_nlcc, calc_tau_atom, create_tau_basis_cache, dgaVtaudgb, &
-        evaluate_nlcc_primitive_fields, gaVxcgb_GC, gaVxcgb_noGC, gapw_atom_grid_support_radius, &
+        build_nlcc_image_list, calc_rho_angular, calc_rho_nlcc, calc_tau_atom, &
+        create_tau_basis_cache, dgaVtaudgb, evaluate_nlcc_primitive_fields, gaVxcgb_GC, &
+        gaVxcgb_noGC, gapw_atom_grid_support_radius, nlcc_image_range, nlcc_primitive_cutoff, &
         release_tau_basis_cache, tau_basis_cache_type
    USE skala_gpw_features,              ONLY: periodic_atom_image_partition,&
                                               periodic_atom_image_partition_at_point,&
@@ -258,7 +261,9 @@ CONTAINS
          gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
          ikind, image_i1, image_i2, image_i3, image_shell(3), image_shift(3), ir, ispin, iw, jdir, &
          myfun, na, natom, nr, nspins
-      INTEGER :: num_pe, source_atom, target_atom, xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: nlcc_entry, nlcc_first, nlcc_last, num_pe, source_atom, target_atom, &
+                 xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: nlcc_source
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
@@ -281,7 +286,8 @@ CONTAINS
          cross_cutoff, density_cut, exc_h, &
          exc_s, feature_vxc_analytic, feature_vxc_fd, feature_vxc_minus, feature_vxc_plus, &
          feature_vxc_step, gradient_cut, local_partition_weight, my_adiabatic_rescale_factor, &
-         nlcc_density, nlcc_spin_factor
+         nlcc_density, nlcc_grid_radius, nlcc_kind_cutoff, nlcc_point_radius, nlcc_reach, &
+         nlcc_spin_factor
       REAL(dp) :: one_center_density_field_contraction, one_center_density_matrix_contraction, &
          one_center_field_contraction, one_center_gradient_field_contraction, &
          one_center_gradient_matrix_contraction, one_center_matrix_contraction, &
@@ -291,7 +297,8 @@ CONTAINS
          smooth_grid_contraction, smooth_input_contraction, target_partition_adjoint, tau_cut, zeff
       REAL(dp), ALLOCATABLE, DIMENSION(:) :: composite_atomic_grid_weight_grad, &
          composite_atomic_grid_weights, composite_base_grid_weights, composite_distances, &
-         composite_grid_weight_grad, composite_grid_weights, composite_partition_weights
+         composite_grid_weight_grad, composite_grid_weights, composite_partition_weights, &
+         nlcc_atom_cutoff, nlcc_cutoff, nlcc_distance
       REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: composite_atom_coord_grad, composite_atom_coords, &
          composite_cross_density, composite_cross_force, composite_cross_force_local, &
          composite_cross_kin, composite_density, composite_density_grad, &
@@ -303,7 +310,7 @@ CONTAINS
       REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: composite_partition_atom_coords, &
          composite_partition_force, composite_partition_force_local, &
          composite_smooth_density_cache, &
-         composite_smooth_kin_cache, local_partition_datom
+         composite_smooth_kin_cache, local_partition_datom, nlcc_center, nlcc_translation
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), TARGET     :: smooth_density_adjoint_storage, &
                                                             smooth_kin_adjoint_storage
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :) :: composite_cross_grad, composite_grad, &
@@ -326,9 +333,9 @@ CONTAINS
          cross_kin_spatial
       REAL(dp), DIMENSION(3, 3) :: composite_cross_image_virial, &
          composite_cross_image_virial_local, composite_explicit_virial, composite_feature_virial, &
-         composite_interpolation_virial, composite_partition_strain_virial, &
-         local_partition_dstrain, nlcc_hessian, skala_atom_virial, &
-         skala_atom_virial_h, skala_atom_virial_s
+         composite_interpolation_virial, composite_nlcc_image_virial, &
+         composite_partition_strain_virial, local_partition_dstrain, nlcc_hessian, &
+         skala_atom_virial, skala_atom_virial_h, skala_atom_virial_s
       REAL(dp), DIMENSION(3, 3, 2)                       :: cross_grad_spatial
       REAL(dp), DIMENSION(4)                             :: feature_component_analytic, &
                                                             feature_component_fd
@@ -342,6 +349,10 @@ CONTAINS
       REAL(dp), DIMENSION(:, :, :, :), POINTER           :: drho_h, drho_s, vxg_h, vxg_s
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
+      TYPE(gth_potential_p_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: nlcc_gth
+      TYPE(sgp_potential_p_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: nlcc_sgp
       TYPE(cp_3d_r_cp_type), DIMENSION(3) :: composite_smooth_drho, composite_smooth_drhoa, &
          composite_smooth_drhob, smooth_drho, smooth_drhoa, smooth_drhob
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -576,19 +587,28 @@ CONTAINS
             DO iatom = 1, SIZE(particle_set)
                composite_atom_coords(:, iatom) = particle_set(iatom)%r
             END DO
+            ALLOCATE (nlcc_atom_cutoff(SIZE(particle_set)), nlcc_gth(SIZE(atomic_kind_set)), &
+                      nlcc_sgp(SIZE(atomic_kind_set)))
             DO ikind = 1, SIZE(atomic_kind_set)
                CALL get_atomic_kind(atomic_kind_set(ikind), atom_list=atom_list, natom=natom)
                NULLIFY (gth_potential, sgp_potential)
                CALL get_qs_kind(my_kind_set(ikind), paw_atom=paw_atom, &
                                 gth_potential=gth_potential, grid_atom=grid_atom, &
                                 sgp_potential=sgp_potential, zatom=zatom, zeff=zeff)
+               ! The NLCC cores of this kind, added with their periodic images up to this radius.
+               nlcc_gth(ikind)%gth_potential => gth_potential
+               nlcc_sgp(ikind)%sgp_potential => sgp_potential
+               nlcc_kind_cutoff = 0.0_dp
+               IF (nlcc) nlcc_kind_cutoff = nlcc_primitive_cutoff(gth_potential, sgp_potential)
                DO iat = 1, natom
                   iatom = atom_list(iat)
                   composite_atomic_grid_sizes(iatom) = INT(grid_atom%nr*grid_atom%ng_sphere, KIND=int_8)
                   composite_atom_kind(iatom) = ikind
                   composite_atom_kind_index(iatom) = iat
+                  nlcc_atom_cutoff(iatom) = nlcc_kind_cutoff
                END DO
             END DO
+            nlcc_reach = MAXVAL(nlcc_atom_cutoff)
             IF (ANY(composite_atomic_grid_sizes <= 0_int_8)) THEN
                CALL cp_abort(__LOCATION__, &
                              "The atom-composite diagnostic requires a GAPW one-center grid for every atom.")
@@ -863,12 +883,19 @@ CONTAINS
                END IF
 
                IF (atom_composite_active) THEN
+                  IF (atom_composite_reference .AND. nlcc) THEN
+                     CALL build_nlcc_image_list(particle_set(iatom)%r, composite_atom_coords, &
+                                                nlcc_atom_cutoff, cell%hmat, cell%h_inv, cell%perd, &
+                                                MAXVAL(grid_atom%rad(1:nr)), nlcc_source, &
+                                                nlcc_center, nlcc_translation, nlcc_distance, &
+                                                nlcc_cutoff)
+                  END IF
 !$OMP PARALLEL DO COLLAPSE(2) IF (image_partition_atom_composite) SCHEDULE(STATIC) DEFAULT(NONE) &
 !$OMP PRIVATE(composite_row, composite_point, composite_smooth_density_value, &
 !$OMP         composite_smooth_gradient_value, composite_smooth_kin_value, &
 !$OMP         idir, ispin, &
-!$OMP         gth_potential, nlcc_density, nlcc_gradient, nlcc_hessian, nlcc_spin_factor, &
-!$OMP         interpolation_stencil, partition_weight, sgp_potential, source_atom) &
+!$OMP         nlcc_density, nlcc_entry, nlcc_first, nlcc_gradient, nlcc_hessian, nlcc_last, &
+!$OMP         nlcc_spin_factor, interpolation_stencil, partition_weight, source_atom) &
 !$OMP SHARED(atom_composite_reference, cell, composite_atom_coords, composite_atom_kind, &
 !$OMP        composite_atom_start, composite_atomic_grid_weights, composite_base_grid_weights, &
 !$OMP        composite_density, composite_distances, composite_grad, &
@@ -880,7 +907,8 @@ CONTAINS
 !$OMP        composite_smooth_kin_cache, composite_smooth_rho, composite_smooth_rhoa, &
 !$OMP        composite_smooth_rhob, composite_smooth_tau, composite_smooth_tau_a, &
 !$OMP        composite_smooth_tau_b, drho_h, drho_s, grid_atom, iatom, &
-!$OMP        image_partition_atom_composite, lsd, my_kind_set, na, nlcc, nr, one_center_kind, &
+!$OMP        image_partition_atom_composite, lsd, na, nlcc, nlcc_center, nlcc_cutoff, &
+!$OMP        nlcc_distance, nlcc_gth, nlcc_reach, nlcc_sgp, nlcc_source, nr, one_center_kind, &
 !$OMP        particle_set, rho_h, rho_s, smooth_rho_r, tau_h, tau_s, &
 !$OMP        use_atom_composite_density, use_atom_composite_gradient, use_atom_composite_tau)
                   DO ir = 1, nr
@@ -1005,15 +1033,20 @@ CONTAINS
                         END IF
                         IF (atom_composite_reference .AND. nlcc) THEN
                            nlcc_spin_factor = MERGE(1.0_dp, 0.5_dp, lsd)
-                           DO source_atom = 1, SIZE(particle_set)
-                              NULLIFY (gth_potential, sgp_potential)
-                              CALL get_qs_kind(my_kind_set(composite_atom_kind(source_atom)), &
-                                               gth_potential=gth_potential, &
-                                               sgp_potential=sgp_potential)
+                           ! The cores of all atoms and of their periodic images within reach.
+                           CALL nlcc_image_range(nlcc_distance, grid_atom%rad(ir), nlcc_reach, &
+                                                 nlcc_first, nlcc_last)
+                           DO nlcc_entry = nlcc_first, nlcc_last
+                              IF (ABS(nlcc_distance(nlcc_entry) - grid_atom%rad(ir)) > &
+                                  nlcc_cutoff(nlcc_entry)) CYCLE
+                              IF (SUM((composite_point - nlcc_center(:, nlcc_entry))**2) > &
+                                  nlcc_cutoff(nlcc_entry)**2) CYCLE
+                              source_atom = nlcc_source(nlcc_entry)
                               CALL evaluate_nlcc_primitive_fields( &
-                                 composite_point, particle_set(source_atom)%r, &
-                                 gth_potential, sgp_potential, nlcc_density, &
-                                 nlcc_gradient, nlcc_hessian)
+                                 composite_point, nlcc_center(:, nlcc_entry), &
+                                 nlcc_gth(composite_atom_kind(source_atom))%gth_potential, &
+                                 nlcc_sgp(composite_atom_kind(source_atom))%sgp_potential, &
+                                 nlcc_density, nlcc_gradient, nlcc_hessian)
                               composite_density(composite_row, :) = &
                                  composite_density(composite_row, :) + &
                                  nlcc_spin_factor*nlcc_density
@@ -1168,6 +1201,9 @@ CONTAINS
                CALL xc_rho_set_release(rho_set_s)
             END IF
          END DO ! ikind
+         IF (ALLOCATED(nlcc_source)) THEN
+            DEALLOCATE (nlcc_source, nlcc_center, nlcc_translation, nlcc_distance, nlcc_cutoff)
+         END IF
 
          IF (atom_composite_active) THEN
             ALLOCATE (composite_cross_density(composite_nflat, 2), &
@@ -1380,6 +1416,7 @@ CONTAINS
                composite_feature_virial = 0.0_dp
                composite_interpolation_virial = 0.0_dp
                composite_partition_strain_virial = 0.0_dp
+               composite_nlcc_image_virial = 0.0_dp
 !$OMP PARALLEL DO IF (image_partition_atom_composite) SCHEDULE(STATIC) DEFAULT(NONE) &
 !$OMP PRIVATE(composite_local_atom, composite_row, composite_smooth_gradient_value, &
 !$OMP         iatom, idir, ispin, jdir) &
@@ -1428,14 +1465,17 @@ CONTAINS
 !$OMP END PARALLEL DO
 !$OMP PARALLEL IF (image_partition_atom_composite) DEFAULT(NONE) &
 !$OMP PRIVATE(composite_local_atom, composite_row, &
-!$OMP         gth_potential, iatom, idir, ispin, jdir, &
-!$OMP         nlcc_density, nlcc_gradient, nlcc_hessian, nlcc_spatial_derivative, &
+!$OMP         iatom, idir, ispin, jdir, &
+!$OMP         nlcc_center, nlcc_cutoff, nlcc_density, nlcc_distance, nlcc_entry, nlcc_first, &
+!$OMP         nlcc_gradient, nlcc_grid_radius, nlcc_hessian, nlcc_last, nlcc_point_radius, &
+!$OMP         nlcc_source, nlcc_spatial_derivative, nlcc_translation, &
 !$OMP         nlcc_spin_factor, partition_adjoint, composite_nlcc_center_force_local, &
 !$OMP         composite_partition_force_local, &
 !$OMP         local_partition_datom, local_partition_dstrain, &
-!$OMP         local_partition_weight, sgp_potential, source_atom, &
+!$OMP         local_partition_weight, source_atom, &
 !$OMP         spatial_derivative, target_atom, target_partition_adjoint) &
-!$OMP REDUCTION(+:composite_interpolation_virial, composite_partition_strain_virial) &
+!$OMP REDUCTION(+:composite_interpolation_virial, composite_nlcc_image_virial, &
+!$OMP             composite_partition_strain_virial) &
 !$OMP SHARED(cell, composite_atom_coord_grad, composite_atom_coords, composite_atom_end, &
 !$OMP        composite_atom_kind, composite_atom_start, &
 !$OMP        composite_atomic_grid_weights, composite_base_grid_weights, composite_density_grad, &
@@ -1448,8 +1488,8 @@ CONTAINS
 !$OMP        composite_partition_weights, composite_smooth_drho, composite_smooth_drhoa, &
 !$OMP        composite_smooth_drhob, composite_smooth_rho, composite_smooth_rhoa, &
 !$OMP        composite_smooth_rhob, composite_smooth_tau, composite_smooth_tau_a, &
-!$OMP        composite_smooth_tau_b, image_partition_atom_composite, lsd, my_kind_set, nlcc, &
-!$OMP        particle_set, smooth_rho_r)
+!$OMP        composite_smooth_tau_b, image_partition_atom_composite, lsd, nlcc, &
+!$OMP        nlcc_atom_cutoff, nlcc_gth, nlcc_reach, nlcc_sgp, particle_set, smooth_rho_r)
                ALLOCATE (composite_nlcc_center_force_local(3, SIZE(particle_set)), &
                          composite_partition_force_local(3, SIZE(particle_set)), &
                          local_partition_datom(3, SIZE(particle_set)))
@@ -1460,6 +1500,18 @@ CONTAINS
                   iatom = composite_local_atoms(composite_local_atom)
                   composite_model_atom_force(:, iatom) = &
                      composite_atom_coord_grad(:, composite_local_atom)
+                  IF (nlcc) THEN
+                     nlcc_grid_radius = 0.0_dp
+                     DO composite_row = composite_atom_start(iatom), composite_atom_end(iatom)
+                        nlcc_grid_radius = MAX(nlcc_grid_radius, SQRT(SUM(( &
+                                               composite_grid_coords(:, composite_row) - &
+                                               particle_set(iatom)%r)**2)))
+                     END DO
+                     CALL build_nlcc_image_list(particle_set(iatom)%r, composite_atom_coords, &
+                                                nlcc_atom_cutoff, cell%hmat, cell%h_inv, cell%perd, &
+                                                nlcc_grid_radius, nlcc_source, nlcc_center, &
+                                                nlcc_translation, nlcc_distance, nlcc_cutoff)
+                  END IF
                   DO composite_row = composite_atom_start(iatom), composite_atom_end(iatom)
                      composite_grid_coord_force(:, iatom) = &
                         composite_grid_coord_force(:, iatom) + &
@@ -1536,14 +1588,20 @@ CONTAINS
                         composite_moving_smooth_force(:, iatom) + spatial_derivative
                      IF (nlcc) THEN
                         nlcc_spin_factor = MERGE(1.0_dp, 0.5_dp, lsd)
-                        DO source_atom = 1, SIZE(particle_set)
-                           NULLIFY (gth_potential, sgp_potential)
-                           CALL get_qs_kind(my_kind_set(composite_atom_kind(source_atom)), &
-                                            gth_potential=gth_potential, &
-                                            sgp_potential=sgp_potential)
+                        nlcc_point_radius = SQRT(SUM((composite_grid_coords(:, composite_row) - &
+                                                      particle_set(iatom)%r)**2))
+                        CALL nlcc_image_range(nlcc_distance, nlcc_point_radius, nlcc_reach, &
+                                              nlcc_first, nlcc_last)
+                        DO nlcc_entry = nlcc_first, nlcc_last
+                           IF (ABS(nlcc_distance(nlcc_entry) - nlcc_point_radius) > &
+                               nlcc_cutoff(nlcc_entry)) CYCLE
+                           IF (SUM((composite_grid_coords(:, composite_row) - &
+                                    nlcc_center(:, nlcc_entry))**2) > nlcc_cutoff(nlcc_entry)**2) CYCLE
+                           source_atom = nlcc_source(nlcc_entry)
                            CALL evaluate_nlcc_primitive_fields( &
-                              composite_grid_coords(:, composite_row), &
-                              particle_set(source_atom)%r, gth_potential, sgp_potential, &
+                              composite_grid_coords(:, composite_row), nlcc_center(:, nlcc_entry), &
+                              nlcc_gth(composite_atom_kind(source_atom))%gth_potential, &
+                              nlcc_sgp(composite_atom_kind(source_atom))%sgp_potential, &
                               nlcc_density, nlcc_gradient, nlcc_hessian)
                            nlcc_spatial_derivative = 0.0_dp
                            DO ispin = 1, 2
@@ -1563,6 +1621,15 @@ CONTAINS
                               composite_nlcc_target_force(:, iatom) + nlcc_spatial_derivative
                            composite_nlcc_center_force_local(:, source_atom) = &
                               composite_nlcc_center_force_local(:, source_atom) - nlcc_spatial_derivative
+                           ! The image moves with its cell under strain; the atom forces carry
+                           ! only the positions of the atoms in the reference cell.
+                           DO idir = 1, 3
+                              DO jdir = 1, 3
+                                 composite_nlcc_image_virial(idir, jdir) = &
+                                    composite_nlcc_image_virial(idir, jdir) + &
+                                    nlcc_spatial_derivative(idir)*nlcc_translation(jdir, nlcc_entry)
+                              END DO
+                           END DO
                         END DO
                      END IF
                      IF (image_partition_atom_composite) THEN
@@ -1611,6 +1678,9 @@ CONTAINS
 !$OMP END CRITICAL(skala_atom_composite_force_reduction)
                DEALLOCATE (composite_nlcc_center_force_local, composite_partition_force_local, &
                            local_partition_datom)
+               IF (ALLOCATED(nlcc_source)) THEN
+                  DEALLOCATE (nlcc_source, nlcc_center, nlcc_translation, nlcc_distance, nlcc_cutoff)
+               END IF
 !$OMP END PARALLEL
                ! The target atom grids can overlap augmentation regions of other atoms
                ! and periodic images. Differentiate the same discrete interpolation used
@@ -1832,7 +1902,8 @@ CONTAINS
                END DO
                composite_explicit_virial = composite_explicit_virial + &
                                            composite_partition_strain_virial + &
-                                           composite_cross_image_virial
+                                           composite_cross_image_virial + &
+                                           composite_nlcc_image_virial
                IF (ASSOCIATED(force)) THEN
                   DO iatom = 1, SIZE(particle_set)
                      ikind = composite_atom_kind(iatom)
@@ -2549,6 +2620,7 @@ CONTAINS
                END IF
             END IF
             CALL xc_rho_set_release(smooth_rho_set, pw_pool=auxbas_pw_pool)
+            DEALLOCATE (nlcc_atom_cutoff, nlcc_gth, nlcc_sgp)
             DEALLOCATE (composite_atomic_grid_sizes, composite_atom_kind, &
                         composite_atom_kind_index, composite_atom_start, composite_atom_end, &
                         composite_atom_coords, composite_local_atoms, composite_local_grid_sizes, &
