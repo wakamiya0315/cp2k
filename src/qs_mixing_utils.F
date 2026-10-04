@@ -247,7 +247,9 @@ CONTAINS
                END DO
             END IF
 
-            IF (mixing_store%gmix_p .AND. dft_control%qs_control%gapw) THEN
+            ! one-centre coefficients: GMIX_P in GAPW, XC_FIELDS in GAPW and GAPW_XC
+            IF (mixing_store%gmix_p .AND. (dft_control%qs_control%gapw .OR. &
+                                           (dft_control%qs_control%gapw_xc .AND. mixing_store%xc_fields))) THEN
                CALL get_qs_env(qs_env=qs_env, rho_atom_set=rho_atom)
                natom = SIZE(rho_atom)
                IF (.NOT. ASSOCIATED(mixing_store%paw)) THEN
@@ -339,7 +341,8 @@ CONTAINS
             END IF
             IF (mixing_store%gmix_p) THEN
 
-               IF (dft_control%qs_control%gapw) THEN
+               IF (dft_control%qs_control%gapw .OR. &
+                   (dft_control%qs_control%gapw_xc .AND. mixing_store%xc_fields)) THEN
                   IF (.NOT. ASSOCIATED(mixing_store%cpc_h_old)) THEN
                      ALLOCATE (mixing_store%cpc_h_old(natom, nspins))
                      ALLOCATE (mixing_store%cpc_s_old(natom, nspins))

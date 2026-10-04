@@ -56,7 +56,7 @@ MODULE qs_density_mixing_types
                                  multisecant_mixing_nr = 6, &
                                  new_pulay_mixing_nr = 7
    PUBLIC :: cp_1d_z_p_type, mixing_storage_create, mixing_storage_type, mixing_storage_release, create_mixing_section, &
-             dm_pulay_storage_release
+             dm_pulay_storage_release, release_field_storage
 
    TYPE cp_1d_z_p_type
       COMPLEX(dp), DIMENSION(:), POINTER :: cc => NULL()
@@ -106,6 +106,14 @@ MODULE qs_density_mixing_types
       TYPE(rho_atom_coeff), DIMENSION(:, :, :), POINTER :: cpc_h_in_buffer => NULL(), cpc_s_in_buffer => NULL()
       TYPE(rho_atom_coeff), DIMENSION(:, :, :), POINTER :: cpc_h_res_buffer => NULL(), cpc_s_res_buffer => NULL()
       TYPE(rho_atom_coeff), DIMENSION(:, :, :), POINTER :: dcpc_h_in => NULL(), dcpc_s_in => NULL()
+      ! XC_FIELDS: further G-space fields read by the XC functional (kinetic energy density, the
+      ! soft XC density of GAPW_XC), mixed with the coefficients of the density: input, previous
+      ! input and last residual per field and spin, and the NBUFFER Broyden differences
+      LOGICAL                                           :: xc_fields = .FALSE.
+      INTEGER                                           :: nfield = 0
+      TYPE(cp_1d_z_p_type), DIMENSION(:, :), POINTER    :: field_in => NULL(), field_in_old => NULL(), &
+                                                           field_last_res => NULL()
+      TYPE(cp_1d_z_p_type), DIMENSION(:, :, :), POINTER :: field_dbuf => NULL()
       ! Pulay (Anderson) acceleration of DIRECT_P_MIXING: the input density matrix and residual
       ! P_out - P_in of the previous step, and NBUFFER normalized differences of both, for every
       ! spin and image
@@ -217,6 +225,14 @@ CONTAINS
       IF (mixing_store%dm_pulay) THEN
          CALL section_vals_val_get(mixing_section, "BROY_W0", r_val=mixing_store%broy_w0)
       END IF
+      CALL section_vals_val_get(mixing_section, "XC_FIELDS", l_val=mixing_store%xc_fields)
+      IF (mixing_store%xc_fields) THEN
+         IF (mixing_method /= broyden_mixing_nr .AND. mixing_method /= gspace_mixing_nr) THEN
+            CPABORT("MIXING%XC_FIELDS is implemented for BROYDEN_MIXING and KERKER_MIXING only")
+         END IF
+         ! the GAPW one-centre coefficients are mixed with the grid fields
+         mixing_store%gmix_p = .TRUE.
+      END IF
 
       IF (mixing_store%max_gvec_exp > 0._dp) THEN
          alpha = 0.25_dp/mixing_store%max_gvec_exp
@@ -278,6 +294,7 @@ CONTAINS
       END IF
 
       CALL dm_pulay_storage_release(mixing_store)
+      CALL release_field_storage(mixing_store)
 
       IF (ASSOCIATED(mixing_store%pulay_matrix)) THEN
          DEALLOCATE (mixing_store%pulay_matrix)
@@ -843,6 +860,21 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="XC_FIELDS", &
+                          description="With BROYDEN_MIXING or KERKER_MIXING: mix, besides the density on "// &
+                          "the grid, every field the exchange-correlation functional reads, with the "// &
+                          "coefficients and the Kerker factor of the density: the kinetic energy density "// &
+                          "(meta-GGA), the separate soft XC density of GAPW_XC (and its kinetic energy "// &
+                          "density), and the GAPW and GAPW_XC one-centre density coefficients (as GMIX_P). "// &
+                          "Without it these fields are recomputed from the unmixed output density matrix, "// &
+                          "so that in GAPW_XC the XC potential is not mixed at all.", &
+                          repeats=.FALSE., &
+                          lone_keyword_l_val=.TRUE., &
+                          default_l_val=.FALSE., &
+                          usage="XC_FIELDS")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P", &
                           description="With DIRECT_P_MIXING: accelerate the mixing of the real-space "// &
                           "density matrices with Pulay's (Anderson's) method. The residual is "// &
@@ -858,6 +890,39 @@ CONTAINS
       CALL keyword_release(keyword)
 
    END SUBROUTINE create_mixing_section
+
+! **************************************************************************************************
+!> \brief Releases the field buffers of XC_FIELDS
+!> \param mixing_store ...
+! **************************************************************************************************
+   SUBROUTINE release_field_storage(mixing_store)
+      TYPE(mixing_storage_type), INTENT(INOUT)           :: mixing_store
+
+      INTEGER                                            :: i, j, k
+
+      IF (ASSOCIATED(mixing_store%field_in)) THEN
+         DO j = 1, SIZE(mixing_store%field_in, 2)
+            DO i = 1, SIZE(mixing_store%field_in, 1)
+               IF (ASSOCIATED(mixing_store%field_in(i, j)%cc)) DEALLOCATE (mixing_store%field_in(i, j)%cc)
+               IF (ASSOCIATED(mixing_store%field_in_old(i, j)%cc)) DEALLOCATE (mixing_store%field_in_old(i, j)%cc)
+               IF (ASSOCIATED(mixing_store%field_last_res(i, j)%cc)) DEALLOCATE (mixing_store%field_last_res(i, j)%cc)
+            END DO
+         END DO
+         DEALLOCATE (mixing_store%field_in, mixing_store%field_in_old, mixing_store%field_last_res)
+      END IF
+      IF (ASSOCIATED(mixing_store%field_dbuf)) THEN
+         DO k = 1, SIZE(mixing_store%field_dbuf, 3)
+            DO j = 1, SIZE(mixing_store%field_dbuf, 2)
+               DO i = 1, SIZE(mixing_store%field_dbuf, 1)
+                  IF (ASSOCIATED(mixing_store%field_dbuf(i, j, k)%cc)) DEALLOCATE (mixing_store%field_dbuf(i, j, k)%cc)
+               END DO
+            END DO
+         END DO
+         DEALLOCATE (mixing_store%field_dbuf)
+      END IF
+      mixing_store%nfield = 0
+
+   END SUBROUTINE release_field_storage
 
 ! **************************************************************************************************
 !> \brief Releases the density-matrix history of PULAY_P
