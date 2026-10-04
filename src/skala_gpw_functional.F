@@ -2762,7 +2762,11 @@ CONTAINS
             CALL pw_zero(grad_pw(i))
          END DO
 
-         ipt = 0
+         ! Every grid point is copied independently; ipt is its row in the flat arrays.
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
+!$OMP SHARED(bo, density_grad, dvol_inv, grad_grad, grad_pw, ispin, kin_grad, &
+!$OMP        my_global_grid_layout, nspins, rho_r, vxc_rho, vxc_tau) &
+!$OMP PRIVATE(i, ipt, j, k)
          DO k = bo(1, 3), bo(2, 3)
             DO j = bo(1, 2), bo(2, 2)
                DO i = bo(1, 1), bo(2, 1)
@@ -2773,7 +2777,8 @@ CONTAINS
                            rho_r(1)%pw_grid%npts(2)*( &
                            k - rho_r(1)%pw_grid%bounds(1, 3)))
                   ELSE
-                     ipt = ipt + 1
+                     ipt = 1 + i - bo(1, 1) + (bo(2, 1) - bo(1, 1) + 1)*( &
+                           j - bo(1, 2) + (bo(2, 2) - bo(1, 2) + 1)*(k - bo(1, 3)))
                   END IF
                   IF (nspins == 1) THEN
                      IF (SIZE(density_grad, 2) == 1) THEN
@@ -2804,6 +2809,7 @@ CONTAINS
                END DO
             END DO
          END DO
+!$OMP END PARALLEL DO
 
          DO i = 1, 3
             CALL pw_scale(grad_pw(i), -1.0_dp)

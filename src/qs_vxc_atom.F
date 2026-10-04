@@ -303,8 +303,8 @@ CONTAINS
          composite_nflat, composite_pw_nflat, composite_row, &
          gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
          ikind, ir, ispin, iw, jdir, myfun, na, natom, nr, nspins
-      INTEGER :: num_pe, section_handle, source_atom, target_atom, xc_deriv_method_id, &
-                 xc_rho_smooth_id, zatom
+      INTEGER :: adjoint_handle, num_pe, section_handle, source_atom, target_atom, &
+                 xc_deriv_method_id, xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
@@ -1804,9 +1804,20 @@ CONTAINS
             ALLOCATE (smooth_density_adjoint_storage(composite_pw_nflat, adjoint_nchannels), &
                       smooth_grad_adjoint_storage(composite_pw_nflat, 3, adjoint_nchannels), &
                       smooth_kin_adjoint_storage(composite_pw_nflat, adjoint_nchannels))
-            smooth_density_adjoint_storage = 0.0_dp
-            smooth_grad_adjoint_storage = 0.0_dp
-            smooth_kin_adjoint_storage = 0.0_dp
+!$OMP PARALLEL DO SCHEDULE(STATIC) DEFAULT(NONE) PRIVATE(ispin, idir) &
+!$OMP SHARED(adjoint_nchannels, composite_pw_nflat, smooth_density_adjoint_storage, &
+!$OMP        smooth_grad_adjoint_storage, smooth_kin_adjoint_storage)
+            DO adjoint_entry = 1, composite_pw_nflat
+               DO ispin = 1, adjoint_nchannels
+                  smooth_density_adjoint_storage(adjoint_entry, ispin) = 0.0_dp
+                  smooth_kin_adjoint_storage(adjoint_entry, ispin) = 0.0_dp
+                  DO idir = 1, 3
+                     smooth_grad_adjoint_storage(adjoint_entry, idir, ispin) = 0.0_dp
+                  END DO
+               END DO
+            END DO
+!$OMP END PARALLEL DO
+            CALL timeset("skala_vxc_pw_adj_scatter", adjoint_handle)
             CALL build_native_grid_adjoint_bins( &
                smooth_rho_r(1)%pw_grid, cell, composite_grid_coords, &
                image_partition_atom_composite, adjoint_tile_count, adjoint_bin_offsets, &
@@ -1859,6 +1870,7 @@ CONTAINS
             END DO
 !$OMP END PARALLEL DO
             DEALLOCATE (adjoint_bin_offsets, adjoint_bin_rows)
+            CALL timestop(adjoint_handle)
             CALL timestop(section_handle)
             ! The contractions below check the adjoints; they are printed only with
             ! NATIVE_GRID_GAPW_ATOM_COMPOSITE_DIAGNOSTIC.
@@ -1915,10 +1927,12 @@ CONTAINS
             CALL para_env%sum(smooth_grad_adjoint)
             CALL para_env%sum(smooth_kin_adjoint)
             CALL para_env%sum(smooth_input_contraction)
+            CALL timeset("skala_vxc_pw_adj_vxc", adjoint_handle)
             CALL build_vxc_from_feature_grads( &
                smooth_vxc_rho, smooth_vxc_tau, smooth_rho_r, auxbas_pw_pool, &
                smooth_density_adjoint, smooth_grad_adjoint, smooth_kin_adjoint, &
                xc_deriv_method_id, global_grid_layout=.TRUE.)
+            CALL timestop(adjoint_handle)
             NULLIFY (smooth_density_adjoint, smooth_grad_adjoint, smooth_kin_adjoint)
             DEALLOCATE (smooth_density_adjoint_storage, smooth_grad_adjoint_storage, &
                         smooth_kin_adjoint_storage)
@@ -2342,7 +2356,15 @@ CONTAINS
                         composite_density_grad, composite_grad_grad, composite_kin_grad, &
                         composite_grid_coords, composite_grid_weights, &
                         composite_base_grid_weights, composite_atomic_grid_weights)
-            IF (lsd) THEN
+            ! On one rank the replicated fields are the local fields of smooth_rho_set.
+            IF (para_env%num_pe == 1) THEN
+               NULLIFY (composite_smooth_rhoa, composite_smooth_rhob, composite_smooth_tau_a, &
+                        composite_smooth_tau_b, composite_smooth_rho, composite_smooth_tau)
+               DO idir = 1, 3
+                  NULLIFY (composite_smooth_drhoa(idir)%array, composite_smooth_drhob(idir)%array, &
+                           composite_smooth_drho(idir)%array)
+               END DO
+            ELSE IF (lsd) THEN
                DEALLOCATE (composite_smooth_rhoa, composite_smooth_rhob, &
                            composite_smooth_tau_a, composite_smooth_tau_b)
                DO idir = 1, 3
@@ -2652,7 +2674,8 @@ CONTAINS
    END FUNCTION contract_one_center_matrix
 
 ! **************************************************************************************************
-!> \brief Replicate a distributed real-space field for atom-grid interpolation.
+!> \brief Replicate a distributed real-space field for atom-grid interpolation. On one rank the
+!>        result points to the local field itself.
 !> \param local_values ...
 !> \param pw_grid ...
 !> \param group ...
@@ -2672,6 +2695,13 @@ CONTAINS
       CPASSERT(ASSOCIATED(pw_grid))
       CPASSERT(.NOT. ASSOCIATED(global_values))
       bo = pw_grid%bounds_local
+      ! On one rank the local field is the whole grid: use it in place (callers then must not
+      ! deallocate global_values).
+      IF (group%num_pe == 1) THEN
+         CPASSERT(ALL(bo == pw_grid%bounds))
+         global_values => local_values
+         RETURN
+      END IF
       ALLOCATE (global_values(pw_grid%bounds(1, 1):pw_grid%bounds(2, 1), &
                               pw_grid%bounds(1, 2):pw_grid%bounds(2, 2), &
                               pw_grid%bounds(1, 3):pw_grid%bounds(2, 3)))
