@@ -55,7 +55,8 @@ MODULE qs_ks_atom
                                               alist_pre_align_blk,&
                                               alist_type,&
                                               get_alist
-   USE util,                            ONLY: get_limit
+   USE util,                            ONLY: get_limit,&
+                                              locate
    USE virial_methods,                  ONLY: virial_pair_force
    USE virial_types,                    ONLY: virial_type
 
@@ -72,6 +73,24 @@ MODULE qs_ks_atom
    PRIVATE
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ks_atom'
+
+   ! Above this size the products of the one-centre potentials with the projector coefficients
+   ! are formed again for every atom pair instead of once per neighbour entry.
+   INTEGER(KIND=int_8), PARAMETER, PRIVATE :: centre_products_max_bytes = 2000000000_int_8
+
+   ! (int_hard - int_soft) of a centre times the projector coefficients of one atom image that is
+   ! not the centre, for every entry of the one-centre overlap lists (indexed like oce%intac)
+   TYPE centre_product_type
+      REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE     :: c_int
+   END TYPE centre_product_type
+
+   TYPE alist_product_type
+      TYPE(centre_product_type), DIMENSION(:), ALLOCATABLE :: clist
+   END TYPE alist_product_type
+
+   TYPE sap_product_type
+      TYPE(alist_product_type), DIMENSION(:), ALLOCATABLE :: alist
+   END TYPE sap_product_type
 
    PUBLIC :: update_ks_atom
 
@@ -124,9 +143,10 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'update_ks_atom'
 
-      INTEGER :: bo(2), handle, ia_kind, iac, iat, iatom, ibc, ikind, img, ip, ispin, ja_kind, &
-         jatom, jkind, ka_kind, kac, katom, kbc, kkind, ldCPC, max_gau, max_nsgf, n_cont_a, &
-         n_cont_b, nat, natom, nimages, nkind, nl_table_num_slots, nsoctot, nspins, slot_num
+      INTEGER :: bo(2), handle, ia_kind, ia_list, iac, iat, iatom, ib_list, ibc, ikind, img, ip, &
+         ispin, ja_kind, jatom, jkind, ka_kind, kac, katom, kbc, kkind, ldCPC, max_gau, max_nsgf, &
+         n_cont_a, n_cont_b, nat, natom, nimages, nkind, nl_table_num_slots, nsoctot, nspins, &
+         slot_num
       INTEGER(KIND=int_8)                                :: nl_table_key
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_kind
       INTEGER, DIMENSION(3)                              :: cell_b
@@ -134,7 +154,7 @@ CONTAINS
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: dista, distb, found, is_entry_null, &
                                                             is_task_valid, my_tddft, paw_atom, &
-                                                            use_virial
+                                                            use_products, use_virial
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: has_intac, paw_kind
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: a_matrix, p_matrix
       REAL(dp), DIMENSION(3)                             :: rac, rbc
@@ -167,6 +187,7 @@ CONTAINS
       TYPE(rho_atom_coeff), DIMENSION(:), POINTER        :: int_local_h, int_local_s
       TYPE(rho_atom_type), DIMENSION(:), POINTER         :: my_rho_atom
       TYPE(rho_atom_type), POINTER                       :: rho_at
+      TYPE(sap_product_type), ALLOCATABLE, DIMENSION(:)  :: centre_products
       TYPE(virial_type), POINTER                         :: virial
 
 !$    INTEGER(kind=omp_lock_kind), ALLOCATABLE, DIMENSION(:) :: locks
@@ -287,6 +308,11 @@ CONTAINS
          has_intac(ikind) = ASSOCIATED(my_oce%intac(ikind)%alist)
       END DO
 
+      ! The first product of add_vhxca_to_ks for a pair of images that are both distant from the
+      ! centre depends only on the centre and one of the two images: form it once per image.
+      CALL build_centre_products(my_oce, my_rho_atom, paw_kind, has_intac, nspins, max_gau, &
+                                 centre_products, use_products)
+
       ! build the hash table in serial...
       ! ... creation ...
       CALL neighbor_list_iterator_create(nl_iterator, my_sab)
@@ -325,8 +351,10 @@ CONTAINS
 !$OMP                 , my_rho_atom, factor1, factor2, use_virial    &
 !$OMP                 , atom_of_kind, ldCPC, force, locks, force_fac &
 !$OMP                 , paw_kind, has_intac                          &
+!$OMP                 , centre_products, use_products                &
 !$OMP                 )                                              &
 !$OMP          PRIVATE( slot_num, is_entry_null, TASK, is_task_valid &
+!$OMP                 , ia_list, ib_list                             &
 !$OMP                 , C_int_h, C_int_s, coc, a_matrix, p_matrix    &
 !$OMP                 , mat_h, mat_p, dCPC_h, dCPC_s, PC_h, PC_s     &
 !$OMP                 , int_local_h, int_local_s                     &
@@ -438,6 +466,10 @@ CONTAINS
                   CALL get_alist(my_oce%intac(ibc), alist_bc, jatom)
                   IF (.NOT. ASSOCIATED(alist_ac)) CYCLE
                   IF (.NOT. ASSOCIATED(alist_bc)) CYCLE
+                  IF (use_products) THEN
+                     ia_list = my_oce%intac(iac)%aindex(locate(my_oce%intac(iac)%asort, iatom))
+                     ib_list = my_oce%intac(ibc)%aindex(locate(my_oce%intac(ibc)%asort, jatom))
+                  END IF
 
                   DO kac = 1, alist_ac%nclist
                      DO kbc = 1, alist_bc%nclist
@@ -477,9 +509,22 @@ CONTAINS
                            nsoctot = SIZE(C_coeff_ss_a, 2)
 
                            CALL get_rho_atom(rho_atom=rho_at, int_scr_h=int_local_h, int_scr_s=int_local_s)
-                           CALL add_vhxca_to_ks(mat_h, C_coeff_hh_a, C_coeff_hh_b, C_coeff_ss_a, C_coeff_ss_b, &
-                                                int_local_h, int_local_s, nspins, iatom, jatom, nsoctot, factor1, &
-                                                list_a, n_cont_a, list_b, n_cont_b, C_int_h, C_int_s, a_matrix, dista, distb, coc)
+                           IF (use_products .AND. dista .AND. distb .AND. iatom <= jatom) THEN
+                              CALL add_vhxca_to_ks(mat_h, C_coeff_hh_a, C_coeff_hh_b, C_coeff_ss_a, C_coeff_ss_b, &
+                                                   int_local_h, int_local_s, nspins, iatom, jatom, nsoctot, factor1, &
+                                                   list_a, n_cont_a, list_b, n_cont_b, C_int_h, C_int_s, a_matrix, dista, &
+                                                   distb, coc, centre_products(ibc)%alist(ib_list)%clist(kbc)%c_int)
+                           ELSE IF (use_products .AND. dista .AND. distb) THEN
+                              CALL add_vhxca_to_ks(mat_h, C_coeff_hh_a, C_coeff_hh_b, C_coeff_ss_a, C_coeff_ss_b, &
+                                                   int_local_h, int_local_s, nspins, iatom, jatom, nsoctot, factor1, &
+                                                   list_a, n_cont_a, list_b, n_cont_b, C_int_h, C_int_s, a_matrix, dista, &
+                                                   distb, coc, centre_products(iac)%alist(ia_list)%clist(kac)%c_int)
+                           ELSE
+                              CALL add_vhxca_to_ks(mat_h, C_coeff_hh_a, C_coeff_hh_b, C_coeff_ss_a, C_coeff_ss_b, &
+                                                   int_local_h, int_local_s, nspins, iatom, jatom, nsoctot, factor1, &
+                                                   list_a, n_cont_a, list_b, n_cont_b, C_int_h, C_int_s, a_matrix, dista, &
+                                                   distb, coc)
+                           END IF
 
                            IF (forces) THEN
                               IF (use_virial) THEN
@@ -585,10 +630,136 @@ CONTAINS
       CALL nl_hash_table_release(nl_hash_table)
 
       DEALLOCATE (basis_set_list, paw_kind, has_intac)
+      IF (ALLOCATED(centre_products)) DEALLOCATE (centre_products)
 
       CALL timestop(handle)
 
    END SUBROUTINE update_ks_atom
+
+! **************************************************************************************************
+!> \brief Products of (int_hard - int_soft) of every centre with the projector coefficients of
+!>        the atom images in its overlap lists that are not the centre itself, formed by the same
+!>        matrix product that add_vhxca_to_ks makes for every pair of such images.
+!> \param oce one-centre overlap lists
+!> \param rho_atom_set one-centre potentials (int_scr_h, int_scr_s)
+!> \param paw_kind ...
+!> \param has_intac ...
+!> \param nspins ...
+!> \param max_gau size of the one-centre basis of the largest kind
+!> \param products indexed like oce%intac(iac)%alist(ilist)%clist(kac)
+!> \param use_products false if the products would take more than centre_products_max_bytes
+! **************************************************************************************************
+   SUBROUTINE build_centre_products(oce, rho_atom_set, paw_kind, has_intac, nspins, max_gau, &
+                                    products, use_products)
+      TYPE(oce_matrix_type), POINTER                     :: oce
+      TYPE(rho_atom_type), DIMENSION(:), POINTER         :: rho_atom_set
+      LOGICAL, DIMENSION(:), INTENT(IN)                  :: paw_kind, has_intac
+      INTEGER, INTENT(IN)                                :: nspins, max_gau
+      TYPE(sap_product_type), ALLOCATABLE, &
+         DIMENSION(:), INTENT(OUT)                       :: products
+      LOGICAL, INTENT(OUT)                               :: use_products
+
+      INTEGER                                            :: i, ientry, ilist, ispin, ixc, j, k, &
+                                                            katom, kxc, ncont, nentry, nkind, nsp
+      INTEGER(KIND=int_8)                                :: nbytes
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: entries
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: coc
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: int_hard, int_soft
+      TYPE(alist_type), POINTER                          :: alist
+      TYPE(rho_atom_coeff), DIMENSION(:), POINTER        :: int_local_h, int_local_s
+
+      nkind = SIZE(paw_kind)
+      nentry = 0
+      nbytes = 0
+      DO ixc = 1, nkind*nkind
+         IF (.NOT. has_intac(ixc)) CYCLE
+         IF (.NOT. paw_kind((ixc - 1)/nkind + 1)) CYCLE
+         DO ilist = 1, SIZE(oce%intac(ixc)%alist)
+            alist => oce%intac(ixc)%alist(ilist)
+            DO kxc = 1, alist%nclist
+               IF (.NOT. distant_image(alist, kxc)) CYCLE
+               nentry = nentry + 1
+               nbytes = nbytes + 8_int_8*SIZE(alist%clist(kxc)%acint, 2)* &
+                        alist%clist(kxc)%nsgf_cnt*nspins
+            END DO
+         END DO
+      END DO
+      use_products = nbytes <= centre_products_max_bytes
+      IF (.NOT. use_products) RETURN
+
+      ALLOCATE (products(nkind*nkind), entries(3, nentry))
+      ientry = 0
+      DO ixc = 1, nkind*nkind
+         IF (.NOT. has_intac(ixc)) CYCLE
+         IF (.NOT. paw_kind((ixc - 1)/nkind + 1)) CYCLE
+         ALLOCATE (products(ixc)%alist(SIZE(oce%intac(ixc)%alist)))
+         DO ilist = 1, SIZE(oce%intac(ixc)%alist)
+            alist => oce%intac(ixc)%alist(ilist)
+            ALLOCATE (products(ixc)%alist(ilist)%clist(MAX(alist%nclist, 0)))
+            DO kxc = 1, alist%nclist
+               IF (.NOT. distant_image(alist, kxc)) CYCLE
+               ALLOCATE (products(ixc)%alist(ilist)%clist(kxc)%c_int( &
+                         SIZE(alist%clist(kxc)%acint, 2), alist%clist(kxc)%nsgf_cnt, nspins))
+               ientry = ientry + 1
+               entries(:, ientry) = [ixc, ilist, kxc]
+            END DO
+         END DO
+      END DO
+
+!$OMP PARALLEL DEFAULT(NONE) SHARED(entries, max_gau, nentry, nspins, oce, products, rho_atom_set) &
+!$OMP          PRIVATE(alist, coc, i, ientry, ilist, int_hard, int_local_h, int_local_s, int_soft, &
+!$OMP                  ispin, ixc, j, k, katom, kxc, ncont, nsp)
+      ALLOCATE (coc(max_gau*max_gau))
+!$OMP DO SCHEDULE(DYNAMIC)
+      DO ientry = 1, nentry
+         ixc = entries(1, ientry)
+         ilist = entries(2, ientry)
+         kxc = entries(3, ientry)
+         alist => oce%intac(ixc)%alist(ilist)
+         katom = alist%clist(kxc)%catom
+         nsp = SIZE(alist%clist(kxc)%acint, 2)
+         ncont = alist%clist(kxc)%nsgf_cnt
+         CALL get_rho_atom(rho_atom=rho_atom_set(katom), int_scr_h=int_local_h, int_scr_s=int_local_s)
+         DO ispin = 1, nspins
+            int_hard => int_local_h(ispin)%r_coef
+            int_soft => int_local_s(ispin)%r_coef
+            k = 0
+            DO i = 1, nsp
+               DO j = 1, nsp
+                  k = k + 1
+                  coc(k) = int_hard(j, i) - int_soft(j, i)
+               END DO
+            END DO
+            CALL DGEMM('N', 'T', nsp, ncont, nsp, 1.0_dp, coc, nsp, alist%clist(kxc)%acint(:, :, 1), &
+                       SIZE(alist%clist(kxc)%acint, 1), 0.0_dp, &
+                       products(ixc)%alist(ilist)%clist(kxc)%c_int(:, :, ispin), nsp)
+         END DO
+      END DO
+!$OMP END DO
+      DEALLOCATE (coc)
+!$OMP END PARALLEL
+
+      DEALLOCATE (entries)
+
+   END SUBROUTINE build_centre_products
+
+! **************************************************************************************************
+!> \brief Whether entry kxc of an overlap list is an image other than the centre itself, with
+!>        coefficients (the case dista or distb of update_ks_atom).
+!> \param alist ...
+!> \param kxc ...
+!> \return ...
+! **************************************************************************************************
+   PURE FUNCTION distant_image(alist, kxc) RESULT(distant)
+      TYPE(alist_type), INTENT(IN)                       :: alist
+      INTEGER, INTENT(IN)                                :: kxc
+      LOGICAL                                            :: distant
+
+      distant = alist%clist(kxc)%nsgf_cnt > 0 .AND. ASSOCIATED(alist%clist(kxc)%acint)
+      IF (distant) distant = alist%aatom /= alist%clist(kxc)%catom .OR. &
+                             ANY(alist%clist(kxc)%cell /= 0)
+
+   END FUNCTION distant_image
 
 ! **************************************************************************************************
 !> \brief ...
@@ -614,11 +785,13 @@ CONTAINS
 !> \param dista ...
 !> \param distb ...
 !> \param coc ...
+!> \param c_int_dist (int_hard - int_soft) times the coefficients of the image with the larger
+!>        atom index, (nsp, ncont, nspins), for pairs of images distant from the centre
 ! **************************************************************************************************
    SUBROUTINE add_vhxca_to_ks(mat_h, C_hh_a, C_hh_b, C_ss_a, C_ss_b, &
                               int_local_h, int_local_s, &
                               nspins, ia, ja, nsp, factor, lista, nconta, listb, ncontb, &
-                              C_int_h, C_int_s, a_matrix, dista, distb, coc)
+                              C_int_h, C_int_s, a_matrix, dista, distb, coc, c_int_dist)
       TYPE(cp_2d_r_p_type), DIMENSION(:), POINTER        :: mat_h
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: C_hh_a, C_hh_b, C_ss_a, C_ss_b
       TYPE(rho_atom_coeff), DIMENSION(:), POINTER        :: int_local_h, int_local_s
@@ -632,6 +805,8 @@ CONTAINS
       REAL(dp), DIMENSION(:, :)                          :: a_matrix
       LOGICAL, INTENT(IN)                                :: dista, distb
       REAL(dp), DIMENSION(:)                             :: coc
+      REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :, :), &
+         INTENT(IN), OPTIONAL                            :: c_int_dist
 
       INTEGER                                            :: i, ispin, j, k
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: h_block, int_hard, int_soft
@@ -645,7 +820,10 @@ CONTAINS
          int_soft => int_local_s(ispin)%r_coef
          !
          IF (ia <= ja) THEN
-            IF (dista .AND. distb) THEN
+            IF (dista .AND. distb .AND. PRESENT(c_int_dist)) THEN
+               CALL DGEMM('N', 'N', nconta, ncontb, nsp, factor, C_hh_a(:, :, 1), SIZE(C_hh_a, 1), &
+                          c_int_dist(:, :, ispin), nsp, 0.0_dp, a_matrix, SIZE(a_matrix, 1))
+            ELSE IF (dista .AND. distb) THEN
                k = 0
                DO i = 1, nsp
                   DO j = 1, nsp
@@ -689,7 +867,10 @@ CONTAINS
             CALL alist_post_align_blk(a_matrix, SIZE(a_matrix, 1), h_block, SIZE(h_block, 1), &
                                       lista, nconta, listb, ncontb)
          ELSE
-            IF (dista .AND. distb) THEN
+            IF (dista .AND. distb .AND. PRESENT(c_int_dist)) THEN
+               CALL DGEMM('N', 'N', ncontb, nconta, nsp, factor, C_hh_b(:, :, 1), SIZE(C_hh_b, 1), &
+                          c_int_dist(:, :, ispin), nsp, 0.0_dp, a_matrix, SIZE(a_matrix, 1))
+            ELSE IF (dista .AND. distb) THEN
                k = 0
                DO i = 1, nsp
                   DO j = 1, nsp
