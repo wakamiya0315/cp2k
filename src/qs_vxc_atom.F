@@ -306,13 +306,13 @@ CONTAINS
          composite_nflat, composite_pw_nflat, composite_row, &
          gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
          ikind, ir, ispin, iw, jdir, myfun, na, natom, nr, nspins
-      INTEGER :: adjoint_handle, adjoint_threads, num_pe, section_handle, source_atom, &
-                 target_atom, xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: adjoint_handle, adjoint_threads, composite_row_rank, num_pe, section_handle, &
+                 source_atom, target_atom, xc_deriv_method_id, xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
          composite_atom_end, composite_atom_kind, composite_atom_kind_index, composite_atom_start, &
-         composite_grid_atom, composite_local_atoms
+         composite_grid_atom, composite_local_atoms, composite_row_order
       INTEGER, DIMENSION(2, 3)                           :: bounds
       INTEGER, DIMENSION(:), POINTER                     :: atom_list
       LOGICAL :: accint, atom_composite_active, atom_composite_diagnostic, &
@@ -822,6 +822,62 @@ CONTAINS
             composite_geometry%partition_ready = .TRUE.
             CALL timestop(section_handle)
 
+            ! Smooth fields at all local rows, taken in the order of their position on the
+            ! plane-wave grid so that consecutive rows read the same grid lines from cache.
+            CALL timeset("skala_vxc_pw_interp", section_handle)
+            CALL native_grid_row_order(smooth_rho_r(1)%pw_grid, cell, composite_grid_coords, &
+                                       image_partition_atom_composite, composite_row_order)
+!$OMP PARALLEL DO SCHEDULE(DYNAMIC, 256) DEFAULT(NONE) &
+!$OMP PRIVATE(composite_row, composite_smooth_density_value, composite_smooth_gradient_value, &
+!$OMP         composite_smooth_kin_value, interpolation_stencil) &
+!$OMP SHARED(cell, composite_grid_coords, composite_nflat, composite_row_order, &
+!$OMP        composite_smooth_density_cache, composite_smooth_drho, composite_smooth_drhoa, &
+!$OMP        composite_smooth_drhob, composite_smooth_gradient_cache, &
+!$OMP        composite_smooth_kin_cache, composite_smooth_rho, composite_smooth_rhoa, &
+!$OMP        composite_smooth_rhob, composite_smooth_tau, composite_smooth_tau_a, &
+!$OMP        composite_smooth_tau_b, image_partition_atom_composite, lsd, smooth_rho_r)
+            DO composite_row_rank = 1, composite_nflat
+               composite_row = composite_row_order(composite_row_rank)
+               CALL create_native_grid_interpolation_stencil( &
+                  interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, &
+                  composite_grid_coords(:, composite_row), image_partition_atom_composite)
+               IF (lsd) THEN
+                  CALL interpolate_native_grid_fields( &
+                     composite_smooth_rhoa, composite_smooth_drhoa(1)%array, &
+                     composite_smooth_drhoa(2)%array, composite_smooth_drhoa(3)%array, &
+                     composite_smooth_tau_a, interpolation_stencil, &
+                     composite_smooth_density_value(1), &
+                     composite_smooth_gradient_value(:, 1), &
+                     composite_smooth_kin_value(1))
+                  CALL interpolate_native_grid_fields( &
+                     composite_smooth_rhob, composite_smooth_drhob(1)%array, &
+                     composite_smooth_drhob(2)%array, composite_smooth_drhob(3)%array, &
+                     composite_smooth_tau_b, interpolation_stencil, &
+                     composite_smooth_density_value(2), &
+                     composite_smooth_gradient_value(:, 2), &
+                     composite_smooth_kin_value(2))
+                  composite_smooth_density_cache(composite_row, :) = composite_smooth_density_value
+                  composite_smooth_gradient_cache(composite_row, :, :) = &
+                     composite_smooth_gradient_value
+                  composite_smooth_kin_cache(composite_row, :) = composite_smooth_kin_value
+               ELSE
+                  CALL interpolate_native_grid_fields( &
+                     composite_smooth_rho, composite_smooth_drho(1)%array, &
+                     composite_smooth_drho(2)%array, composite_smooth_drho(3)%array, &
+                     composite_smooth_tau, interpolation_stencil, &
+                     composite_smooth_density_value(1), &
+                     composite_smooth_gradient_value(:, 1), &
+                     composite_smooth_kin_value(1))
+                  composite_smooth_density_cache(composite_row, 1) = &
+                     composite_smooth_density_value(1)
+                  composite_smooth_gradient_cache(composite_row, :, 1) = &
+                     composite_smooth_gradient_value(:, 1)
+                  composite_smooth_kin_cache(composite_row, 1) = composite_smooth_kin_value(1)
+               END IF
+            END DO
+!$OMP END PARALLEL DO
+            CALL timestop(section_handle)
+
             ! Hard and soft one-center fields of all atoms, once for the whole call.
             IF (.NOT. direct_valence_atom_composite) THEN
                CALL timeset("skala_vxc_1c_fields", section_handle)
@@ -1012,7 +1068,7 @@ CONTAINS
                END IF
 
                IF (atom_composite_active) THEN
-                  CALL timeset("skala_vxc_pw_interp", section_handle)
+                  CALL timeset("skala_vxc_composite", section_handle)
 !$OMP PARALLEL DO COLLAPSE(2) IF (image_partition_atom_composite) SCHEDULE(STATIC) DEFAULT(NONE) &
 !$OMP PRIVATE(composite_row, composite_point, composite_smooth_density_value, &
 !$OMP         composite_smooth_gradient_value, composite_smooth_kin_value, &
@@ -1035,30 +1091,13 @@ CONTAINS
                      DO ia = 1, na
                         composite_row = composite_atom_start(iatom) + (ir - 1)*na + ia - 1
                         composite_point = composite_grid_coords(:, composite_row)
-                        CALL create_native_grid_interpolation_stencil( &
-                           interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, composite_point, &
-                           image_partition_atom_composite)
+                        ! The smooth fields were interpolated for all rows before this loop.
                         IF (lsd) THEN
-                           CALL interpolate_native_grid_fields( &
-                              composite_smooth_rhoa, composite_smooth_drhoa(1)%array, &
-                              composite_smooth_drhoa(2)%array, composite_smooth_drhoa(3)%array, &
-                              composite_smooth_tau_a, interpolation_stencil, &
-                              composite_smooth_density_value(1), &
-                              composite_smooth_gradient_value(:, 1), &
-                              composite_smooth_kin_value(1))
-                           CALL interpolate_native_grid_fields( &
-                              composite_smooth_rhob, composite_smooth_drhob(1)%array, &
-                              composite_smooth_drhob(2)%array, composite_smooth_drhob(3)%array, &
-                              composite_smooth_tau_b, interpolation_stencil, &
-                              composite_smooth_density_value(2), &
-                              composite_smooth_gradient_value(:, 2), &
-                              composite_smooth_kin_value(2))
-                           composite_smooth_density_cache(composite_row, :) = &
-                              composite_smooth_density_value
-                           composite_smooth_gradient_cache(composite_row, :, :) = &
-                              composite_smooth_gradient_value
-                           composite_smooth_kin_cache(composite_row, :) = &
-                              composite_smooth_kin_value
+                           composite_smooth_density_value = &
+                              composite_smooth_density_cache(composite_row, :)
+                           composite_smooth_gradient_value = &
+                              composite_smooth_gradient_cache(composite_row, :, :)
+                           composite_smooth_kin_value = composite_smooth_kin_cache(composite_row, :)
                            DO ispin = 1, 2
                               composite_density(composite_row, ispin) = &
                                  composite_smooth_density_value(ispin)
@@ -1085,19 +1124,11 @@ CONTAINS
                               END IF
                            END DO
                         ELSE
-                           CALL interpolate_native_grid_fields( &
-                              composite_smooth_rho, composite_smooth_drho(1)%array, &
-                              composite_smooth_drho(2)%array, composite_smooth_drho(3)%array, &
-                              composite_smooth_tau, interpolation_stencil, &
-                              composite_smooth_density_value(1), &
-                              composite_smooth_gradient_value(:, 1), &
-                              composite_smooth_kin_value(1))
-                           composite_smooth_density_cache(composite_row, 1) = &
-                              composite_smooth_density_value(1)
-                           composite_smooth_gradient_cache(composite_row, :, 1) = &
-                              composite_smooth_gradient_value(:, 1)
-                           composite_smooth_kin_cache(composite_row, 1) = &
-                              composite_smooth_kin_value(1)
+                           composite_smooth_density_value(1) = &
+                              composite_smooth_density_cache(composite_row, 1)
+                           composite_smooth_gradient_value(:, 1) = &
+                              composite_smooth_gradient_cache(composite_row, :, 1)
+                           composite_smooth_kin_value(1) = composite_smooth_kin_cache(composite_row, 1)
                            composite_density(composite_row, :) = &
                               0.5_dp*composite_smooth_density_value(1)
                            DO idir = 1, 3
@@ -1839,9 +1870,10 @@ CONTAINS
 !$OMP         composite_smooth_gradient_adjoint_value, composite_smooth_kin_adjoint_value, &
 !$OMP         adjoint_entry, adjoint_tile_lower, adjoint_tile_upper, interpolation_stencil, &
 !$OMP         private_density_adjoint, private_grad_adjoint, private_kin_adjoint, &
-!$OMP         adjoint_threads) &
+!$OMP         adjoint_threads, composite_row_rank) &
 !$OMP SHARED(adjoint_nchannels, cell, composite_density_grad, composite_grad_grad, &
 !$OMP        composite_grid_coords, composite_kin_grad, composite_nflat, composite_pw_nflat, &
+!$OMP        composite_row_order, &
 !$OMP        image_partition_atom_composite, lsd, smooth_density_adjoint_storage, &
 !$OMP        smooth_grad_adjoint_storage, smooth_kin_adjoint_storage, smooth_rho_r)
                adjoint_threads = 1
@@ -1855,7 +1887,8 @@ CONTAINS
                adjoint_tile_lower = 0
                adjoint_tile_upper = smooth_rho_r(1)%pw_grid%npts - 1
 !$OMP DO SCHEDULE(STATIC)
-               DO composite_row = 1, composite_nflat
+               DO composite_row_rank = 1, composite_nflat
+                  composite_row = composite_row_order(composite_row_rank)
                   CALL create_native_grid_interpolation_stencil( &
                      interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, &
                      composite_grid_coords(:, composite_row), image_partition_atom_composite)
@@ -1888,7 +1921,7 @@ CONTAINS
                CALL build_native_grid_adjoint_bins( &
                   smooth_rho_r(1)%pw_grid, cell, composite_grid_coords, &
                   image_partition_atom_composite, adjoint_tile_count, adjoint_bin_offsets, &
-                  adjoint_bin_rows)
+                  adjoint_bin_rows, composite_row_order)
                adjoint_nbins = SIZE(adjoint_bin_offsets) - 1
 !$OMP PARALLEL DO SCHEDULE(DYNAMIC) DEFAULT(NONE) &
 !$OMP PRIVATE(adjoint_entry, composite_row, composite_smooth_density_adjoint_value, &
@@ -2399,6 +2432,7 @@ CONTAINS
                CALL release_one_center_fields(one_center_fields)
                DEALLOCATE (one_center_fields)
             END IF
+            DEALLOCATE (composite_row_order)
             CALL xc_rho_set_release(smooth_rho_set, pw_pool=auxbas_pw_pool)
             DEALLOCATE (composite_atomic_grid_sizes, composite_atom_kind, &
                         composite_atom_kind_index, composite_atom_start, composite_atom_end, &
@@ -2886,6 +2920,69 @@ CONTAINS
    END SUBROUTINE interpolate_native_grid_fields
 
 ! **************************************************************************************************
+!> \brief Order of the atom-grid rows by the position of their interpolation stencils on the
+!>        plane-wave grid: by blocks of row_order_block grid points along the third, second and
+!>        first direction. Rows taken in this order read and write the same grid lines, which
+!>        then come from cache; rows of one atom grid in their own order jump across the grid.
+!> \param pw_grid ...
+!> \param cell ...
+!> \param points atom-grid coordinates
+!> \param wrap_auxiliary_cell wrap all auxiliary-grid directions
+!> \param order rows in the new order
+! **************************************************************************************************
+   SUBROUTINE native_grid_row_order(pw_grid, cell, points, wrap_auxiliary_cell, order)
+      TYPE(pw_grid_type), INTENT(IN), POINTER            :: pw_grid
+      TYPE(cell_type), INTENT(IN), POINTER               :: cell
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: points
+      LOGICAL, INTENT(IN)                                :: wrap_auxiliary_cell
+      INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: order
+
+      INTEGER, PARAMETER                                 :: row_order_block = 8
+
+      INTEGER                                            :: block, idir, irow, nblock_total, nrow
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: block_count, block_of_row, next_slot
+      INTEGER, DIMENSION(3)                              :: block_index, nblock
+      REAL(KIND=dp), DIMENSION(3)                        :: relative
+
+      nrow = SIZE(points, 2)
+      nblock = (pw_grid%npts + row_order_block - 1)/row_order_block
+      nblock_total = PRODUCT(nblock)
+      ALLOCATE (block_of_row(nrow), block_count(nblock_total + 1), next_slot(nblock_total), &
+                order(nrow))
+!$OMP PARALLEL DO SCHEDULE(STATIC) DEFAULT(NONE) &
+!$OMP PRIVATE(block_index, idir, irow, relative) &
+!$OMP SHARED(block_of_row, cell, nblock, nrow, points, pw_grid, wrap_auxiliary_cell)
+      DO irow = 1, nrow
+         relative = MATMUL(pw_grid%dh_inv, points(:, irow))
+         DO idir = 1, 3
+            IF (cell%perd(idir) == 1 .OR. wrap_auxiliary_cell) THEN
+               relative(idir) = MODULO(relative(idir), REAL(pw_grid%npts(idir), KIND=dp))
+            END IF
+            block_index(idir) = MIN(MAX(FLOOR(relative(idir)/REAL(row_order_block, dp)), 0), &
+                                    nblock(idir) - 1)
+         END DO
+         block_of_row(irow) = 1 + block_index(1) + nblock(1)*(block_index(2) + &
+                                                              nblock(2)*block_index(3))
+      END DO
+!$OMP END PARALLEL DO
+      ! Counting sort by block, rows of one block in ascending order
+      block_count = 0
+      DO irow = 1, nrow
+         block_count(block_of_row(irow) + 1) = block_count(block_of_row(irow) + 1) + 1
+      END DO
+      next_slot(1) = 1
+      DO block = 2, nblock_total
+         next_slot(block) = next_slot(block - 1) + block_count(block)
+      END DO
+      DO irow = 1, nrow
+         block = block_of_row(irow)
+         order(next_slot(block)) = irow
+         next_slot(block) = next_slot(block) + 1
+      END DO
+      DEALLOCATE (block_of_row, block_count, next_slot)
+   END SUBROUTINE native_grid_row_order
+
+! **************************************************************************************************
 !> \brief Group atom-grid rows by the disjoint PW tiles touched by their interpolation stencils.
 !> \param pw_grid ...
 !> \param cell ...
@@ -2894,18 +2991,21 @@ CONTAINS
 !> \param tile_count number of tiles along each PW-grid direction
 !> \param bin_offsets CSR offsets into bin_rows
 !> \param bin_rows atom-grid rows touching each tile
+!> \param row_order optional order of the rows within each bin
 ! **************************************************************************************************
    SUBROUTINE build_native_grid_adjoint_bins(pw_grid, cell, points, wrap_auxiliary_cell, &
-                                             tile_count, bin_offsets, bin_rows)
+                                             tile_count, bin_offsets, bin_rows, row_order)
       TYPE(pw_grid_type), INTENT(IN), POINTER            :: pw_grid
       TYPE(cell_type), INTENT(IN), POINTER               :: cell
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: points
       LOGICAL, INTENT(IN)                                :: wrap_auxiliary_cell
       INTEGER, DIMENSION(3), INTENT(OUT)                 :: tile_count
       INTEGER, ALLOCATABLE, DIMENSION(:), INTENT(OUT)    :: bin_offsets, bin_rows
+      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: row_order
 
-      INTEGER                                            :: candidate, ibin, idir, inode, irow, ix, &
-                                                            iy, iz, nbin, ntouched, position
+      INTEGER                                            :: candidate, ibin, idir, inode, irank, &
+                                                            irow, ix, iy, iz, nbin, ntouched, &
+                                                            position
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bin_counts, bin_cursor, row_bin_count
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: row_bins
       INTEGER, DIMENSION(3)                              :: touched_count
@@ -2973,7 +3073,10 @@ CONTAINS
       END DO
       ALLOCATE (bin_rows(bin_offsets(nbin + 1) - 1))
       bin_cursor(:) = bin_offsets(1:nbin)
-      DO irow = 1, SIZE(points, 2)
+      ! Within a bin the rows follow row_order when given, ascending otherwise.
+      DO irank = 1, SIZE(points, 2)
+         irow = irank
+         IF (PRESENT(row_order)) irow = row_order(irank)
          DO ibin = 1, row_bin_count(irow)
             candidate = row_bins(ibin, irow)
             position = bin_cursor(candidate)
