@@ -144,6 +144,9 @@ MODULE qs_vxc_atom
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: rho_h => NULL(), rho_s => NULL(), &
                                                             tau_h => NULL(), tau_s => NULL()
       REAL(KIND=dp), DIMENSION(:, :, :, :), POINTER      :: drho_h => NULL(), drho_s => NULL()
+      ! Projections of the hard-minus-soft fields on the harmonics of the grid,
+      ! (max_s_harm, nr, 5, nspins); see project_atom_grid_fields
+      REAL(KIND=dp), DIMENSION(:, :, :, :), POINTER      :: projection => NULL()
       ! Outermost radius of the hard-minus-soft fields (bohr), zero if they vanish
       REAL(KIND=dp)                                      :: support_radius = 0.0_dp
    END TYPE one_center_fields_type
@@ -3275,8 +3278,14 @@ CONTAINS
    END SUBROUTINE radial_node_derivative_coefficients
 
 ! **************************************************************************************************
-!> \brief Build mutually consistent value and Cartesian-derivative weights for interpolation from
-!>        a GAPW radial/Lebedev atom grid to one arbitrary local displacement.
+!> \brief Radial interpolation weights and the real spherical harmonics, with their Cartesian
+!>        derivatives, for interpolating fields of a GAPW radial/Lebedev atom grid at one point.
+!> \details A field F on the grid is interpolated as
+!>          sum_n radial_weights(n) sum_iso angular_values(iso) P_iso(radial_indices(n)), where
+!>          P_iso(ir) = sum_ia wa(ia) slm(ia, iso) F(ia, ir) is the projection of shell ir on the
+!>          harmonics of the grid (project_atom_grid_fields). The angular part is that projection
+!>          evaluated in the direction of the point, the radial part a C2-continuous quintic
+!>          Hermite interpolant through the neighbouring shells.
 !> \param grid_atom source atom grid
 !> \param harmonics source spherical harmonics
 !> \param displacement point minus source-image coordinate
@@ -3285,13 +3294,13 @@ CONTAINS
 !> \param radial_weights interpolation weights on the active radial nodes
 !> \param radial_derivative_weights optional radial derivatives of the interpolation weights
 !> \param nradial number of active radial nodes
-!> \param angular_weights angular interpolation weights
-!> \param angular_derivative_weights optional Cartesian derivatives of the angular weights
+!> \param angular_values real spherical harmonics of the grid in the direction of the point
+!> \param angular_value_derivatives optional Cartesian derivatives of angular_values at the point
 !> \param active whether the point lies inside the compact support
 ! **************************************************************************************************
-   SUBROUTINE atom_grid_interpolation_weights( &
+   SUBROUTINE atom_grid_interpolation_harmonics( &
       grid_atom, harmonics, displacement, cutoff, radial_indices, radial_weights, &
-      radial_derivative_weights, nradial, angular_weights, angular_derivative_weights, active)
+      radial_derivative_weights, nradial, angular_values, angular_value_derivatives, active)
       TYPE(grid_atom_type), POINTER                      :: grid_atom
       TYPE(harmonics_atom_type), POINTER                 :: harmonics
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: displacement
@@ -3300,11 +3309,11 @@ CONTAINS
       REAL(dp), DIMENSION(4), INTENT(OUT)                :: radial_weights
       REAL(dp), DIMENSION(4), INTENT(OUT), OPTIONAL      :: radial_derivative_weights
       INTEGER, INTENT(OUT)                               :: nradial
-      REAL(dp), DIMENSION(:), INTENT(OUT)                :: angular_weights
-      REAL(dp), DIMENSION(:, :), INTENT(OUT), OPTIONAL   :: angular_derivative_weights
+      REAL(dp), DIMENSION(:), INTENT(OUT)                :: angular_values
+      REAL(dp), DIMENSION(:, :), INTENT(OUT), OPTIONAL   :: angular_value_derivatives
       LOGICAL, INTENT(OUT)                               :: active
 
-      INTEGER                                            :: ia, ic, inode, iso, l, left, left_pos, &
+      INTEGER                                            :: ic, inode, iso, l, left, left_pos, &
                                                             logical_end, logical_start, lx, ly, &
                                                             lz, n, right_pos, shell_index
       LOGICAL                                            :: descending
@@ -3313,26 +3322,20 @@ CONTAINS
                                                             monomial, radius, solid_derivative, t, &
                                                             x1, x2
       REAL(dp), DIMENSION(3)                             :: direction
-      REAL(dp), DIMENSION(harmonics%max_s_harm)          :: angular_values
       REAL(dp), DIMENSION(4)                             :: curvature_left, curvature_right, &
                                                             slope_left, slope_right
-      REAL(dp), DIMENSION(3, harmonics%max_s_harm)       :: angular_value_derivatives
 
       CPASSERT(ASSOCIATED(grid_atom))
       CPASSERT(ASSOCIATED(harmonics))
-      CPASSERT(SIZE(angular_weights) == grid_atom%ng_sphere)
-      IF (PRESENT(angular_derivative_weights)) THEN
-         CPASSERT(SIZE(angular_derivative_weights, 1) == 3)
-         CPASSERT(SIZE(angular_derivative_weights, 2) == grid_atom%ng_sphere)
+      CPASSERT(SIZE(angular_values) == harmonics%max_s_harm)
+      IF (PRESENT(angular_value_derivatives)) THEN
+         CPASSERT(SIZE(angular_value_derivatives, 1) == 3)
+         CPASSERT(SIZE(angular_value_derivatives, 2) == harmonics%max_s_harm)
       END IF
 
       radial_indices = 0
       radial_weights = 0.0_dp
       IF (PRESENT(radial_derivative_weights)) radial_derivative_weights = 0.0_dp
-      ! The angular weights are not zeroed: both callers read them only for an active point,
-      ! and an active point assigns every entry below. Zeroing them on every call, mostly for
-      ! points outside the atomic grid that return at once, took about half of the CPU time
-      ! of native SKALA with GAPW_XC.
       nradial = 0
       active = .FALSE.
       n = grid_atom%nr
@@ -3407,11 +3410,11 @@ CONTAINS
       END IF
 
       angular_values = 0.0_dp
-      IF (PRESENT(angular_derivative_weights)) angular_value_derivatives = 0.0_dp
+      IF (PRESENT(angular_value_derivatives)) angular_value_derivatives = 0.0_dp
       DO iso = 1, harmonics%max_s_harm
          l = indso(1, iso)
          CALL y_lm(direction, angular_values(iso), l, indso(2, iso))
-         IF (l == 0 .OR. .NOT. PRESENT(angular_derivative_weights)) CYCLE
+         IF (l == 0 .OR. .NOT. PRESENT(angular_value_derivatives)) CYCLE
          shell_index = iso - nsoset(l - 1)
          DO ic = 1, nco(l)
             lx = indco(1, ic + ncoset(l - 1))
@@ -3443,37 +3446,82 @@ CONTAINS
                                                      direction(inode))/radius
          END DO
       END DO
-
-      DO ia = 1, grid_atom%ng_sphere
-         angular_weights(ia) = grid_atom%wa(ia)* &
-                               DOT_PRODUCT(harmonics%slm(ia, 1:harmonics%max_s_harm), &
-                                           angular_values)
-         IF (PRESENT(angular_derivative_weights)) THEN
-            DO inode = 1, 3
-               angular_derivative_weights(inode, ia) = grid_atom%wa(ia)* &
-                                                       DOT_PRODUCT(harmonics%slm(ia, 1:harmonics%max_s_harm), &
-                                                                   angular_value_derivatives(inode, :))
-            END DO
-         END IF
-      END DO
       active = .TRUE.
 
-   END SUBROUTINE atom_grid_interpolation_weights
+   END SUBROUTINE atom_grid_interpolation_harmonics
 
 ! **************************************************************************************************
-!> \brief Interpolate hard-minus-soft primitive fields and their spatial derivatives from one
-!>        GAPW atom grid.
+!> \brief Project the hard-minus-soft fields of one atom on the real spherical harmonics of its grid,
+!>        shell by shell: projection(iso, ir, c, ispin) = sum_ia wa(ia) slm(ia, iso) F_c(ia, ir), with
+!>        F_c the density (c = 1), the gradient components (2-4) and the kinetic-energy density (5).
+!> \details With these projections the cross-atom interpolation of atom_grid_interpolation_harmonics
+!>          costs max_s_harm operations per radial node and field instead of ng_sphere x
+!>          max_s_harm. The sums run in another order than a sum of angular weights over the grid
+!>          points, which changes the interpolated values only by rounding.
+!> \param grid_atom ...
+!> \param harmonics ...
+!> \param nspins number of spin channels
+!> \param rho_h hard density
+!> \param rho_s soft density
+!> \param drho_h hard density gradient (components 1-3)
+!> \param drho_s soft density gradient
+!> \param tau_h hard kinetic-energy density
+!> \param tau_s soft kinetic-energy density
+!> \param projection (max_s_harm, nr, 5, nspins)
+! **************************************************************************************************
+   SUBROUTINE project_atom_grid_fields(grid_atom, harmonics, nspins, rho_h, rho_s, drho_h, drho_s, &
+                                       tau_h, tau_s, projection)
+      TYPE(grid_atom_type), POINTER                      :: grid_atom
+      TYPE(harmonics_atom_type), POINTER                 :: harmonics
+      INTEGER, INTENT(IN)                                :: nspins
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: rho_h, rho_s
+      REAL(dp), DIMENSION(:, :, :, :), INTENT(IN)        :: drho_h, drho_s
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: tau_h, tau_s
+      REAL(dp), DIMENSION(:, :, :, :), INTENT(OUT)       :: projection
+
+      INTEGER                                            :: ia, ic, idir, ir, ispin, na, nharm, nr
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: difference, weighted_harmonics
+
+      na = grid_atom%ng_sphere
+      nr = grid_atom%nr
+      nharm = harmonics%max_s_harm
+      CPASSERT(ALL(SHAPE(projection) == [nharm, nr, 5, nspins]))
+      ALLOCATE (difference(na, nr), weighted_harmonics(na, nharm))
+      DO ic = 1, nharm
+         DO ia = 1, na
+            weighted_harmonics(ia, ic) = grid_atom%wa(ia)*harmonics%slm(ia, ic)
+         END DO
+      END DO
+      DO ispin = 1, nspins
+         DO ic = 1, 5
+            DO ir = 1, nr
+               SELECT CASE (ic)
+               CASE (1)
+                  difference(:, ir) = rho_h(1:na, ir, ispin) - rho_s(1:na, ir, ispin)
+               CASE (2, 3, 4)
+                  idir = ic - 1
+                  difference(:, ir) = drho_h(idir, 1:na, ir, ispin) - drho_s(idir, 1:na, ir, ispin)
+               CASE (5)
+                  difference(:, ir) = tau_h(1:na, ir, ispin) - tau_s(1:na, ir, ispin)
+               END SELECT
+            END DO
+            CALL dgemm('T', 'N', nharm, nr, na, 1.0_dp, weighted_harmonics, na, difference, na, &
+                       0.0_dp, projection(:, :, ic, ispin), nharm)
+         END DO
+      END DO
+      DEALLOCATE (difference, weighted_harmonics)
+   END SUBROUTINE project_atom_grid_fields
+
+! **************************************************************************************************
+!> \brief Interpolate the hard-minus-soft fields of one atom grid at one point from their
+!>        projections on the harmonics (project_atom_grid_fields), optionally with their Cartesian
+!>        derivatives with respect to the point.
 !> \param grid_atom radial and angular source grid
 !> \param harmonics spherical-harmonic representation of the source grid
 !> \param displacement target point relative to the source-atom image
 !> \param cutoff compact support radius of the source fields
 !> \param nspins number of spin channels
-!> \param rho_h hard one-center density values
-!> \param rho_s soft one-center density values
-!> \param drho_h hard one-center density-gradient values
-!> \param drho_s soft one-center density-gradient values
-!> \param tau_h hard one-center kinetic-energy-density values
-!> \param tau_s soft one-center kinetic-energy-density values
+!> \param projection projections of the fields of the source atom
 !> \param density interpolated hard-minus-soft density
 !> \param gradient interpolated hard-minus-soft density gradient
 !> \param kin interpolated hard-minus-soft kinetic-energy density
@@ -3481,77 +3529,87 @@ CONTAINS
 !> \param gradient_spatial Cartesian derivatives of the density gradient
 !> \param kin_spatial Cartesian derivatives of the kinetic-energy density
 ! **************************************************************************************************
-   SUBROUTINE interpolate_gapw_atom_grid_fields( &
-      grid_atom, harmonics, displacement, cutoff, nspins, rho_h, rho_s, drho_h, drho_s, &
-      tau_h, tau_s, density, gradient, kin, density_spatial, gradient_spatial, kin_spatial)
+   SUBROUTINE interpolate_projected_fields(grid_atom, harmonics, displacement, cutoff, nspins, &
+                                           projection, density, gradient, kin, density_spatial, &
+                                           gradient_spatial, kin_spatial)
       TYPE(grid_atom_type), POINTER                      :: grid_atom
       TYPE(harmonics_atom_type), POINTER                 :: harmonics
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: displacement
       REAL(dp), INTENT(IN)                               :: cutoff
       INTEGER, INTENT(IN)                                :: nspins
-      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: rho_h, rho_s
-      REAL(dp), DIMENSION(:, :, :, :), INTENT(IN)        :: drho_h, drho_s
-      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: tau_h, tau_s
+      REAL(dp), DIMENSION(:, :, :, :), INTENT(IN)        :: projection
       REAL(dp), DIMENSION(2), INTENT(OUT)                :: density
       REAL(dp), DIMENSION(3, 2), INTENT(OUT)             :: gradient
       REAL(dp), DIMENSION(2), INTENT(OUT)                :: kin
-      REAL(dp), DIMENSION(3, 2), INTENT(OUT)             :: density_spatial
-      REAL(dp), DIMENSION(3, 3, 2), INTENT(OUT)          :: gradient_spatial
-      REAL(dp), DIMENSION(3, 2), INTENT(OUT)             :: kin_spatial
+      REAL(dp), DIMENSION(3, 2), INTENT(OUT), OPTIONAL   :: density_spatial
+      REAL(dp), DIMENSION(3, 3, 2), INTENT(OUT), &
+         OPTIONAL                                        :: gradient_spatial
+      REAL(dp), DIMENSION(3, 2), INTENT(OUT), OPTIONAL   :: kin_spatial
 
-      INTEGER                                            :: ia, idir, inode, ir, ispin, jdir, nradial
+      INTEGER                                            :: ic, idir, inode, ir, ispin, nharm, &
+                                                            nradial
       INTEGER, DIMENSION(4)                              :: radial_indices
-      LOGICAL                                            :: active
-      REAL(dp)                                           :: derivative_weight, weight
-      REAL(dp), DIMENSION(grid_atom%ng_sphere)           :: angular_weights
+      LOGICAL                                            :: active, spatial
+      REAL(dp)                                           :: shell_value
+      REAL(dp), DIMENSION(3)                             :: direction, shell_derivative
+      REAL(dp), DIMENSION(3, 5, 2)                       :: field_spatial
       REAL(dp), DIMENSION(4)                             :: radial_derivative_weights, radial_weights
-      REAL(dp), DIMENSION(3, grid_atom%ng_sphere)        :: angular_derivative_weights
+      REAL(dp), DIMENSION(5, 2)                          :: field
+      REAL(dp), DIMENSION(3, harmonics%max_s_harm)       :: angular_value_derivatives
+      REAL(dp), DIMENSION(harmonics%max_s_harm)          :: angular_values
 
-      density = 0.0_dp
-      gradient = 0.0_dp
-      kin = 0.0_dp
-      density_spatial = 0.0_dp
-      gradient_spatial = 0.0_dp
-      kin_spatial = 0.0_dp
-      CALL atom_grid_interpolation_weights( &
-         grid_atom, harmonics, displacement, cutoff, radial_indices, radial_weights, &
-         radial_derivative_weights, nradial, angular_weights, angular_derivative_weights, active)
+      nharm = harmonics%max_s_harm
+      spatial = PRESENT(density_spatial)
+      CPASSERT(PRESENT(gradient_spatial) .EQV. spatial)
+      CPASSERT(PRESENT(kin_spatial) .EQV. spatial)
+      field = 0.0_dp
+      field_spatial = 0.0_dp
+      IF (spatial) THEN
+         CALL atom_grid_interpolation_harmonics( &
+            grid_atom, harmonics, displacement, cutoff, radial_indices, radial_weights, &
+            radial_derivative_weights, nradial, angular_values, angular_value_derivatives, active)
+      ELSE
+         CALL atom_grid_interpolation_harmonics( &
+            grid_atom, harmonics, displacement, cutoff, radial_indices, radial_weights, &
+            nradial=nradial, angular_values=angular_values, active=active)
+      END IF
       IF (active) THEN
+         direction = displacement/SQRT(SUM(displacement**2))
          DO inode = 1, nradial
             ir = radial_indices(inode)
-            DO ia = 1, grid_atom%ng_sphere
-               weight = radial_weights(inode)*angular_weights(ia)
-               DO ispin = 1, nspins
-                  density(ispin) = density(ispin) + &
-                                   weight*(rho_h(ia, ir, ispin) - rho_s(ia, ir, ispin))
-                  kin(ispin) = kin(ispin) + &
-                               weight*(tau_h(ia, ir, ispin) - tau_s(ia, ir, ispin))
+            DO ispin = 1, nspins
+               DO ic = 1, 5
+                  shell_value = DOT_PRODUCT(angular_values, projection(1:nharm, ir, ic, ispin))
+                  field(ic, ispin) = field(ic, ispin) + radial_weights(inode)*shell_value
+                  IF (.NOT. spatial) CYCLE
                   DO idir = 1, 3
-                     gradient(idir, ispin) = gradient(idir, ispin) + &
-                                             weight*(drho_h(idir, ia, ir, ispin) - &
-                                                     drho_s(idir, ia, ir, ispin))
-                     derivative_weight = radial_derivative_weights(inode)* &
-                                         displacement(idir)/SQRT(SUM(displacement**2))* &
-                                         angular_weights(ia) + radial_weights(inode)* &
-                                         angular_derivative_weights(idir, ia)
-                     density_spatial(idir, ispin) = density_spatial(idir, ispin) + &
-                                                    derivative_weight*(rho_h(ia, ir, ispin) - rho_s(ia, ir, ispin))
-                     kin_spatial(idir, ispin) = kin_spatial(idir, ispin) + &
-                                                derivative_weight*(tau_h(ia, ir, ispin) - tau_s(ia, ir, ispin))
-                     DO jdir = 1, 3
-                        gradient_spatial(jdir, idir, ispin) = &
-                           gradient_spatial(jdir, idir, ispin) + derivative_weight*( &
-                           drho_h(jdir, ia, ir, ispin) - drho_s(jdir, ia, ir, ispin))
-                     END DO
+                     shell_derivative(idir) = DOT_PRODUCT(angular_value_derivatives(idir, :), &
+                                                          projection(1:nharm, ir, ic, ispin))
                   END DO
+                  field_spatial(:, ic, ispin) = field_spatial(:, ic, ispin) + &
+                                                radial_derivative_weights(inode)*direction* &
+                                                shell_value + &
+                                                radial_weights(inode)*shell_derivative
                END DO
             END DO
          END DO
       END IF
-   END SUBROUTINE interpolate_gapw_atom_grid_fields
+      density = field(1, :)
+      gradient = field(2:4, :)
+      kin = field(5, :)
+      IF (spatial) THEN
+         density_spatial = field_spatial(:, 1, :)
+         DO idir = 1, 3
+            gradient_spatial(idir, :, :) = field_spatial(:, 1 + idir, :)
+         END DO
+         kin_spatial = field_spatial(:, 5, :)
+      END IF
+   END SUBROUTINE interpolate_projected_fields
 
 ! **************************************************************************************************
-!> \brief Apply the exact transpose of interpolate_gapw_atom_grid_fields to one-center potentials.
+!> \brief Add the transpose of interpolate_projected_fields at one point to adjoint projections:
+!>        adjoint(iso, ir, c, ispin) gains radial_weight(ir) Y_iso(point) times the model derivative
+!>        with respect to field c. add_projected_potentials turns them into grid potentials.
 !> \param grid_atom radial and angular source grid
 !> \param harmonics spherical-harmonic representation of the source grid
 !> \param displacement target point relative to the source-atom image
@@ -3560,16 +3618,10 @@ CONTAINS
 !> \param density_adjoint model derivative with respect to density
 !> \param gradient_adjoint model derivative with respect to the density gradient
 !> \param kin_adjoint model derivative with respect to kinetic-energy density
-!> \param vxc_h accumulated hard one-center density potential
-!> \param vxc_s accumulated soft one-center density potential
-!> \param vxg_h accumulated hard one-center density-gradient potential
-!> \param vxg_s accumulated soft one-center density-gradient potential
-!> \param vtau_h accumulated hard one-center kinetic-energy-density potential
-!> \param vtau_s accumulated soft one-center kinetic-energy-density potential
+!> \param adjoint adjoint projections (max_s_harm, nr, 5, nspins), accumulated
 ! **************************************************************************************************
-   SUBROUTINE add_gapw_atom_grid_interpolation_adjoint( &
-      grid_atom, harmonics, displacement, cutoff, nspins, density_adjoint, gradient_adjoint, &
-      kin_adjoint, vxc_h, vxc_s, vxg_h, vxg_s, vtau_h, vtau_s)
+   SUBROUTINE add_projected_adjoint(grid_atom, harmonics, displacement, cutoff, nspins, &
+                                    density_adjoint, gradient_adjoint, kin_adjoint, adjoint)
       TYPE(grid_atom_type), POINTER                      :: grid_atom
       TYPE(harmonics_atom_type), POINTER                 :: harmonics
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: displacement
@@ -3578,112 +3630,93 @@ CONTAINS
       REAL(dp), DIMENSION(2), INTENT(IN)                 :: density_adjoint
       REAL(dp), DIMENSION(3, 2), INTENT(IN)              :: gradient_adjoint
       REAL(dp), DIMENSION(2), INTENT(IN)                 :: kin_adjoint
+      REAL(dp), DIMENSION(:, :, :, :), INTENT(INOUT)     :: adjoint
+
+      INTEGER                                            :: ic, inode, ir, ispin, nharm, nradial
+      INTEGER, DIMENSION(4)                              :: radial_indices
+      LOGICAL                                            :: active
+      REAL(dp), DIMENSION(4)                             :: radial_weights
+      REAL(dp), DIMENSION(5)                             :: coefficient
+      REAL(dp), DIMENSION(harmonics%max_s_harm)          :: angular_values
+
+      nharm = harmonics%max_s_harm
+      CALL atom_grid_interpolation_harmonics( &
+         grid_atom, harmonics, displacement, cutoff, radial_indices, radial_weights, &
+         nradial=nradial, angular_values=angular_values, active=active)
+      IF (.NOT. active) RETURN
+      DO inode = 1, nradial
+         ir = radial_indices(inode)
+         DO ispin = 1, nspins
+            coefficient(1) = radial_weights(inode)*density_adjoint(ispin)
+            coefficient(2:4) = radial_weights(inode)*gradient_adjoint(:, ispin)
+            coefficient(5) = radial_weights(inode)*kin_adjoint(ispin)
+            DO ic = 1, 5
+               adjoint(1:nharm, ir, ic, ispin) = adjoint(1:nharm, ir, ic, ispin) + &
+                                                 coefficient(ic)*angular_values
+            END DO
+         END DO
+      END DO
+   END SUBROUTINE add_projected_adjoint
+
+! **************************************************************************************************
+!> \brief Add the grid potentials of adjoint projections to the hard and soft one-center
+!>        potentials: v(ia, ir) = sum_iso wa(ia) slm(ia, iso) adjoint(iso, ir). CP2K applies the
+!>        hard-minus-soft sign when the two one-center matrices are assembled, so both potentials
+!>        receive the same values.
+!> \param grid_atom ...
+!> \param harmonics ...
+!> \param nspins number of spin channels
+!> \param adjoint adjoint projections (max_s_harm, nr, 5, nspins)
+!> \param vxc_h hard density potential, accumulated
+!> \param vxc_s soft density potential, accumulated
+!> \param vxg_h hard gradient potential, accumulated
+!> \param vxg_s soft gradient potential, accumulated
+!> \param vtau_h hard kinetic-energy-density potential, accumulated
+!> \param vtau_s soft kinetic-energy-density potential, accumulated
+! **************************************************************************************************
+   SUBROUTINE add_projected_potentials(grid_atom, harmonics, nspins, adjoint, vxc_h, vxc_s, &
+                                       vxg_h, vxg_s, vtau_h, vtau_s)
+      TYPE(grid_atom_type), POINTER                      :: grid_atom
+      TYPE(harmonics_atom_type), POINTER                 :: harmonics
+      INTEGER, INTENT(IN)                                :: nspins
+      REAL(dp), DIMENSION(:, :, :, :), INTENT(IN)        :: adjoint
       REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: vxc_h, vxc_s
       REAL(dp), DIMENSION(:, :, :, :), INTENT(INOUT)     :: vxg_h, vxg_s
       REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: vtau_h, vtau_s
 
-      INTEGER                                            :: ia, idir, inode, ir, ispin, nradial
-      INTEGER, DIMENSION(4)                              :: radial_indices
-      LOGICAL                                            :: active
-      REAL(dp)                                           :: value
-      REAL(dp), DIMENSION(4)                             :: radial_weights
-      REAL(dp), DIMENSION(grid_atom%ng_sphere)           :: angular_weights
+      INTEGER                                            :: ia, ic, ir, ispin, na, nharm, nr
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: potential, weighted_harmonics
 
-      CALL atom_grid_interpolation_weights( &
-         grid_atom, harmonics, displacement, cutoff, radial_indices, radial_weights, &
-         nradial=nradial, angular_weights=angular_weights, active=active)
-      IF (active) THEN
-         DO inode = 1, nradial
-            ir = radial_indices(inode)
-            DO ia = 1, grid_atom%ng_sphere
-               value = radial_weights(inode)*angular_weights(ia)
-               DO ispin = 1, nspins
-                  ! CP2K applies the hard-minus-soft sign when the two one-center
-                  ! matrices are assembled, so both stored potentials carry the
-                  ! same transpose-interpolation coefficient.
-                  vxc_h(ia, ir, ispin) = vxc_h(ia, ir, ispin) + value*density_adjoint(ispin)
-                  vxc_s(ia, ir, ispin) = vxc_s(ia, ir, ispin) + value*density_adjoint(ispin)
-                  vtau_h(ia, ir, ispin) = vtau_h(ia, ir, ispin) + value*kin_adjoint(ispin)
-                  vtau_s(ia, ir, ispin) = vtau_s(ia, ir, ispin) + value*kin_adjoint(ispin)
-                  DO idir = 1, 3
-                     vxg_h(idir, ia, ir, ispin) = vxg_h(idir, ia, ir, ispin) + &
-                                                  value*gradient_adjoint(idir, ispin)
-                     vxg_s(idir, ia, ir, ispin) = vxg_s(idir, ia, ir, ispin) + &
-                                                  value*gradient_adjoint(idir, ispin)
-                  END DO
-               END DO
+      na = grid_atom%ng_sphere
+      nr = grid_atom%nr
+      nharm = harmonics%max_s_harm
+      ALLOCATE (potential(na, nr), weighted_harmonics(na, nharm))
+      DO ic = 1, nharm
+         DO ia = 1, na
+            weighted_harmonics(ia, ic) = grid_atom%wa(ia)*harmonics%slm(ia, ic)
+         END DO
+      END DO
+      DO ispin = 1, nspins
+         DO ic = 1, 5
+            CALL dgemm('N', 'N', na, nr, nharm, 1.0_dp, weighted_harmonics, na, &
+                       adjoint(:, :, ic, ispin), nharm, 0.0_dp, potential, na)
+            DO ir = 1, nr
+               SELECT CASE (ic)
+               CASE (1)
+                  vxc_h(1:na, ir, ispin) = vxc_h(1:na, ir, ispin) + potential(:, ir)
+                  vxc_s(1:na, ir, ispin) = vxc_s(1:na, ir, ispin) + potential(:, ir)
+               CASE (2, 3, 4)
+                  vxg_h(ic - 1, 1:na, ir, ispin) = vxg_h(ic - 1, 1:na, ir, ispin) + potential(:, ir)
+                  vxg_s(ic - 1, 1:na, ir, ispin) = vxg_s(ic - 1, 1:na, ir, ispin) + potential(:, ir)
+               CASE (5)
+                  vtau_h(1:na, ir, ispin) = vtau_h(1:na, ir, ispin) + potential(:, ir)
+                  vtau_s(1:na, ir, ispin) = vtau_s(1:na, ir, ispin) + potential(:, ir)
+               END SELECT
             END DO
          END DO
-      END IF
-   END SUBROUTINE add_gapw_atom_grid_interpolation_adjoint
-
-! **************************************************************************************************
-!> \brief Interpolate the hard-minus-soft primitive fields of one GAPW atom grid at one point,
-!>        without the spatial derivatives that only the forces need. Gives the same values as
-!>        interpolate_gapw_atom_grid_fields.
-!> \param grid_atom radial and angular source grid
-!> \param harmonics spherical-harmonic representation of the source grid
-!> \param displacement target point relative to the source-atom image
-!> \param cutoff compact support radius of the source fields
-!> \param nspins number of spin channels
-!> \param rho_h hard one-center density values
-!> \param rho_s soft one-center density values
-!> \param drho_h hard one-center density-gradient values
-!> \param drho_s soft one-center density-gradient values
-!> \param tau_h hard one-center kinetic-energy-density values
-!> \param tau_s soft one-center kinetic-energy-density values
-!> \param density interpolated hard-minus-soft density
-!> \param gradient interpolated hard-minus-soft density gradient
-!> \param kin interpolated hard-minus-soft kinetic-energy density
-! **************************************************************************************************
-   SUBROUTINE interpolate_gapw_atom_grid_values( &
-      grid_atom, harmonics, displacement, cutoff, nspins, rho_h, rho_s, drho_h, drho_s, &
-      tau_h, tau_s, density, gradient, kin)
-      TYPE(grid_atom_type), POINTER                      :: grid_atom
-      TYPE(harmonics_atom_type), POINTER                 :: harmonics
-      REAL(dp), DIMENSION(3), INTENT(IN)                 :: displacement
-      REAL(dp), INTENT(IN)                               :: cutoff
-      INTEGER, INTENT(IN)                                :: nspins
-      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: rho_h, rho_s
-      REAL(dp), DIMENSION(:, :, :, :), INTENT(IN)        :: drho_h, drho_s
-      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: tau_h, tau_s
-      REAL(dp), DIMENSION(2), INTENT(OUT)                :: density
-      REAL(dp), DIMENSION(3, 2), INTENT(OUT)             :: gradient
-      REAL(dp), DIMENSION(2), INTENT(OUT)                :: kin
-
-      INTEGER                                            :: ia, idir, inode, ir, ispin, nradial
-      INTEGER, DIMENSION(4)                              :: radial_indices
-      LOGICAL                                            :: active
-      REAL(dp)                                           :: weight
-      REAL(dp), DIMENSION(4)                             :: radial_weights
-      REAL(dp), DIMENSION(grid_atom%ng_sphere)           :: angular_weights
-
-      density = 0.0_dp
-      gradient = 0.0_dp
-      kin = 0.0_dp
-      CALL atom_grid_interpolation_weights( &
-         grid_atom, harmonics, displacement, cutoff, radial_indices, radial_weights, &
-         nradial=nradial, angular_weights=angular_weights, active=active)
-      IF (active) THEN
-         DO inode = 1, nradial
-            ir = radial_indices(inode)
-            DO ia = 1, grid_atom%ng_sphere
-               weight = radial_weights(inode)*angular_weights(ia)
-               DO ispin = 1, nspins
-                  density(ispin) = density(ispin) + &
-                                   weight*(rho_h(ia, ir, ispin) - rho_s(ia, ir, ispin))
-                  kin(ispin) = kin(ispin) + &
-                               weight*(tau_h(ia, ir, ispin) - tau_s(ia, ir, ispin))
-                  DO idir = 1, 3
-                     gradient(idir, ispin) = gradient(idir, ispin) + &
-                                             weight*(drho_h(idir, ia, ir, ispin) - &
-                                                     drho_s(idir, ia, ir, ispin))
-                  END DO
-               END DO
-            END DO
-         END DO
-      END IF
-   END SUBROUTINE interpolate_gapw_atom_grid_values
+      END DO
+      DEALLOCATE (potential, weighted_harmonics)
+   END SUBROUTINE add_projected_potentials
 
 ! **************************************************************************************************
 !> \brief Model derivatives of one composite row as seen by the cross-atom interpolation adjoint.
@@ -4019,9 +4052,8 @@ CONTAINS
             displacement = candidates%displacement(:, icand)
             IF (SQRT(SUM(displacement**2)) > cutoff) CYCLE
             row = candidates%row(icand)
-            CALL interpolate_gapw_atom_grid_values( &
-               grid_atom, harmonics, displacement, cutoff, nspins, fields%rho_h, fields%rho_s, &
-               fields%drho_h, fields%drho_s, fields%tau_h, fields%tau_s, density, gradient, kin)
+            CALL interpolate_projected_fields(grid_atom, harmonics, displacement, cutoff, nspins, &
+                                              fields%projection, density, gradient, kin)
             IF (lsd) THEN
                IF (use_density) THEN
                   cross_density(row, 1:2) = cross_density(row, 1:2) + density(1:2)
@@ -4053,8 +4085,10 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Add the transpose of add_cross_atom_fields to the one-center potentials of the source
 !>        atom.
-!> \details Threads take equal shares of the list and add their sums in thread order, so the
-!>          result depends on the number of threads only through rounding.
+!> \details The contributions are summed as projections on the harmonics of the source grid and
+!>          turned into grid potentials once (add_projected_potentials). Threads take equal shares
+!>          of the list and add their sums in thread order, so the result depends on the number of
+!>          threads only through rounding.
 !> \param candidates rows near the images of the source atom
 !> \param cutoff current cross cutoff of the source atom (bohr)
 !> \param grid_atom grid of the source atom
@@ -4092,34 +4126,22 @@ CONTAINS
       REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: vtau_h, vtau_s
 
       INTEGER                                            :: icand, ithread, nthread, row, row_done
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: vtau_h_local, vtau_s_local, &
-                                                            vxc_h_local, vxc_s_local
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :, :)       :: vxg_h_local, vxg_s_local
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :, :)       :: adjoint, adjoint_local
       REAL(dp), DIMENSION(2)                             :: density_adjoint, kin_adjoint
       REAL(dp), DIMENSION(3)                             :: displacement
       REAL(dp), DIMENSION(3, 2)                          :: gradient_adjoint
 
+      ALLOCATE (adjoint(harmonics%max_s_harm, grid_atom%nr, 5, nspins))
+      adjoint = 0.0_dp
 !$OMP PARALLEL DEFAULT(NONE) &
-!$OMP PRIVATE(density_adjoint, displacement, gradient_adjoint, icand, ithread, kin_adjoint, &
-!$OMP         nthread, row, row_done, vtau_h_local, vtau_s_local, vxc_h_local, vxc_s_local, &
-!$OMP         vxg_h_local, vxg_s_local) &
-!$OMP SHARED(candidates, cutoff, density_grad, grad_grad, grid_atom, harmonics, kin_grad, lsd, &
-!$OMP        nspins, use_density, use_gradient, use_tau, vtau_h, vtau_s, vxc_h, vxc_s, vxg_h, &
-!$OMP        vxg_s)
+!$OMP PRIVATE(adjoint_local, density_adjoint, displacement, gradient_adjoint, icand, ithread, &
+!$OMP         kin_adjoint, nthread, row, row_done) &
+!$OMP SHARED(adjoint, candidates, cutoff, density_grad, grad_grad, grid_atom, harmonics, &
+!$OMP        kin_grad, lsd, nspins, use_density, use_gradient, use_tau)
       nthread = 1
 !$    nthread = omp_get_num_threads()
-      ALLOCATE (vxc_h_local, MOLD=vxc_h)
-      ALLOCATE (vxc_s_local, MOLD=vxc_s)
-      ALLOCATE (vxg_h_local, MOLD=vxg_h)
-      ALLOCATE (vxg_s_local, MOLD=vxg_s)
-      ALLOCATE (vtau_h_local, MOLD=vtau_h)
-      ALLOCATE (vtau_s_local, MOLD=vtau_s)
-      vxc_h_local = 0.0_dp
-      vxc_s_local = 0.0_dp
-      vxg_h_local = 0.0_dp
-      vxg_s_local = 0.0_dp
-      vtau_h_local = 0.0_dp
-      vtau_s_local = 0.0_dp
+      ALLOCATE (adjoint_local, MOLD=adjoint)
+      adjoint_local = 0.0_dp
       row_done = 0
 !$OMP DO SCHEDULE(STATIC)
       DO icand = 1, SIZE(candidates%row)
@@ -4132,26 +4154,22 @@ CONTAINS
                                              density_adjoint, gradient_adjoint, kin_adjoint)
             row_done = row
          END IF
-         CALL add_gapw_atom_grid_interpolation_adjoint( &
-            grid_atom, harmonics, displacement, cutoff, nspins, density_adjoint, &
-            gradient_adjoint, kin_adjoint, vxc_h_local, vxc_s_local, vxg_h_local, vxg_s_local, &
-            vtau_h_local, vtau_s_local)
+         CALL add_projected_adjoint(grid_atom, harmonics, displacement, cutoff, nspins, &
+                                    density_adjoint, gradient_adjoint, kin_adjoint, adjoint_local)
       END DO
 !$OMP END DO
 !$OMP DO ORDERED SCHEDULE(STATIC, 1)
       DO ithread = 1, nthread
 !$OMP ORDERED
-         vxc_h = vxc_h + vxc_h_local
-         vxc_s = vxc_s + vxc_s_local
-         vxg_h = vxg_h + vxg_h_local
-         vxg_s = vxg_s + vxg_s_local
-         vtau_h = vtau_h + vtau_h_local
-         vtau_s = vtau_s + vtau_s_local
+         adjoint = adjoint + adjoint_local
 !$OMP END ORDERED
       END DO
 !$OMP END DO
-      DEALLOCATE (vxc_h_local, vxc_s_local, vxg_h_local, vxg_s_local, vtau_h_local, vtau_s_local)
+      DEALLOCATE (adjoint_local)
 !$OMP END PARALLEL
+      CALL add_projected_potentials(grid_atom, harmonics, nspins, adjoint, vxc_h, vxc_s, &
+                                    vxg_h, vxg_s, vtau_h, vtau_s)
+      DEALLOCATE (adjoint)
    END SUBROUTINE add_cross_atom_adjoint
 
 ! **************************************************************************************************
@@ -4236,10 +4254,9 @@ CONTAINS
          END IF
          target_atom = grid_atom_of_row(row)
          image_translation = MATMUL(cell%hmat, REAL(candidates%shift(:, icand), dp))
-         CALL interpolate_gapw_atom_grid_fields( &
-            grid_atom, harmonics, displacement, cutoff, nspins, fields%rho_h, fields%rho_s, &
-            fields%drho_h, fields%drho_s, fields%tau_h, fields%tau_s, cross_density, cross_grad, &
-            cross_kin, cross_density_spatial, cross_grad_spatial, cross_kin_spatial)
+         CALL interpolate_projected_fields( &
+            grid_atom, harmonics, displacement, cutoff, nspins, fields%projection, cross_density, &
+            cross_grad, cross_kin, cross_density_spatial, cross_grad_spatial, cross_kin_spatial)
          cross_spatial_derivative = 0.0_dp
          DO ispin = 1, nspins
             DO idir = 1, 3
@@ -4361,6 +4378,12 @@ CONTAINS
                                            grid_atom, fields(iatom)%rho_h, fields(iatom)%rho_s, &
                                            fields(iatom)%drho_h, fields(iatom)%drho_s, &
                                            fields(iatom)%tau_h, fields(iatom)%tau_s)
+            IF (fields(iatom)%support_radius <= 0.0_dp) CYCLE
+            ALLOCATE (fields(iatom)%projection(harmonics%max_s_harm, nr, 5, nspins))
+            CALL project_atom_grid_fields(grid_atom, harmonics, nspins, fields(iatom)%rho_h, &
+                                          fields(iatom)%rho_s, fields(iatom)%drho_h, &
+                                          fields(iatom)%drho_s, fields(iatom)%tau_h, &
+                                          fields(iatom)%tau_s, fields(iatom)%projection)
          END DO
          CALL release_tau_basis_cache(tau_basis_cache)
       END DO
@@ -4383,6 +4406,7 @@ CONTAINS
          IF (ASSOCIATED(fields(iatom)%drho_s)) DEALLOCATE (fields(iatom)%drho_s)
          IF (ASSOCIATED(fields(iatom)%tau_h)) DEALLOCATE (fields(iatom)%tau_h)
          IF (ASSOCIATED(fields(iatom)%tau_s)) DEALLOCATE (fields(iatom)%tau_s)
+         IF (ASSOCIATED(fields(iatom)%projection)) DEALLOCATE (fields(iatom)%projection)
          fields(iatom)%support_radius = 0.0_dp
       END DO
    END SUBROUTINE release_one_center_fields
