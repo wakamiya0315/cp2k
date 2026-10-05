@@ -1025,8 +1025,11 @@ CONTAINS
          ! Orient the octahedral symmetry of all atomic grids (QS%LEBEDEV_GRID_ROTATION). Grids,
          ! harmonics and the native-grid composite points below are all built from these directions.
          DO ilg = 1, SIZE(lebedev_grid)
-            IF (ASSOCIATED(lebedev_grid(ilg)%r)) &
+            IF (ASSOCIATED(lebedev_grid(ilg)%r)) THEN
                lebedev_grid(ilg)%r(:, :) = MATMUL(gapw_control%lebedev_rotation, lebedev_grid(ilg)%r)
+               ! rounding can push a direction cosine past 1 (Legendre functions, ACOS)
+               lebedev_grid(ilg)%r(:, :) = MAX(-1.0_dp, MIN(1.0_dp, lebedev_grid(ilg)%r(:, :)))
+            END IF
          END DO
       END IF
       quadrature = gapw_control%quadrature
