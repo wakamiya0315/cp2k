@@ -316,6 +316,9 @@ CONTAINS
       REAL(dp)                                           :: diag_kin, diag_rho, diag_w, diag_xkin, &
                                                             diag_xkin_max, diag_xrho
       TYPE(grid_atom_type), POINTER                      :: diag_grid
+      CHARACTER(LEN=512)                                 :: diag_path
+      INTEGER                                            :: diag_unit
+      INTEGER, SAVE                                      :: diag_dump_count = 0
       INTEGER :: adjoint_handle, adjoint_threads, composite_row_rank, nlcc_entry, nlcc_first, &
                  nlcc_last, num_pe, section_handle, source_atom, target_atom, xc_deriv_method_id, &
                  xc_rho_smooth_id, zatom
@@ -1479,6 +1482,22 @@ CONTAINS
             composite_grad(:, :, :) = composite_grad(:, :, :) + composite_cross_grad(:, :, :)
             composite_kin(:, :) = composite_kin(:, :) + composite_cross_kin(:, :)
             DEALLOCATE (composite_cross_density, composite_cross_grad, composite_cross_kin)
+            ! Stage 10 diagnostics: the model inputs of this evaluation as a raw stream (Fortran
+            ! order), file <SKALA2PW_DIAG_DUMP>.<n> for the n-th evaluation of the run.
+            CALL GET_ENVIRONMENT_VARIABLE("SKALA2PW_DIAG_DUMP", diag_path, diag_length)
+            IF (diag_length > 0) THEN
+               diag_dump_count = diag_dump_count + 1
+               WRITE (diag_value, "(I0)") diag_dump_count
+               OPEN (NEWUNIT=diag_unit, FILE=TRIM(diag_path)//"."//TRIM(diag_value), &
+                     ACCESS="STREAM", FORM="UNFORMATTED", STATUS="REPLACE")
+               WRITE (diag_unit) INT(SIZE(composite_density, 1), int_8), &
+                  INT(composite_local_natom, int_8), INT(SIZE(composite_smooth_kin_cache, 1), int_8)
+               WRITE (diag_unit) composite_grid_coords, composite_grid_weights, &
+                  composite_atomic_grid_weights, composite_density, composite_grad, composite_kin, &
+                  composite_smooth_density_cache, composite_smooth_kin_cache, &
+                  composite_local_grid_sizes, composite_local_atom_coords
+               CLOSE (diag_unit)
+            END IF
 
             CPASSERT(ALL(composite_grid_weights >= 0.0_dp))
             atom_composite_nelec = SUM(composite_grid_weights* &
