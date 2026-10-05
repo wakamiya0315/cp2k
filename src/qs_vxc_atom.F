@@ -309,6 +309,13 @@ CONTAINS
          composite_nflat, composite_pw_nflat, composite_row, &
          gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
          ikind, ir, ispin, iw, jdir, myfun, na, natom, nr, nspins
+      ! stage 10 diagnostics, switched on by SKALA2PW_DIAG_* environment variables
+      CHARACTER(LEN=64)                                  :: diag_value
+      INTEGER                                            :: diag_atom, diag_ir, diag_length, &
+                                                            diag_na, diag_nr, diag_row0
+      REAL(dp)                                           :: diag_kin, diag_rho, diag_w, diag_xkin, &
+                                                            diag_xkin_max, diag_xrho
+      TYPE(grid_atom_type), POINTER                      :: diag_grid
       INTEGER :: adjoint_handle, adjoint_threads, composite_row_rank, nlcc_entry, nlcc_first, &
                  nlcc_last, num_pe, section_handle, source_atom, target_atom, xc_deriv_method_id, &
                  xc_rho_smooth_id, zatom
@@ -1432,6 +1439,42 @@ CONTAINS
                END IF
                CALL timestop(section_handle)
             END IF
+            ! Stage 10 diagnostics (environment variables, not for production): per-shell sums
+            ! over the first local atom with the descriptor (atomic) weights, spin channel 1, and
+            ! switches that drop the cross-atom hard-minus-soft fields.
+            CALL GET_ENVIRONMENT_VARIABLE("SKALA2PW_DIAG_SHELLS", diag_value, diag_length)
+            IF (diag_length > 0 .AND. composite_local_natom > 0) THEN
+               iw = cp_logger_get_default_io_unit()
+               diag_atom = composite_local_atoms(1)
+               NULLIFY (diag_grid)
+               CALL get_qs_kind(my_kind_set(composite_atom_kind(diag_atom)), grid_atom=diag_grid)
+               diag_nr = diag_grid%nr
+               diag_na = diag_grid%ng_sphere
+               DO diag_ir = 1, diag_nr
+                  diag_row0 = composite_atom_start(diag_atom) + (diag_ir - 1)*diag_na
+                  diag_w = SUM(composite_atomic_grid_weights(diag_row0:diag_row0 + diag_na - 1))
+                  diag_rho = SUM(composite_atomic_grid_weights(diag_row0:diag_row0 + diag_na - 1)* &
+                                 composite_density(diag_row0:diag_row0 + diag_na - 1, 1))
+                  diag_xrho = SUM(composite_atomic_grid_weights(diag_row0:diag_row0 + diag_na - 1)* &
+                                  composite_cross_density(diag_row0:diag_row0 + diag_na - 1, 1))
+                  diag_kin = SUM(composite_atomic_grid_weights(diag_row0:diag_row0 + diag_na - 1)* &
+                                 composite_kin(diag_row0:diag_row0 + diag_na - 1, 1))
+                  diag_xkin = SUM(composite_atomic_grid_weights(diag_row0:diag_row0 + diag_na - 1)* &
+                                  composite_cross_kin(diag_row0:diag_row0 + diag_na - 1, 1))
+                  diag_xkin_max = MAXVAL(ABS(composite_cross_kin(diag_row0:diag_row0 + diag_na - 1, 1)))
+                  IF (iw > 0) WRITE (UNIT=iw, FMT="(T2,A,I5,7(1X,ES13.5))") "SKALA2PW_DIAG| shell", &
+                     diag_ir, diag_grid%rad(diag_ir), diag_w, diag_rho, diag_xrho, diag_kin, &
+                     diag_xkin, diag_xkin_max
+               END DO
+            END IF
+            CALL GET_ENVIRONMENT_VARIABLE("SKALA2PW_DIAG_NO_CROSS", diag_value, diag_length)
+            IF (diag_length > 0) THEN
+               composite_cross_density = 0.0_dp
+               composite_cross_grad = 0.0_dp
+               composite_cross_kin = 0.0_dp
+            END IF
+            CALL GET_ENVIRONMENT_VARIABLE("SKALA2PW_DIAG_NO_CROSS_TAU", diag_value, diag_length)
+            IF (diag_length > 0) composite_cross_kin = 0.0_dp
             composite_density(:, :) = composite_density(:, :) + composite_cross_density(:, :)
             composite_grad(:, :, :) = composite_grad(:, :, :) + composite_cross_grad(:, :, :)
             composite_kin(:, :) = composite_kin(:, :) + composite_cross_kin(:, :)
