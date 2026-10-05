@@ -118,6 +118,7 @@ MODULE qs_density_mixing_types
       ! P_out - P_in of the previous step for every spin and image, and NBUFFER normalized
       ! differences of both (with two spins: of the total density matrix only)
       LOGICAL                                           :: dm_pulay = .FALSE.
+      LOGICAL                                           :: dm_pulay_mag = .FALSE.
       INTEGER                                           :: dm_pulay_ncall = 0
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: dm_pulay_p_last => NULL(), &
                                                            dm_pulay_res_last => NULL()
@@ -221,6 +222,8 @@ CONTAINS
       CALL section_vals_val_get(mixing_section, "GMIX_P", l_val=mixing_store%gmix_p)
       CALL section_vals_val_get(mixing_section, "PULAY_P", l_val=mixing_store%dm_pulay)
       mixing_store%dm_pulay = mixing_store%dm_pulay .AND. mixing_method == direct_mixing_nr
+      CALL section_vals_val_get(mixing_section, "PULAY_P_MAG", l_val=mixing_store%dm_pulay_mag)
+      mixing_store%dm_pulay_mag = mixing_store%dm_pulay_mag .AND. mixing_store%dm_pulay
       mixing_store%dm_pulay_ncall = 0
       IF (mixing_store%dm_pulay) THEN
          CALL section_vals_val_get(mixing_section, "BROY_W0", r_val=mixing_store%broy_w0)
@@ -889,6 +892,18 @@ CONTAINS
                           lone_keyword_l_val=.TRUE., &
                           default_l_val=.FALSE., &
                           usage="PULAY_P")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_MAG", &
+                          description="With PULAY_P and two spins: mix the spin density matrix "// &
+                          "P_a - P_b with Pulay's method as well, with its own history of NBUFFER "// &
+                          "steps, its own coefficients and ALPHA_MAG as the initial step. The total "// &
+                          "density matrix is mixed as without the keyword. For magnetizations that "// &
+                          "converge along a slow mode with linear mixing.", &
+                          repeats=.FALSE., &
+                          lone_keyword_l_val=.TRUE., &
+                          default_l_val=.FALSE., &
+                          usage="PULAY_P_MAG")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

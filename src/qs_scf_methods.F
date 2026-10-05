@@ -378,15 +378,18 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'dm_pulay_mixing_spin'
 
-      INTEGER                                            :: handle, ib, ic, ispin, jb, kb, nb, &
-                                                            nbuffer, nimg
-      REAL(KIND=dp)                                      :: alpha, alpha_mag, inv_err, norm
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, g
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a, b
+      INTEGER                                            :: handle, ib, ic, ich, ispin, jb, kb, nb, &
+                                                            nbm, nbuffer, nch, nimg
+      REAL(KIND=dp)                                      :: alpha, alpha_mag, inv_err, norm, norm_mag
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, cm, g, gm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a, am, b, bm
 
       CALL timeset(routineN, handle)
 
       CPASSERT(SIZE(p_mix_new, 1) == 2)
+      ! history channels: 1 the total density matrix, 2 the spin density matrix (PULAY_P_MAG)
+      nch = MERGE(2, 1, mixing_store%dm_pulay_mag)
+      nbm = 0
       nimg = SIZE(p_mix_new, 2)
       nbuffer = MAX(mixing_store%nbuffer, 1)
       alpha = mixing_store%alpha
@@ -432,7 +435,8 @@ CONTAINS
          CALL dm_pulay_storage_release(mixing_store)
          mixing_store%dm_pulay_ncall = 1
          ALLOCATE (mixing_store%dm_pulay_p_last(2, nimg), mixing_store%dm_pulay_res_last(2, nimg))
-         ALLOCATE (mixing_store%dm_pulay_dp(nbuffer, 1, nimg), mixing_store%dm_pulay_dres(nbuffer, 1, nimg))
+         ALLOCATE (mixing_store%dm_pulay_dp(nbuffer, nch, nimg), &
+                   mixing_store%dm_pulay_dres(nbuffer, nch, nimg))
          DO ic = 1, nimg
             DO ispin = 1, 2
                ALLOCATE (mixing_store%dm_pulay_p_last(ispin, ic)%matrix, &
@@ -442,12 +446,15 @@ CONTAINS
                CALL dbcsr_create(mixing_store%dm_pulay_res_last(ispin, ic)%matrix, &
                                  template=rho_ao(ispin, ic)%matrix, name="PULAY_P RESIDUAL")
             END DO
-            DO ib = 1, nbuffer
-               ALLOCATE (mixing_store%dm_pulay_dp(ib, 1, ic)%matrix, mixing_store%dm_pulay_dres(ib, 1, ic)%matrix)
-               CALL dbcsr_create(mixing_store%dm_pulay_dp(ib, 1, ic)%matrix, &
-                                 template=rho_ao(1, ic)%matrix, name="PULAY_P DP")
-               CALL dbcsr_create(mixing_store%dm_pulay_dres(ib, 1, ic)%matrix, &
-                                 template=rho_ao(1, ic)%matrix, name="PULAY_P DRES")
+            DO ich = 1, nch
+               DO ib = 1, nbuffer
+                  ALLOCATE (mixing_store%dm_pulay_dp(ib, ich, ic)%matrix, &
+                            mixing_store%dm_pulay_dres(ib, ich, ic)%matrix)
+                  CALL dbcsr_create(mixing_store%dm_pulay_dp(ib, ich, ic)%matrix, &
+                                    template=rho_ao(1, ic)%matrix, name="PULAY_P DP")
+                  CALL dbcsr_create(mixing_store%dm_pulay_dres(ib, ich, ic)%matrix, &
+                                    template=rho_ao(1, ic)%matrix, name="PULAY_P DRES")
+               END DO
             END DO
          END DO
          nb = 0
@@ -478,6 +485,34 @@ CONTAINS
             END DO
          ELSE
             nb = 0
+         END IF
+         IF (nch == 2) THEN
+            ! the same for the spin density matrix and its residual, divided by their own |dR|
+            nbm = MIN(mixing_store%dm_pulay_ncall - 1, nbuffer)
+            norm_mag = 0.0_dp
+            DO ic = 1, nimg
+               ASSOCIATE (dres => mixing_store%dm_pulay_dres(ib, 2, ic)%matrix, &
+                          dpin => mixing_store%dm_pulay_dp(ib, 2, ic)%matrix)
+                  CALL dbcsr_copy(dres, p_mix_new(1, ic)%matrix)
+                  CALL dbcsr_add(dres, p_mix_new(2, ic)%matrix, 1.0_dp, -1.0_dp)
+                  CALL dbcsr_add(dres, mixing_store%dm_pulay_res_last(1, ic)%matrix, 1.0_dp, -1.0_dp)
+                  CALL dbcsr_add(dres, mixing_store%dm_pulay_res_last(2, ic)%matrix, 1.0_dp, 1.0_dp)
+                  CALL dbcsr_copy(dpin, rho_ao(1, ic)%matrix)
+                  CALL dbcsr_add(dpin, rho_ao(2, ic)%matrix, 1.0_dp, -1.0_dp)
+                  CALL dbcsr_add(dpin, mixing_store%dm_pulay_p_last(1, ic)%matrix, 1.0_dp, -1.0_dp)
+                  CALL dbcsr_add(dpin, mixing_store%dm_pulay_p_last(2, ic)%matrix, 1.0_dp, 1.0_dp)
+                  norm_mag = norm_mag + frobenius_dot(dres, dres)
+               END ASSOCIATE
+            END DO
+            norm_mag = SQRT(norm_mag)
+            IF (norm_mag > 0.0_dp) THEN
+               DO ic = 1, nimg
+                  CALL dbcsr_scale(mixing_store%dm_pulay_dres(ib, 2, ic)%matrix, 1.0_dp/norm_mag)
+                  CALL dbcsr_scale(mixing_store%dm_pulay_dp(ib, 2, ic)%matrix, 1.0_dp/norm_mag)
+               END DO
+            ELSE
+               nbm = 0
+            END IF
          END IF
       END IF
 
@@ -515,7 +550,31 @@ CONTAINS
          g = MATMUL(b, c)
       END IF
 
-      ! steps of the total (Pulay) and spin (linear) density matrices, then back to spins
+      ! Pulay coefficients of the spin density matrix from its own history (PULAY_P_MAG)
+      IF (nbm > 0) THEN
+         ALLOCATE (am(nbm, nbm), bm(nbm, nbm), cm(nbm), gm(nbm))
+         am = 0.0_dp
+         cm = 0.0_dp
+         DO jb = 1, nbm
+            DO kb = jb, nbm
+               DO ic = 1, nimg
+                  am(jb, kb) = am(jb, kb) + frobenius_dot(mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
+                                                          mixing_store%dm_pulay_dres(kb, 2, ic)%matrix)
+               END DO
+               am(kb, jb) = am(jb, kb)
+            END DO
+            am(jb, jb) = am(jb, jb) + mixing_store%broy_w0
+            DO ic = 1, nimg
+               cm(jb) = cm(jb) + frobenius_dot(mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
+                                               p_mix_new(2, ic)%matrix)
+            END DO
+         END DO
+         CALL invert_matrix(am, bm, inv_err)
+         gm = MATMUL(bm, cm)
+      END IF
+
+      ! steps of the total (Pulay) and spin (linear, or Pulay with PULAY_P_MAG) density matrices,
+      ! then back to spins
       DO ic = 1, nimg
          CALL dbcsr_scale(p_mix_new(1, ic)%matrix, alpha)
          DO jb = 1, nb
@@ -524,6 +583,11 @@ CONTAINS
                            1.0_dp, -alpha*g(jb))
          END DO
          CALL dbcsr_scale(p_mix_new(2, ic)%matrix, alpha_mag)
+         DO jb = 1, nbm
+            CALL dbcsr_add(p_mix_new(2, ic)%matrix, mixing_store%dm_pulay_dp(jb, 2, ic)%matrix, 1.0_dp, -gm(jb))
+            CALL dbcsr_add(p_mix_new(2, ic)%matrix, mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
+                           1.0_dp, -alpha_mag*gm(jb))
+         END DO
          CALL dbcsr_add(p_mix_new(1, ic)%matrix, p_mix_new(2, ic)%matrix, 0.5_dp, 0.5_dp)
          CALL dbcsr_add(p_mix_new(2, ic)%matrix, p_mix_new(1, ic)%matrix, -1.0_dp, 1.0_dp)
          DO ispin = 1, 2
@@ -532,6 +596,7 @@ CONTAINS
       END DO
 
       IF (nb > 0) DEALLOCATE (a, b, c, g)
+      IF (nbm > 0) DEALLOCATE (am, bm, cm, gm)
 
       CALL timestop(handle)
 
