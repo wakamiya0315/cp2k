@@ -44,6 +44,7 @@ MODULE qs_scf_methods
                                               cp_fm_release,&
                                               cp_fm_to_fm,&
                                               cp_fm_type
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
    USE input_constants,                 ONLY: cholesky_inverse,&
                                               cholesky_off,&
                                               cholesky_reduce,&
@@ -352,10 +353,11 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Pulay mixing (MIXING%PULAY_P) of spin-polarized density matrices: Pulay's method for the
 !>        total density matrix P_a + P_b, linear mixing with ALPHA_MAG for the spin density matrix
-!>        P_a - P_b
+!>        P_a - P_b; with PULAY_P_JOINT one Pulay history for both
 !> \param p_mix_new    on entry P_out of both spins, on exit the input of the next step
 !> \param mixing_store history: P_in and the residual of both spins in the previous step, and
 !>                     NBUFFER normalized differences of the total density matrix and its residual
+!>                     (with PULAY_P_JOINT also of the spin density matrix and its residual)
 !> \param rho_ao       input density matrices P_in of the present step
 !> \param iter_delta   largest element of |P_out - P_in| over both spins and all images
 !> \param full_step    take P_out unmixed (NSKIP) and restart the history
@@ -368,6 +370,16 @@ CONTAINS
 !>      magnetic response is unstable (Stoner), while the charge, whose long-range response limits
 !>      the step, keeps the acceleration. G-space mixing in CP2K and VASP likewise treat charge and
 !>      magnetization as separate channels.
+!> \par PULAY_P_JOINT
+!>      Linear mixing converges along a soft longitudinal mode of the moment at 1 - ALPHA_MAG*lambda
+!>      per step, slowly for ferromagnetic metal slabs. VASP (BRMIX) and Quantum ESPRESSO (mix_rho)
+!>      extrapolate charge and magnetization with one set of coefficients but with their own
+!>      initial steps (VASP: AMIX_MAG = 4 AMIX) and weights. PULAY_P_JOINT keeps the differences of
+!>      both channels in one history, normalized together, and takes one set of coefficients from
+!>      the metric <x, y> = <x_tot, y_tot> + PULAY_P_MAG_WEIGHT <x_mag, y_mag> (Frobenius over all
+!>      images); ALPHA and ALPHA_MAG remain the initial steps of the two channels. With
+!>      PULAY_P_JOINT_START > 0 the step is the one without the keyword until the largest change
+!>      falls below that value, so that the joint extrapolation starts near the magnetic solution.
 ! **************************************************************************************************
    SUBROUTINE dm_pulay_mixing_spin(p_mix_new, mixing_store, rho_ao, iter_delta, full_step, invert)
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: p_mix_new
@@ -378,10 +390,12 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'dm_pulay_mixing_spin'
 
-      INTEGER                                            :: handle, ib, ic, ispin, jb, kb, nb, &
-                                                            nbuffer, nimg
-      REAL(KIND=dp)                                      :: alpha, alpha_mag, inv_err, norm
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, g
+      INTEGER                                            :: handle, ib, ic, ich, ispin, iw, jb, kb, &
+                                                            nb, nbuffer, nch, nimg
+      LOGICAL                                            :: joint_step
+      REAL(KIND=dp)                                      :: alpha, alpha_mag, inv_err, norm, sgn, &
+                                                            weight
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, g, t
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a, b
 
       CALL timeset(routineN, handle)
@@ -391,6 +405,9 @@ CONTAINS
       nbuffer = MAX(mixing_store%nbuffer, 1)
       alpha = mixing_store%alpha
       alpha_mag = mixing_store%alpha_mag
+      ! history channels: 1 the total density matrix, 2 the spin density matrix (PULAY_P_JOINT)
+      nch = MERGE(2, 1, mixing_store%dm_pulay_joint)
+      weight = mixing_store%dm_pulay_mag_weight
       iter_delta = 0.0_dp
 
       IF (invert) THEN
@@ -428,11 +445,12 @@ CONTAINS
 
       mixing_store%dm_pulay_ncall = mixing_store%dm_pulay_ncall + 1
       IF (mixing_store%dm_pulay_ncall == 1) THEN
-         ! per spin: last input and residual; for the total density matrix: the differences
+         ! per spin: last input and residual; per channel: the differences
          CALL dm_pulay_storage_release(mixing_store)
          mixing_store%dm_pulay_ncall = 1
+         mixing_store%dm_pulay_joint_active = .FALSE.
          ALLOCATE (mixing_store%dm_pulay_p_last(2, nimg), mixing_store%dm_pulay_res_last(2, nimg))
-         ALLOCATE (mixing_store%dm_pulay_dp(nbuffer, 1, nimg), mixing_store%dm_pulay_dres(nbuffer, 1, nimg))
+         ALLOCATE (mixing_store%dm_pulay_dp(nbuffer, nch, nimg), mixing_store%dm_pulay_dres(nbuffer, nch, nimg))
          DO ic = 1, nimg
             DO ispin = 1, 2
                ALLOCATE (mixing_store%dm_pulay_p_last(ispin, ic)%matrix, &
@@ -442,44 +460,70 @@ CONTAINS
                CALL dbcsr_create(mixing_store%dm_pulay_res_last(ispin, ic)%matrix, &
                                  template=rho_ao(ispin, ic)%matrix, name="PULAY_P RESIDUAL")
             END DO
-            DO ib = 1, nbuffer
-               ALLOCATE (mixing_store%dm_pulay_dp(ib, 1, ic)%matrix, mixing_store%dm_pulay_dres(ib, 1, ic)%matrix)
-               CALL dbcsr_create(mixing_store%dm_pulay_dp(ib, 1, ic)%matrix, &
-                                 template=rho_ao(1, ic)%matrix, name="PULAY_P DP")
-               CALL dbcsr_create(mixing_store%dm_pulay_dres(ib, 1, ic)%matrix, &
-                                 template=rho_ao(1, ic)%matrix, name="PULAY_P DRES")
+            DO ich = 1, nch
+               DO ib = 1, nbuffer
+                  ALLOCATE (mixing_store%dm_pulay_dp(ib, ich, ic)%matrix, &
+                            mixing_store%dm_pulay_dres(ib, ich, ic)%matrix)
+                  CALL dbcsr_create(mixing_store%dm_pulay_dp(ib, ich, ic)%matrix, &
+                                    template=rho_ao(1, ic)%matrix, name="PULAY_P DP")
+                  CALL dbcsr_create(mixing_store%dm_pulay_dres(ib, ich, ic)%matrix, &
+                                    template=rho_ao(1, ic)%matrix, name="PULAY_P DRES")
+               END DO
             END DO
          END DO
          nb = 0
       ELSE
-         ! differences of the total density matrix and its residual, divided by |dR|
+         ! differences of the total density matrix and its residual (and with PULAY_P_JOINT of the
+         ! spin density matrix and its residual), divided by the norm of the residual differences
          nb = MIN(mixing_store%dm_pulay_ncall - 1, nbuffer)
          ib = MODULO(mixing_store%dm_pulay_ncall - 2, nbuffer) + 1
          norm = 0.0_dp
          DO ic = 1, nimg
-            ASSOCIATE (dres => mixing_store%dm_pulay_dres(ib, 1, ic)%matrix, &
-                       dpin => mixing_store%dm_pulay_dp(ib, 1, ic)%matrix)
-               CALL dbcsr_copy(dres, p_mix_new(1, ic)%matrix)
-               CALL dbcsr_add(dres, p_mix_new(2, ic)%matrix, 1.0_dp, 1.0_dp)
-               CALL dbcsr_add(dres, mixing_store%dm_pulay_res_last(1, ic)%matrix, 1.0_dp, -1.0_dp)
-               CALL dbcsr_add(dres, mixing_store%dm_pulay_res_last(2, ic)%matrix, 1.0_dp, -1.0_dp)
-               CALL dbcsr_copy(dpin, rho_ao(1, ic)%matrix)
-               CALL dbcsr_add(dpin, rho_ao(2, ic)%matrix, 1.0_dp, 1.0_dp)
-               CALL dbcsr_add(dpin, mixing_store%dm_pulay_p_last(1, ic)%matrix, 1.0_dp, -1.0_dp)
-               CALL dbcsr_add(dpin, mixing_store%dm_pulay_p_last(2, ic)%matrix, 1.0_dp, -1.0_dp)
-               norm = norm + frobenius_dot(dres, dres)
-            END ASSOCIATE
+            DO ich = 1, nch
+               sgn = MERGE(1.0_dp, -1.0_dp, ich == 1)
+               ASSOCIATE (dres => mixing_store%dm_pulay_dres(ib, ich, ic)%matrix, &
+                          dpin => mixing_store%dm_pulay_dp(ib, ich, ic)%matrix)
+                  CALL dbcsr_copy(dres, p_mix_new(1, ic)%matrix)
+                  CALL dbcsr_add(dres, p_mix_new(2, ic)%matrix, 1.0_dp, sgn)
+                  CALL dbcsr_add(dres, mixing_store%dm_pulay_res_last(1, ic)%matrix, 1.0_dp, -1.0_dp)
+                  CALL dbcsr_add(dres, mixing_store%dm_pulay_res_last(2, ic)%matrix, 1.0_dp, -sgn)
+                  CALL dbcsr_copy(dpin, rho_ao(1, ic)%matrix)
+                  CALL dbcsr_add(dpin, rho_ao(2, ic)%matrix, 1.0_dp, sgn)
+                  CALL dbcsr_add(dpin, mixing_store%dm_pulay_p_last(1, ic)%matrix, 1.0_dp, -1.0_dp)
+                  CALL dbcsr_add(dpin, mixing_store%dm_pulay_p_last(2, ic)%matrix, 1.0_dp, -sgn)
+                  IF (ich == 1) THEN
+                     norm = norm + frobenius_dot(dres, dres)
+                  ELSE
+                     norm = norm + weight*frobenius_dot(dres, dres)
+                  END IF
+               END ASSOCIATE
+            END DO
          END DO
          norm = SQRT(norm)
          IF (norm > 0.0_dp) THEN
             DO ic = 1, nimg
-               CALL dbcsr_scale(mixing_store%dm_pulay_dres(ib, 1, ic)%matrix, 1.0_dp/norm)
-               CALL dbcsr_scale(mixing_store%dm_pulay_dp(ib, 1, ic)%matrix, 1.0_dp/norm)
+               DO ich = 1, nch
+                  CALL dbcsr_scale(mixing_store%dm_pulay_dres(ib, ich, ic)%matrix, 1.0_dp/norm)
+                  CALL dbcsr_scale(mixing_store%dm_pulay_dp(ib, ich, ic)%matrix, 1.0_dp/norm)
+               END DO
             END DO
          ELSE
             nb = 0
          END IF
       END IF
+
+      ! joint coefficients from the first step, or once the change has fallen below
+      ! PULAY_P_JOINT_START; the history of both channels is kept from the first step either way
+      IF (nch == 2 .AND. .NOT. mixing_store%dm_pulay_joint_active) THEN
+         IF (mixing_store%dm_pulay_joint_start <= 0.0_dp .OR. &
+             iter_delta < mixing_store%dm_pulay_joint_start) THEN
+            mixing_store%dm_pulay_joint_active = .TRUE.
+            iw = cp_logger_get_default_io_unit()
+            IF (iw > 0) WRITE (iw, '(T2,A,I6,A,ES10.3)') "PULAY_P_JOINT| joint coefficients from call", &
+               mixing_store%dm_pulay_ncall, ", change ", iter_delta
+         END IF
+      END IF
+      joint_step = nch == 2 .AND. mixing_store%dm_pulay_joint_active
 
       ! keep P_in and R of both spins, then turn p_mix_new into the residuals of the total density
       ! matrix (spin 1) and of the spin density matrix (spin 2)
@@ -492,9 +536,9 @@ CONTAINS
          CALL dbcsr_add(p_mix_new(2, ic)%matrix, p_mix_new(1, ic)%matrix, -2.0_dp, 1.0_dp)
       END DO
 
-      ! Pulay coefficients from the total density matrix
+      ! Pulay coefficients: from the total density matrix, or (joint) from both channels
       IF (nb > 0) THEN
-         ALLOCATE (a(nb, nb), b(nb, nb), c(nb), g(nb))
+         ALLOCATE (a(nb, nb), b(nb, nb), c(nb), g(nb), t(nb))
          a = 0.0_dp
          c = 0.0_dp
          DO jb = 1, nb
@@ -502,20 +546,41 @@ CONTAINS
                DO ic = 1, nimg
                   a(jb, kb) = a(jb, kb) + frobenius_dot(mixing_store%dm_pulay_dres(jb, 1, ic)%matrix, &
                                                         mixing_store%dm_pulay_dres(kb, 1, ic)%matrix)
+                  IF (joint_step) a(jb, kb) = a(jb, kb) + &
+                                              weight*frobenius_dot(mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
+                                                                   mixing_store%dm_pulay_dres(kb, 2, ic)%matrix)
                END DO
                a(kb, jb) = a(jb, kb)
             END DO
-            a(jb, jb) = a(jb, jb) + mixing_store%broy_w0
             DO ic = 1, nimg
                c(jb) = c(jb) + frobenius_dot(mixing_store%dm_pulay_dres(jb, 1, ic)%matrix, &
                                              p_mix_new(1, ic)%matrix)
+               IF (joint_step) c(jb) = c(jb) + weight*frobenius_dot(mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
+                                                                    p_mix_new(2, ic)%matrix)
             END DO
+         END DO
+         IF (nch == 2 .AND. .NOT. joint_step) THEN
+            ! the total channel alone, with differences normalized jointly: normalize them here
+            DO jb = 1, nb
+               t(jb) = SQRT(MAX(a(jb, jb), TINY(1.0_dp)))
+            END DO
+            DO jb = 1, nb
+               DO kb = 1, nb
+                  a(jb, kb) = a(jb, kb)/(t(jb)*t(kb))
+               END DO
+               c(jb) = c(jb)/t(jb)
+            END DO
+         END IF
+         DO jb = 1, nb
+            a(jb, jb) = a(jb, jb) + mixing_store%broy_w0
          END DO
          CALL invert_matrix(a, b, inv_err)
          g = MATMUL(b, c)
+         IF (nch == 2 .AND. .NOT. joint_step) g(:) = g(:)/t(:)
       END IF
 
-      ! steps of the total (Pulay) and spin (linear) density matrices, then back to spins
+      ! steps of the total (Pulay) and spin (linear, or Pulay with PULAY_P_JOINT) density matrices,
+      ! then back to spins
       DO ic = 1, nimg
          CALL dbcsr_scale(p_mix_new(1, ic)%matrix, alpha)
          DO jb = 1, nb
@@ -524,6 +589,13 @@ CONTAINS
                            1.0_dp, -alpha*g(jb))
          END DO
          CALL dbcsr_scale(p_mix_new(2, ic)%matrix, alpha_mag)
+         IF (joint_step) THEN
+            DO jb = 1, nb
+               CALL dbcsr_add(p_mix_new(2, ic)%matrix, mixing_store%dm_pulay_dp(jb, 2, ic)%matrix, 1.0_dp, -g(jb))
+               CALL dbcsr_add(p_mix_new(2, ic)%matrix, mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
+                              1.0_dp, -alpha_mag*g(jb))
+            END DO
+         END IF
          CALL dbcsr_add(p_mix_new(1, ic)%matrix, p_mix_new(2, ic)%matrix, 0.5_dp, 0.5_dp)
          CALL dbcsr_add(p_mix_new(2, ic)%matrix, p_mix_new(1, ic)%matrix, -1.0_dp, 1.0_dp)
          DO ispin = 1, 2
@@ -531,7 +603,7 @@ CONTAINS
          END DO
       END DO
 
-      IF (nb > 0) DEALLOCATE (a, b, c, g)
+      IF (nb > 0) DEALLOCATE (a, b, c, g, t)
 
       CALL timestop(handle)
 

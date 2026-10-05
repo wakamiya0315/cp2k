@@ -116,13 +116,18 @@ MODULE qs_density_mixing_types
       TYPE(cp_1d_z_p_type), DIMENSION(:, :, :), POINTER :: field_dbuf => NULL()
       ! Pulay (Anderson) acceleration of DIRECT_P_MIXING: the input density matrix and residual
       ! P_out - P_in of the previous step for every spin and image, and NBUFFER normalized
-      ! differences of both (with two spins: of the total density matrix only)
+      ! differences of both (with two spins: of the total density matrix, with PULAY_P_JOINT also of
+      ! the spin density matrix, which then shares the coefficients)
       LOGICAL                                           :: dm_pulay = .FALSE.
       INTEGER                                           :: dm_pulay_ncall = 0
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: dm_pulay_p_last => NULL(), &
                                                            dm_pulay_res_last => NULL()
       TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER   :: dm_pulay_dp => NULL(), &
                                                            dm_pulay_dres => NULL()
+      LOGICAL                                           :: dm_pulay_joint = .FALSE., &
+                                                           dm_pulay_joint_active = .FALSE.
+      REAL(KIND=dp)                                     :: dm_pulay_mag_weight = 1.0_dp, &
+                                                           dm_pulay_joint_start = 0.0_dp
 #if defined(__TBLITE)
       CLASS(mixer_type), ALLOCATABLE                    :: tb_scc_mixer
 #endif
@@ -224,7 +229,13 @@ CONTAINS
       mixing_store%dm_pulay_ncall = 0
       IF (mixing_store%dm_pulay) THEN
          CALL section_vals_val_get(mixing_section, "BROY_W0", r_val=mixing_store%broy_w0)
+         CALL section_vals_val_get(mixing_section, "PULAY_P_JOINT", l_val=mixing_store%dm_pulay_joint)
+         CALL section_vals_val_get(mixing_section, "PULAY_P_MAG_WEIGHT", &
+                                   r_val=mixing_store%dm_pulay_mag_weight)
+         CALL section_vals_val_get(mixing_section, "PULAY_P_JOINT_START", &
+                                   r_val=mixing_store%dm_pulay_joint_start)
       END IF
+      mixing_store%dm_pulay_joint_active = .FALSE.
       CALL section_vals_val_get(mixing_section, "XC_FIELDS", l_val=mixing_store%xc_fields)
       IF (mixing_store%xc_fields) THEN
          IF (mixing_method /= broyden_mixing_nr .AND. mixing_method /= gspace_mixing_nr) THEN
@@ -889,6 +900,47 @@ CONTAINS
                           lone_keyword_l_val=.TRUE., &
                           default_l_val=.FALSE., &
                           usage="PULAY_P")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_JOINT", &
+                          description="With PULAY_P and two spins: keep the differences of the total "// &
+                          "and of the spin density matrix in one history and take one set of Pulay "// &
+                          "coefficients for both, from the metric <x,y> = <x_tot,y_tot> + "// &
+                          "PULAY_P_MAG_WEIGHT <x_mag,y_mag> over all images; ALPHA and ALPHA_MAG stay "// &
+                          "the initial steps of the two channels. This is how VASP and Quantum "// &
+                          "ESPRESSO mix charge and magnetization, and it accelerates a slow mode of the "// &
+                          "moment that linear mixing of the spin density matrix converges slowly. "// &
+                          "Doubles the memory of the history. See PULAY_P_JOINT_START.", &
+                          repeats=.FALSE., &
+                          lone_keyword_l_val=.TRUE., &
+                          default_l_val=.FALSE., &
+                          usage="PULAY_P_JOINT")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_MAG_WEIGHT", &
+                          description="With PULAY_P_JOINT: weight of the spin density matrix in the "// &
+                          "metric of the Pulay equations (the total density matrix has weight 1).", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=real_t, &
+                          default_r_val=1.0_dp, &
+                          usage="PULAY_P_MAG_WEIGHT 0.25")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_JOINT_START", &
+                          description="With PULAY_P_JOINT: take the joint coefficients only once the "// &
+                          "largest change of the density matrices has fallen below this value (0: from "// &
+                          "the first step); until then the step is that of PULAY_P alone, while the "// &
+                          "history of both channels is kept. Starting the joint extrapolation near the "// &
+                          "magnetic solution keeps it from settling at an unstable non-magnetic one.", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=real_t, &
+                          default_r_val=0.0_dp, &
+                          usage="PULAY_P_JOINT_START 1.0E-2")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
