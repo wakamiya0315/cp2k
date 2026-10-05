@@ -115,8 +115,8 @@ MODULE qs_density_mixing_types
                                                            field_last_res => NULL()
       TYPE(cp_1d_z_p_type), DIMENSION(:, :, :), POINTER :: field_dbuf => NULL()
       ! Pulay (Anderson) acceleration of DIRECT_P_MIXING: the input density matrix and residual
-      ! P_out - P_in of the previous step, and NBUFFER normalized differences of both, for every
-      ! spin and image
+      ! P_out - P_in of the previous step for every spin and image, and NBUFFER normalized
+      ! differences of both (with two spins: of the total density matrix only)
       LOGICAL                                           :: dm_pulay = .FALSE.
       INTEGER                                           :: dm_pulay_ncall = 0
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: dm_pulay_p_last => NULL(), &
@@ -878,10 +878,13 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P", &
                           description="With DIRECT_P_MIXING: accelerate the mixing of the real-space "// &
                           "density matrices with Pulay's (Anderson's) method. The residual is "// &
-                          "P_out - P_in over all spins and periodic images, the history holds the "// &
-                          "last NBUFFER steps and BROY_W0 regularizes its normal equations. All "// &
-                          "densities (grid, kinetic energy density, GAPW one-centre terms) stay derived "// &
-                          "from one density matrix. The Kohn-Sham DIIS is switched off.", &
+                          "P_out - P_in over all periodic images, the history holds the last NBUFFER "// &
+                          "steps and BROY_W0 regularizes its normal equations. With two spins the total "// &
+                          "density matrix is mixed in this way and the spin density matrix linearly "// &
+                          "with ALPHA_MAG, which keeps the SCF away from unstable non-magnetic "// &
+                          "solutions. All densities (grid, kinetic energy density, GAPW one-centre "// &
+                          "terms) stay derived from one density matrix. The Kohn-Sham DIIS is "// &
+                          "switched off.", &
                           repeats=.FALSE., &
                           lone_keyword_l_val=.TRUE., &
                           default_l_val=.FALSE., &
