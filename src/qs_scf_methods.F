@@ -44,6 +44,7 @@ MODULE qs_scf_methods
                                               cp_fm_release,&
                                               cp_fm_to_fm,&
                                               cp_fm_type
+   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
    USE input_constants,                 ONLY: cholesky_inverse,&
                                               cholesky_off,&
                                               cholesky_reduce,&
@@ -381,6 +382,9 @@ CONTAINS
       INTEGER                                            :: handle, ib, ic, ich, ispin, jb, kb, nb, &
                                                             nbm, nbuffer, nch, nimg
       REAL(KIND=dp)                                      :: alpha, alpha_mag, inv_err, norm, norm_mag
+      CHARACTER(LEN=8)                                   :: diag_value
+      INTEGER                                            :: diag_status, iw
+      REAL(KIND=dp)                                      :: max_mag, max_tot, norm_r_mag, norm_r_tot
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, cm, g, gm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a, am, b, bm
 
@@ -526,6 +530,26 @@ CONTAINS
          CALL dbcsr_add(p_mix_new(1, ic)%matrix, p_mix_new(2, ic)%matrix, 1.0_dp, 1.0_dp)
          CALL dbcsr_add(p_mix_new(2, ic)%matrix, p_mix_new(1, ic)%matrix, -2.0_dp, 1.0_dp)
       END DO
+
+      ! stage 11 diagnostics (skala2pw/spin-mixing-diag, not for merging): with SKALA2PW_DIAG_MIX
+      ! set, the Frobenius norms (all images) and largest elements of the residuals of the total
+      ! and of the spin density matrix, the Pulay history lengths of both channels
+      CALL GET_ENVIRONMENT_VARIABLE("SKALA2PW_DIAG_MIX", diag_value, STATUS=diag_status)
+      IF (diag_status == 0 .OR. diag_status == -1) THEN
+         norm_r_tot = 0.0_dp
+         norm_r_mag = 0.0_dp
+         max_tot = 0.0_dp
+         max_mag = 0.0_dp
+         DO ic = 1, nimg
+            norm_r_tot = norm_r_tot + frobenius_dot(p_mix_new(1, ic)%matrix, p_mix_new(1, ic)%matrix)
+            norm_r_mag = norm_r_mag + frobenius_dot(p_mix_new(2, ic)%matrix, p_mix_new(2, ic)%matrix)
+            max_tot = MAX(max_tot, dbcsr_maxabs(p_mix_new(1, ic)%matrix))
+            max_mag = MAX(max_mag, dbcsr_maxabs(p_mix_new(2, ic)%matrix))
+         END DO
+         iw = cp_logger_get_default_io_unit()
+         IF (iw > 0) WRITE (iw, '(T2,A,I6,4ES13.5,2I4)') "PULAY_P_DIAG|", mixing_store%dm_pulay_ncall, &
+            SQRT(norm_r_tot), max_tot, SQRT(norm_r_mag), max_mag, nb, nbm
+      END IF
 
       ! Pulay coefficients from the total density matrix
       IF (nb > 0) THEN
