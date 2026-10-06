@@ -88,6 +88,8 @@ MODULE kpoint_methods
                                               mpools_get,&
                                               mpools_rebuild_fm_pools,&
                                               qs_matrix_pools_type
+   USE qs_mo_occupation,                ONLY: fixed_spin_targets,&
+                                              separate_smear_spins
    USE qs_mo_types,                     ONLY: allocate_mo_set,&
                                               get_mo_set,&
                                               init_mo_set,&
@@ -1550,7 +1552,8 @@ CONTAINS
       INTEGER, DIMENSION(2)                              :: kp_range
       LOGICAL                                            :: my_added_mos_auto_grow, &
                                                             my_separate_spin_occupations
-      REAL(KIND=dp)                                      :: kTS, kTS_spin(2), mu, mus(2), nel
+      REAL(KIND=dp)                                      :: kTS, kTS_spin(2), mu, mus(2), nel, &
+                                                            nel_spin(2)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: smatrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: weig, wocc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: icoeff, rcoeff
@@ -1569,7 +1572,7 @@ CONTAINS
       CALL get_kpoint_info(kpoint, nkp=nkp)
       kp => kpoint%kp_env(1)%kpoint_env
       nspin = SIZE(kp%mos, 2)
-      my_separate_spin_occupations = smear%fixed_mag_mom > 0.0_dp
+      my_separate_spin_occupations = separate_smear_spins(smear)
       IF (PRESENT(separate_spin_occupations)) THEN
          my_separate_spin_occupations = my_separate_spin_occupations .OR. separate_spin_occupations
       END IF
@@ -1579,6 +1582,7 @@ CONTAINS
       IF (nspin == 2) THEN
          CALL get_mo_set(kp%mos(1, 2), nmo=nb, nelectron=ne_b)
          CPASSERT(nmo == nb)
+         CALL fixed_spin_targets(smear, ne_a, ne_b, nel_spin)
       END IF
       ALLOCATE (weig(nmo, nkp, nspin), wocc(nmo, nkp, nspin))
       weig = 0.0_dp
@@ -1708,16 +1712,16 @@ CONTAINS
                                smear%electronic_temperature, 2.0_dp, smear_fermi_dirac)
                   kTS_spin(1) = kTS
                ELSE IF (my_separate_spin_occupations) THEN
-                  nel = REAL(ne_a, KIND=dp)
+                  nel = nel_spin(1)
                   CALL Smearkp(wocc(:, :, 1), mus(1), kTS, weig(:, :, 1), nel, wkp, &
                                smear%electronic_temperature, 1.0_dp, smear_fermi_dirac)
                   kTS_spin(1) = kTS
-                  nel = REAL(ne_b, KIND=dp)
+                  nel = nel_spin(2)
                   CALL Smearkp(wocc(:, :, 2), mus(2), kTS, weig(:, :, 2), nel, wkp, &
                                smear%electronic_temperature, 1.0_dp, smear_fermi_dirac)
                   kTS_spin(2) = kTS
                ELSE
-                  nel = REAL(ne_a, KIND=dp) + REAL(ne_b, KIND=dp)
+                  nel = nel_spin(1) + REAL(ne_b, KIND=dp)
                   CALL Smearkp2(wocc(:, :, :), mu, kTS, weig(:, :, :), nel, wkp, &
                                 smear%electronic_temperature, smear_fermi_dirac)
                   kTS = kTS/2._dp
@@ -1731,16 +1735,16 @@ CONTAINS
                                smear%smearing_width, 2.0_dp, smear%method)
                   kTS_spin(1) = kTS
                ELSE IF (my_separate_spin_occupations) THEN
-                  nel = REAL(ne_a, KIND=dp)
+                  nel = nel_spin(1)
                   CALL Smearkp(wocc(:, :, 1), mus(1), kTS, weig(:, :, 1), nel, wkp, &
                                smear%smearing_width, 1.0_dp, smear%method)
                   kTS_spin(1) = kTS
-                  nel = REAL(ne_b, KIND=dp)
+                  nel = nel_spin(2)
                   CALL Smearkp(wocc(:, :, 2), mus(2), kTS, weig(:, :, 2), nel, wkp, &
                                smear%smearing_width, 1.0_dp, smear%method)
                   kTS_spin(2) = kTS
                ELSE
-                  nel = REAL(ne_a, KIND=dp) + REAL(ne_b, KIND=dp)
+                  nel = nel_spin(1) + REAL(ne_b, KIND=dp)
                   CALL Smearkp2(wocc(:, :, :), mu, kTS, weig(:, :, :), nel, wkp, &
                                 smear%smearing_width, smear%method)
                   kTS = kTS/2._dp
@@ -1783,6 +1787,14 @@ CONTAINS
                              "K-point ADDED_MOS AUTO needs a larger virtual-space buffer, "// &
                              "but this call path cannot grow it.")
             END IF
+         END IF
+         IF (smear%do_smear .AND. nspin == 2 .AND. my_separate_spin_occupations) THEN
+            DO ispin = 1, 2
+               nel = SUM(wkp*SUM(wocc(:, :, ispin), DIM=1))
+               IF (ABS(nel - nel_spin(ispin)) > &
+                   10.0_dp*smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin))) &
+                  CALL cp_warn(__LOCATION__, "Weighted k-point occupations differ from the fixed spin target")
+            END DO
          END IF
          DO ikpgr = 1, kplocal
             ik = kp_range(1) + ikpgr - 1
