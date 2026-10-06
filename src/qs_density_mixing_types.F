@@ -119,6 +119,8 @@ MODULE qs_density_mixing_types
       ! differences of both (with two spins: of the total density matrix, with PULAY_P_JOINT also of
       ! the spin density matrix, which then shares the coefficients)
       LOGICAL                                           :: dm_pulay = .FALSE.
+      LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
+      REAL(KIND=dp) :: dm_trial_occ_tol = 1.0E-6_dp, dm_trial_charge_tol = 1.0E-6_dp, dm_trial_step_limit = 0.0_dp
       INTEGER                                           :: dm_pulay_ncall = 0
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: dm_pulay_p_last => NULL(), &
                                                            dm_pulay_res_last => NULL()
@@ -235,6 +237,21 @@ CONTAINS
          CALL section_vals_val_get(mixing_section, "PULAY_P_JOINT_START", &
                                    r_val=mixing_store%dm_pulay_joint_start)
       END IF
+      CALL section_vals_val_get(mixing_section, "PULAY_P_DIAGNOSTICS", l_val=mixing_store%dm_trial_diagnostics)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_REJECT", l_val=mixing_store%dm_trial_reject)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_OCC_TOL", r_val=mixing_store%dm_trial_occ_tol)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_CHARGE_TOL", r_val=mixing_store%dm_trial_charge_tol)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_STEP_LIMIT", r_val=mixing_store%dm_trial_step_limit)
+      mixing_store%dm_trial_diagnostics = mixing_store%dm_trial_diagnostics .OR. &
+                                          mixing_store%dm_trial_reject .OR. mixing_store%dm_trial_step_limit > 0.0_dp
+      IF (mixing_store%dm_trial_diagnostics) THEN
+         IF (.NOT. mixing_store%dm_pulay) CALL cp_abort(__LOCATION__, &
+                                                        "PULAY_P trial checks require DIRECT_P_MIXING with PULAY_P")
+         CPASSERT(mixing_store%dm_trial_occ_tol >= 0.0_dp .AND. mixing_store%dm_trial_charge_tol >= 0.0_dp)
+         CPASSERT(mixing_store%dm_trial_step_limit >= 0.0_dp)
+         CPASSERT(mixing_store%alpha > 0.0_dp .AND. mixing_store%alpha <= 1.0_dp)
+      END IF
+      mixing_store%dm_trial_fallback = .FALSE.
       mixing_store%dm_pulay_joint_active = .FALSE.
       CALL section_vals_val_get(mixing_section, "XC_FIELDS", l_val=mixing_store%xc_fields)
       IF (mixing_store%xc_fields) THEN
@@ -941,6 +958,41 @@ CONTAINS
                           type_of_var=real_t, &
                           default_r_val=0.0_dp, &
                           usage="PULAY_P_JOINT_START 1.0E-2")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_DIAGNOSTICS", &
+                          description="Diagnose input, output and trial density matrices after Pulay mixing o"// &
+                          "n one MPI rank.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_REJECT", &
+                          description="Reject nonfinite trials, wrong charge and occupation eigenvalues outsi"// &
+                          "de the physical interval. Reset history and use one convex linear step"// &
+                          " for both spins.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_OCC_TOL", &
+                          description="Slack on spin-normalized overlap-metric occupation eigenvalues; "// &
+                          "choose from observed numerical noise.", &
+                          default_r_val=1.0E-6_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_CHARGE_TOL", &
+                          description="Absolute electron-count tolerance for rejecting a Pulay trial.", &
+                          default_r_val=1.0E-6_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_STEP_LIMIT", &
+                          description="Bound on the full-step Frobenius norm divided by the residual norm; "// &
+                          "zero disables the bound.", &
+                          default_r_val=0.0_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
