@@ -5141,7 +5141,7 @@ CONTAINS
       CALL para_env%max(bounds(5))
       CALL para_env%min(bounds(6))
       CALL para_env%max(bounds(7))
-      IF (iw > 0) WRITE (iw, '(T2,A,7ES22.12)') "SCF_TRIAL| rho min,max;tau min,max;gradmax;weight min,max ", bounds
+      IF (iw > 0) WRITE (iw, '(T2,A,7ES22.12E3)') "SCF_TRIAL| rho min,max;tau min,max;gradmax;weight min,max ", bounds
    END SUBROUTINE trial_skala_fields
 
 ! **************************************************************************************************
@@ -5197,7 +5197,7 @@ CONTAINS
          CALL para_env%min(ranges(ispin))
          CALL para_env%max(ranges(ispin + 1))
       END DO
-      IF (iw > 0) WRITE (iw, '(T2,A,6ES22.12)') "SCF_TRIAL| weighted rho,gradient,tau adjoint ranges ", ranges
+      IF (iw > 0) WRITE (iw, '(T2,A,6ES22.12E3)') "SCF_TRIAL| weighted rho,gradient,tau adjoint ranges ", ranges
       ALLOCATE (vtau(SIZE(weights)), vrho(SIZE(weights)), vgrad(SIZE(weights), 3), &
                 rho(SIZE(weights)), grad2(SIZE(weights)), negative(SIZE(weights)), &
                 trough(SIZE(weights)), positive_weight(SIZE(weights)))
@@ -5244,8 +5244,8 @@ CONTAINS
          CALL para_env%sum(support(1:3))
          CALL para_env%max(support(4))
          IF (iw > 0) THEN
-            WRITE (iw, '(T2,A,I2,6ES22.12)') "SCF_TRIAL| spin,unweighted rho,grad,kinetic-coefficient ranges ", ispin, extrema
-            WRITE (iw, '(T2,A,I2,4ES22.12)') "SCF_TRIAL| spin,negative-volume,electrons,trough-volume,trough-adjoint ", &
+            WRITE (iw, '(T2,A,I2,6ES22.12E3)') "SCF_TRIAL| spin,unweighted rho,grad,kinetic-coefficient ranges ", ispin, extrema
+            WRITE (iw, '(T2,A,I2,4ES22.12E3)') "SCF_TRIAL| spin,negative-volume,electrons,trough-volume,trough-adjoint ", &
                ispin, support
          END IF
       END DO
