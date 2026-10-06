@@ -52,11 +52,11 @@ MODULE qs_scf
         dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_get_info, &
         dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, dbcsr_release_p, dbcsr_set, dbcsr_type, &
         dbcsr_type_no_symmetry
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
                                               cp_dbcsr_m_by_n_from_row_template,&
                                               dbcsr_deallocate_matrix_set
-   USE cp_dbcsr_contrib, ONLY: dbcsr_dot
    USE cp_files,                        ONLY: close_file
    USE cp_fm_pool_types,                ONLY: cp_fm_pool_p_type
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
@@ -3299,17 +3299,21 @@ CONTAINS
 !> \brief Check the fixed spin target against occupations, Tr(PS), and the grid integral.
 !> \param qs_env ...
    SUBROUTINE qs_scf_check_fixed_spin_populations(qs_env)
-      TYPE(qs_environment_type), POINTER :: qs_env
-      TYPE(dft_control_type), POINTER :: dft_control
-      TYPE(scf_control_type), POINTER :: scf_control
-      TYPE(qs_rho_type), POINTER :: rho
-      TYPE(kpoint_type), POINTER :: kpoints
-      TYPE(mo_set_type), DIMENSION(:), POINTER :: mos
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER :: matrix_s, rho_ao
-      REAL(KIND=dp), DIMENSION(:), POINTER :: wkp
-      REAL(KIND=dp) :: nel_spin(2), occupation_count(2), trace_count(2), dot, grid_count, tolerance
-      INTEGER :: ne_a, ne_b, ispin, ic, ikp, iw
-      LOGICAL :: do_kpoints
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+
+      INTEGER                                            :: ic, ikp, ispin, iw, ne_a, ne_b
+      LOGICAL                                            :: do_kpoints
+      REAL(KIND=dp)                                      :: dot, grid_count, nel_spin(2), &
+                                                            occupation_count(2), tolerance, &
+                                                            trace_count(2)
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: wkp
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s, rho_ao
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(scf_control_type), POINTER                    :: scf_control
+
       CALL get_qs_env(qs_env, dft_control=dft_control, scf_control=scf_control)
       IF (dft_control%nspins /= 2 .OR. dft_control%roks) RETURN
       IF (.NOT. scf_control%smear%do_smear) RETURN
@@ -3324,8 +3328,8 @@ CONTAINS
          DO ikp = 1, SIZE(kpoints%kp_env)
             DO ispin = 1, 2
                occupation_count(ispin) = occupation_count(ispin) + &
-                  wkp(kpoints%kp_env(ikp)%kpoint_env%nkpoint)* &
-                  SUM(kpoints%kp_env(ikp)%kpoint_env%mos(1, ispin)%occupation_numbers)
+                                         wkp(kpoints%kp_env(ikp)%kpoint_env%nkpoint)* &
+                                         SUM(kpoints%kp_env(ikp)%kpoint_env%mos(1, ispin)%occupation_numbers)
             END DO
          END DO
          CALL kpoints%para_env_inter_kp%sum(occupation_count)
@@ -3347,17 +3351,17 @@ CONTAINS
       iw = cp_logger_get_default_io_unit()
       DO ispin = 1, 2
          tolerance = MAX(1.0E-6_dp, &
-                        10.0_dp*scf_control%smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin)))
+                         10.0_dp*scf_control%smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin)))
          grid_count = ABS(rho%tot_rho_r(ispin))
          IF (iw > 0) WRITE (iw, '(T2,A,I2,4ES22.12)') &
             "FIXED_MOMENT| spin,target,occupation,Tr(PS),grid ", ispin, nel_spin(ispin), &
             occupation_count(ispin), trace_count(ispin), grid_count
-         CPWARN_IF(ABS(occupation_count(ispin) - nel_spin(ispin)) > tolerance, &
-                   "Fixed-moment occupation sum differs from its target")
-         CPWARN_IF(ABS(trace_count(ispin) - nel_spin(ispin)) > tolerance, &
-                   "Fixed-moment Tr(PS) differs from its target")
-         CPWARN_IF(ABS(grid_count - nel_spin(ispin)) > tolerance, &
-                   "Fixed-moment grid integral differs from its target")
+         IF (ABS(occupation_count(ispin) - nel_spin(ispin)) > tolerance) CALL cp_warn(__LOCATION__, &
+                                                                              "Fixed-moment occupation sum differs from its target")
+         IF (ABS(trace_count(ispin) - nel_spin(ispin)) > tolerance) CALL cp_warn(__LOCATION__, &
+                                                                                 "Fixed-moment Tr(PS) differs from its target")
+         IF (ABS(grid_count - nel_spin(ispin)) > tolerance) CALL cp_warn(__LOCATION__, &
+                                                                         "Fixed-moment grid integral differs from its target")
       END DO
    END SUBROUTINE qs_scf_check_fixed_spin_populations
 

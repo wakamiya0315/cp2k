@@ -88,7 +88,8 @@ MODULE kpoint_methods
                                               mpools_get,&
                                               mpools_rebuild_fm_pools,&
                                               qs_matrix_pools_type
-   USE qs_mo_occupation, ONLY: fixed_spin_targets, separate_smear_spins
+   USE qs_mo_occupation,                ONLY: fixed_spin_targets,&
+                                              separate_smear_spins
    USE qs_mo_types,                     ONLY: allocate_mo_set,&
                                               get_mo_set,&
                                               init_mo_set,&
@@ -1551,7 +1552,8 @@ CONTAINS
       INTEGER, DIMENSION(2)                              :: kp_range
       LOGICAL                                            :: my_added_mos_auto_grow, &
                                                             my_separate_spin_occupations
-      REAL(KIND=dp)                                      :: kTS, kTS_spin(2), mu, mus(2), nel, nel_spin(2)
+      REAL(KIND=dp)                                      :: kTS, kTS_spin(2), mu, mus(2), nel, &
+                                                            nel_spin(2)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: smatrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: weig, wocc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: icoeff, rcoeff
@@ -1789,9 +1791,9 @@ CONTAINS
          IF (smear%do_smear .AND. nspin == 2 .AND. my_separate_spin_occupations) THEN
             DO ispin = 1, 2
                nel = SUM(wkp*SUM(wocc(:, :, ispin), DIM=1))
-               CPWARN_IF(ABS(nel - nel_spin(ispin)) > &
-                         10.0_dp*smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin)), &
-                         "Weighted k-point occupations differ from the fixed spin target")
+               IF (ABS(nel - nel_spin(ispin)) > &
+                   10.0_dp*smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin))) &
+                  CALL cp_warn(__LOCATION__, "Weighted k-point occupations differ from the fixed spin target")
             END DO
          END IF
          DO ikpgr = 1, kplocal

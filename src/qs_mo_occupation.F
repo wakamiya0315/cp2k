@@ -916,7 +916,8 @@ CONTAINS
          END DO
          is_large = ABS(nelec - accurate_sum(mo_set%occupation_numbers(1:mo_set%homo))) > &
                     smear%eps_fermi_dirac*MAX(1.0_dp, nelec)
-         CPWARN_IF(is_large .AND. my_emit_warnings, "Retained density occupations differ from the electron target")
+         IF (is_large .AND. my_emit_warnings) CALL cp_warn(__LOCATION__, &
+                                                           "Retained density occupations differ from the electron target")
 
       END IF ! do smear
 
@@ -932,7 +933,8 @@ CONTAINS
 !> \brief Whether smearing fixes separate spin populations, with the Gamma semantics.
 !> \param smear ...
    LOGICAL FUNCTION separate_smear_spins(smear)
-      TYPE(smear_type), INTENT(IN) :: smear
+      TYPE(smear_type), INTENT(IN)                       :: smear
+
       separate_smear_spins = smear%fixed_mag_mom >= 0.0_dp .OR. smear%fixed_mag_mom == -1.0_dp
    END FUNCTION separate_smear_spins
 
@@ -943,10 +945,12 @@ CONTAINS
 !> \param ne_b ...
 !> \param nel_spin ...
    SUBROUTINE fixed_spin_targets(smear, ne_a, ne_b, nel_spin)
-      TYPE(smear_type), INTENT(IN) :: smear
-      INTEGER, INTENT(IN) :: ne_a, ne_b
-      REAL(KIND=dp), DIMENSION(2), INTENT(OUT) :: nel_spin
-      REAL(KIND=dp) :: ne_total
+      TYPE(smear_type), INTENT(IN)                       :: smear
+      INTEGER, INTENT(IN)                                :: ne_a, ne_b
+      REAL(KIND=dp), DIMENSION(2), INTENT(OUT)           :: nel_spin
+
+      REAL(KIND=dp)                                      :: ne_total
+
       nel_spin = REAL([ne_a, ne_b], KIND=dp)
       IF (smear%do_smear .AND. smear%fixed_mag_mom >= 0.0_dp) THEN
          ne_total = REAL(ne_a + ne_b, KIND=dp)

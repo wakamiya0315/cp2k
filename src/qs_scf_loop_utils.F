@@ -1811,7 +1811,7 @@ CONTAINS
       INTEGER                                            :: energy_start, ikpoint, ispin, &
                                                             local_channel, local_kpoint, ne_a, &
                                                             ne_b, nelectron, nkpoint, nmo
-      REAL(KIND=dp)                                      :: kTS, mu, nel, sigma, nel_spin(2)
+      REAL(KIND=dp)                                      :: kTS, mu, nel, nel_spin(2), sigma
       REAL(KIND=dp), DIMENSION(2)                        :: mus
       TYPE(kpoint_env_type), POINTER                     :: kp
 
