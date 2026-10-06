@@ -945,7 +945,8 @@ CONTAINS
                CALL qs_scf_density_mixing(scf_env, rho, para_env, density_full_step)
                CALL qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, output_unit, density_full_step)
                CALL qs_scf_free_accept(qs_env, scf_env, scf_control, output_unit, density_full_step)
-               IF (mixing_free_energy_active(scf_env%mixing_store)) oda_state_evaluated = .TRUE.
+               ! Keep the normal end-of-step rho invalidation. ODA's separate evaluated-energy
+               ! snapshot is not populated by this path and must never overwrite the accepted F.
             END IF
             IF (dft_control%qs_control%xtb_control%do_tblite .AND. &
                 .NOT. (dft_control%qs_control%do_ls_scf .OR. scf_control%use_ot)) THEN
@@ -3408,7 +3409,8 @@ CONTAINS
       CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control, do_kpoints=do_kpoints)
       IF (.NOT. do_kpoints .OR. scf_env%method /= general_diag_method_nr .OR. &
           .NOT. control%smear%do_smear .OR. control%smear%method /= smear_fermi_dirac .OR. &
-          .NOT. store%dm_trial_k_loaded .OR. dft_control%do_admm .OR. dft_control%hairy_probes) &
+          .NOT. store%dm_trial_k_loaded .OR. dft_control%do_admm .OR. dft_control%hairy_probes .OR. &
+          control%diagonalization%update_method == diag_update_method_adiis) &
          CALL cp_abort(__LOCATION__, &
                        "Trial free energy needs complete-state k-point diagonalization with Fermi-Dirac smearing")
       sigma = control%smear%electronic_temperature
@@ -3600,6 +3602,18 @@ CONTAINS
       TYPE(dbcsr_p_type), POINTER                        :: matrix_ks(:, :), reference_ks(:, :)
       TYPE(dbcsr_type)                                   :: delta
 
+      ! Form the reference from a fresh evaluation of this P, not an operator that
+      ! diagonalization/KS-DIIS may have temporarily transformed or extrapolated.
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+         END DO
+      END DO
+      CALL qs_scf_free_evaluate(qs_env, scf_env, control, initial_k, f, eks, valid)
+      CPASSERT(valid)
+      IF (iw > 0) WRITE (iw, '(T2,A,2ES24.14E3)') &
+         "SCF_FREE_ENERGY| validation input vs fresh EKS,F errors ", &
+         eks - scf_env%mixing_store%dm_trial_eks_input, f - scf_env%mixing_store%dm_trial_f_input
       CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks)
       NULLIFY (reference_ks)
       CALL dbcsr_allocate_matrix_set(reference_ks, SIZE(initial, 1), SIZE(initial, 2))
