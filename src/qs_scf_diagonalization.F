@@ -187,7 +187,7 @@ MODULE qs_scf_diagonalization
       TYPE(cp_cfm_type) :: cksmat, cmos, csmat, csmat_base, cwork
    END TYPE kp_diag_omp_workspace_type
 
-   PUBLIC :: qs_scf_full_bloch_initialize, qs_scf_full_bloch_save
+   PUBLIC :: qs_scf_full_bloch_initialize, qs_scf_full_bloch_save, qs_scf_bloch_entropy
    PUBLIC :: do_general_diag, do_general_diag_kp, do_roks_diag, &
              do_special_diag, do_ot_diag, do_ot_diag_kp, do_block_davidson_diag, &
              do_block_davidson_diag_kp, &
@@ -4424,6 +4424,94 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Apply the exact real-space Pulay coefficients and normalization to full Bloch densities.
+
+! **************************************************************************************************
+!> rief Entropy of a certified complete ensemble and its actual real-space image.
+!> \param bloch full density, not an inverse transform of truncated real-space images
+!> \param entropy dimensionless S/k_B including spin normalization and k weights
+!> \param valid finite, physical bounds, Hermiticity, forward map and charge/spin certificate
+   SUBROUTINE qs_scf_bloch_entropy(qs_env, scf_env, bloch, entropy, valid)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      COMPLEX(KIND=dp), INTENT(IN)                       :: bloch(:, :, :, :)
+      REAL(KIND=dp), INTENT(OUT)                         :: entropy
+      LOGICAL, INTENT(OUT)                               :: valid
+
+      INTEGER                                            :: ic, ik, ispin, nao, ne_a, ne_b, nel, &
+                                                            nkp, nspin
+      INTEGER, POINTER                                   :: cell_to_index(:, :, :)
+      LOGICAL                                            :: do_kpoints, finite
+      REAL(KIND=dp)                                      :: dot, error, herm, hi, lo, maxocc, &
+                                                            partial, targets(2), trace
+      REAL(KIND=dp), ALLOCATABLE                         :: counts(:, :)
+      REAL(KIND=dp), POINTER                             :: wkp(:), xkp(:, :)
+      TYPE(cp_cfm_type)                                  :: sk
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(dbcsr_p_type), POINTER                        :: overlap(:, :), real_density(:, :)
+      TYPE(kp_transform_plan_type)                       :: plan
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+      TYPE(scf_control_type), POINTER                    :: control
+
+      store => scf_env%mixing_store
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_s_kp=overlap, para_env=para_env, &
+                      do_kpoints=do_kpoints, nelectron_total=nel, scf_control=control)
+      valid = do_kpoints .AND. para_env%num_pe == 1
+      entropy = 0.0_dp
+      IF (.NOT. valid) RETURN
+      real_density => scf_env%p_mix_new
+      CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      nao = fmstruct%nrow_global; nspin = SIZE(real_density, 1)
+      valid = ALL(SHAPE(bloch) == [nao, nao, nspin, nkp])
+      IF (.NOT. valid) RETURN
+      CALL trial_bloch_roundtrip(qs_env, scf_env, real_density, bloch, error)
+      valid = ieee_is_finite(error) .AND. error <= 1.0E-8_dp
+      CALL cp_cfm_create(sk, fmstruct)
+      CALL kp_transform_plan_create(plan, sab_nl, cell_to_index, SIZE(overlap, 2), overlap(1, 1)%matrix)
+      ALLOCATE (counts(nspin, 2)); counts = 0.0_dp
+      maxocc = MERGE(2.0_dp, 1.0_dp, nspin == 1)
+      DO ik = 1, nkp
+         CALL kp_build_cfm(overlap, 1, xkp(:, ik), plan, sk)
+         DO ispin = 1, nspin
+            CALL trial_occupation_bounds(bloch(:, :, ispin, ik), sk%local_data(1:nao, 1:nao), &
+                                         scf_env%cholesky_method == cholesky_off, control%eps_eigval, maxocc, &
+                                         lo, hi, trace, herm, finite, partial)
+            valid = valid .AND. finite .AND. lo >= -store%dm_trial_occ_tol .AND. &
+                    hi <= 1.0_dp + store%dm_trial_occ_tol .AND. herm <= 1.0E-10_dp
+            entropy = entropy + wkp(ik)*partial
+            counts(ispin, 1) = counts(ispin, 1) + wkp(ik)*trace
+         END DO
+      END DO
+      DO ic = 1, SIZE(real_density, 2)
+         DO ispin = 1, nspin
+            CALL dbcsr_dot(real_density(ispin, ic)%matrix, overlap(1, ic)%matrix, dot)
+            counts(ispin, 2) = counts(ispin, 2) + dot
+         END DO
+      END DO
+      valid = valid .AND. ALL(ieee_is_finite(counts)) .AND. ieee_is_finite(entropy) .AND. &
+              MAXVAL(ABS(counts(:, 1) - counts(:, 2))) <= store%dm_trial_charge_tol .AND. &
+              ABS(SUM(counts(:, 1)) - REAL(nel, KIND=dp)) <= store%dm_trial_charge_tol
+      IF (nspin == 2) THEN
+         IF (control%smear%fixed_mag_mom >= 0.0_dp .OR. control%smear%fixed_mag_mom == -1.0_dp) THEN
+            IF (control%smear%fixed_mag_mom >= 0.0_dp) THEN
+               targets = 0.5_dp*[REAL(nel, KIND=dp) + control%smear%fixed_mag_mom, &
+                                 REAL(nel, KIND=dp) - control%smear%fixed_mag_mom]
+            ELSE
+               kp => kpoints%kp_env(1)%kpoint_env
+               CALL get_mo_set(kp%mos(1, 1), nelectron=ne_a)
+               CALL get_mo_set(kp%mos(1, 2), nelectron=ne_b)
+               targets = REAL([ne_a, ne_b], KIND=dp)
+            END IF
+            valid = valid .AND. MAXVAL(ABS(counts(:, 1) - targets)) <= store%dm_trial_charge_tol
+         END IF
+      END IF
+      CALL cp_cfm_release(sk); CALL kp_transform_plan_release(plan); DEALLOCATE (counts)
+   END SUBROUTINE qs_scf_bloch_entropy
+
    SUBROUTINE trial_bloch_mix(store, raw, mixed, full_step)
       TYPE(mixing_storage_type), POINTER                 :: store
       COMPLEX(KIND=dp), INTENT(IN)                       :: raw(:, :, :, :)
@@ -4548,13 +4636,15 @@ CONTAINS
 !> \param hermitian_error ...
 !> \param finite ...
    SUBROUTINE trial_occupation_bounds(p, s, canonical, eps_eigval, maxocc, &
-                                      occmin, occmax, trace, hermitian_error, finite)
+                                      occmin, occmax, trace, hermitian_error, finite, entropy)
       COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: p, s
       LOGICAL, INTENT(IN)                                :: canonical
       REAL(KIND=dp), INTENT(IN)                          :: eps_eigval, maxocc
       REAL(KIND=dp), INTENT(OUT)                         :: occmin, occmax, trace, hermitian_error
       LOGICAL, INTENT(OUT)                               :: finite
+      REAL(KIND=dp), OPTIONAL, INTENT(OUT)                :: entropy
 
+      REAL(KIND=dp)                                      :: occupation
       COMPLEX(KIND=dp), ALLOCATABLE                      :: basis(:, :), metric(:, :), &
                                                             physical(:, :), work(:)
       INTEGER                                            :: first, i, info, j, n, nr
@@ -4563,6 +4653,7 @@ CONTAINS
 #if defined(__HAS_IEEE_EXCEPTIONS)
       TYPE(ieee_status_type) :: saved_status
 #endif
+      IF (PRESENT(entropy)) entropy = 0.0_dp
       n = SIZE(p, 1)
       occmin = 0.0_dp
       occmax = 0.0_dp
@@ -4621,6 +4712,15 @@ CONTAINS
                occmin = MINVAL(eig(1:nr))
                occmax = MAXVAL(eig(1:nr))
                trace = SUM(eig(1:nr))*maxocc
+               IF (PRESENT(entropy)) THEN
+                  ! The caller certifies bounds first; clamp eigensolver rounding only for log(0).
+                  ! This does not project, clip or otherwise change P or any physical feature.
+                  DO i = 1, nr
+                     occupation = MAX(0.0_dp, MIN(1.0_dp, eig(i)))
+                     IF (occupation > 0.0_dp .AND. occupation < 1.0_dp) entropy = entropy - maxocc* &
+                                                       (occupation*LOG(occupation) + (1.0_dp - occupation)*LOG(1.0_dp - occupation))
+                  END DO
+               END IF
             END IF
          END IF
       END IF

@@ -60,14 +60,10 @@ MODULE qs_scf_loop_utils
                                               kpoint_type
    USE message_passing,                 ONLY: mp_para_env_type
    USE qs_density_matrices,             ONLY: calculate_density_matrix
-   USE qs_density_mixing_types,         ONLY: broyden_mixing_nr,&
-                                              direct_mixing_nr,&
-                                              gspace_mixing_nr,&
-                                              modified_broyden_mixing_nr,&
-                                              multisecant_mixing_nr,&
-                                              new_pulay_mixing_nr,&
-                                              no_mixing_nr,&
-                                              pulay_mixing_nr
+   USE qs_density_mixing_types,         ONLY: &
+        broyden_mixing_nr, direct_mixing_nr, gspace_mixing_nr, mixing_free_energy_active, &
+        modified_broyden_mixing_nr, multisecant_mixing_nr, new_pulay_mixing_nr, no_mixing_nr, &
+        pulay_mixing_nr
    USE qs_energy_types,                 ONLY: qs_energy_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -79,6 +75,8 @@ MODULE qs_scf_loop_utils
                                               kpoint_operator_get
    USE qs_kpp1_env_types,               ONLY: kpp1_release,&
                                               qs_kpp1_env_type
+   USE qs_ks_methods,                   ONLY: evaluate_core_matrix_traces,&
+                                              qs_ks_update_qs_env
    USE qs_ks_types,                     ONLY: qs_ks_did_change,&
                                               qs_ks_env_type
    USE qs_linres_kernel,                ONLY: apply_hxc_kernel_kp
@@ -110,7 +108,7 @@ MODULE qs_scf_loop_utils
    USE qs_scf_diagonalization,          ONLY: &
         do_block_davidson_diag, do_block_davidson_diag_kp, do_block_krylov_diag, do_general_diag, &
         do_general_diag_kp, do_ot_diag, do_ot_diag_kp, do_roks_diag, do_scf_diag_subspace, &
-        do_special_diag, qs_scf_get_ot_kpoint_operator
+        do_special_diag, qs_scf_bloch_entropy, qs_scf_get_ot_kpoint_operator
    USE qs_scf_methods,                  ONLY: cp_sm_mix,&
                                               scf_env_density_mixing
    USE qs_scf_output,                   ONLY: qs_scf_print_summary
@@ -3097,6 +3095,12 @@ CONTAINS
                             scf_env%scf_subspace_buffer%diis_weight >= 1.0_dp
       END IF
 
+      ! The opt-in objective never accepts a one-step smeared restart as a physical reference.
+      ! Keep the raw residual unchanged; require an independently updated second diagonalization.
+      IF (mixing_free_energy_active(scf_env%mixing_store)) THEN
+         IF (scf_env%iter_count < 2) update_validated = .FALSE.
+      END IF
+
       CALL external_control(should_stop, "SCF", target_time=qs_env%target_time, &
                             start_time=qs_env%start_time)
       IF (scf_env%iter_delta < scf_control%eps_scf .AND. update_validated) THEN
@@ -3241,24 +3245,26 @@ CONTAINS
       LOGICAL                                            :: diis_step
       INTEGER, INTENT(IN)                                :: output_unit
 
-      LOGICAL                                            :: do_kpoints
+      LOGICAL                                            :: do_kpoints, valid
+      REAL(KIND=dp)                                      :: density_kts, eks, entropy
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(qs_energy_type), POINTER                      :: energy
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
       TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(scf_control_type), POINTER                    :: control
 
-      NULLIFY (energy, rho, dft_control, ks_env)
+      NULLIFY (energy, rho, dft_control, ks_env, control)
 
       CALL get_qs_env(qs_env=qs_env, energy=energy, ks_env=ks_env, &
                       rho=rho, dft_control=dft_control, para_env=para_env, &
-                      do_kpoints=do_kpoints)
+                      do_kpoints=do_kpoints, scf_control=control)
 
       CALL cleanup_scf_loop(scf_env)
 
       ! now, print out energies and charges corresponding to the obtained wfn
       ! (this actually is not 100% consistent at this point)!
-      CALL qs_scf_print_summary(output_unit, qs_env)
+      IF (.NOT. mixing_free_energy_active(scf_env%mixing_store)) CALL qs_scf_print_summary(output_unit, qs_env)
 
       CALL qs_scf_undo_mixing(scf_env, rho, dft_control, para_env, diis_step)
 
@@ -3266,6 +3272,23 @@ CONTAINS
       !   *** this might not always be needed (i.e. no post calculation / no forces )
       !   *** but guarantees that rho and wfn are consistent at this point
       CALL qs_scf_rho_update(rho, qs_env, scf_env, ks_env, mix_rho=.FALSE.)
+      IF (mixing_free_energy_active(scf_env%mixing_store)) THEN
+         ! Finalization restores raw P_out. Its entropy, fields and energy must refer to that same P.
+         scf_env%mixing_store%dm_trial_k_input = scf_env%mixing_store%dm_trial_k_last + &
+                                                 scf_env%mixing_store%dm_trial_k_reslast
+         CALL qs_scf_bloch_entropy(qs_env, scf_env, scf_env%mixing_store%dm_trial_k_input, entropy, valid)
+         IF (.NOT. valid) CALL cp_abort(__LOCATION__, &
+                                        "Final raw density does not certify the trial free energy")
+         CALL evaluate_core_matrix_traces(qs_env)
+         CALL qs_ks_update_qs_env(qs_env, just_energy=.FALSE., calculate_forces=.FALSE., print_active=.FALSE.)
+         eks = energy%total - energy%kTS
+         density_kts = -control%smear%electronic_temperature*entropy
+         energy%total = eks + density_kts; energy%kTS = density_kts
+         IF (output_unit > 0) WRITE (output_unit, '(T2,A,3ES24.14E3)') &
+            "SCF_FREE_ENERGY| finalized raw-state F,raw-residual,entropy consistency error ", &
+            energy%total, scf_env%iter_delta, density_kts - scf_env%mixing_store%dm_trial_raw_kts
+         CALL qs_scf_print_summary(output_unit, qs_env)
+      END IF
 
    END SUBROUTINE qs_scf_inner_finalize
 

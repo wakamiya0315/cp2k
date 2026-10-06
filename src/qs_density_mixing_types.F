@@ -120,6 +120,9 @@ MODULE qs_density_mixing_types
       ! the spin density matrix, which then shares the coefficients)
       LOGICAL                                           :: dm_pulay = .FALSE.
       LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
+      LOGICAL :: dm_trial_free_energy = .FALSE., dm_trial_free_validate = .FALSE.
+      INTEGER :: dm_trial_free_backtracks = 12, dm_trial_free_evaluations = 0
+      REAL(KIND=dp) :: dm_trial_f_input = 0.0_dp, dm_trial_eks_input = 0.0_dp, dm_trial_raw_kts = 0.0_dp
       REAL(KIND=dp) :: dm_trial_occ_tol = 1.0E-6_dp, dm_trial_charge_tol = 1.0E-6_dp, dm_trial_step_limit = 0.0_dp
       ! Full Bloch companion: the same affine Pulay candidate, before real-space truncation.
       ! Allocated only for opt-in one-rank diagnostics; never Fourier-invert a density as an operator.
@@ -143,6 +146,8 @@ MODULE qs_density_mixing_types
       CLASS(mixer_type), ALLOCATABLE                    :: tb_scc_mixer
 #endif
    END TYPE mixing_storage_type
+
+   PUBLIC :: mixing_free_energy_active
 
 CONTAINS
 
@@ -248,6 +253,15 @@ CONTAINS
       END IF
       CALL section_vals_val_get(mixing_section, "PULAY_P_DIAGNOSTICS", l_val=mixing_store%dm_trial_diagnostics)
       CALL section_vals_val_get(mixing_section, "PULAY_P_REJECT", l_val=mixing_store%dm_trial_reject)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_ENERGY", l_val=mixing_store%dm_trial_free_energy)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_VALIDATE", l_val=mixing_store%dm_trial_free_validate)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_BACKTRACKS", i_val=mixing_store%dm_trial_free_backtracks)
+      IF (mixing_store%dm_trial_free_energy) mixing_store%dm_trial_reject = .TRUE.
+      IF (mixing_store%dm_trial_free_validate .AND. .NOT. mixing_store%dm_trial_free_energy) &
+         CALL cp_abort(__LOCATION__, &
+                       "PULAY_P_FREE_VALIDATE requires PULAY_P_FREE_ENERGY")
+      CPASSERT(mixing_store%dm_trial_free_backtracks >= 0)
+      CPASSERT(mixing_store%dm_trial_free_backtracks <= 30)
       CALL section_vals_val_get(mixing_section, "PULAY_P_OCC_TOL", r_val=mixing_store%dm_trial_occ_tol)
       CALL section_vals_val_get(mixing_section, "PULAY_P_CHARGE_TOL", r_val=mixing_store%dm_trial_charge_tol)
       CALL section_vals_val_get(mixing_section, "PULAY_P_STEP_LIMIT", r_val=mixing_store%dm_trial_step_limit)
@@ -271,6 +285,10 @@ CONTAINS
          CPASSERT(mixing_store%dm_trial_step_limit >= 0.0_dp)
          CPASSERT(mixing_store%alpha > 0.0_dp .AND. mixing_store%alpha <= 1.0_dp)
       END IF
+      IF (mixing_store%dm_trial_free_energy .AND. LEN_TRIM(mixing_store%dm_trial_k_read) == 0) &
+         CALL cp_abort(__LOCATION__, &
+                       "Trial free energy requires a paired complete Bloch initial checkpoint")
+      mixing_store%dm_trial_free_evaluations = 0
       mixing_store%dm_trial_fallback = .FALSE.
       mixing_store%dm_pulay_joint_active = .FALSE.
       CALL section_vals_val_get(mixing_section, "XC_FIELDS", l_val=mixing_store%xc_fields)
@@ -1020,6 +1038,27 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_ENERGY", &
+                          description="Accept only non-increasing same-density finite-temperature free energy. "// &
+                          "Rebuild rho, tau and KS state for each physical full-Bloch trial. Requires "// &
+                          "Fermi-Dirac smearing, a paired initial checkpoint and one MPI rank. "// &
+                          "Enables domain rejection; preserves the raw residual convergence test.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_BACKTRACKS", &
+                          description="Maximum halvings for each of the Pulay and common raw-map directions. "// &
+                          "Exhaustion restores the input and stops with failure rather than zero-step convergence.", &
+                          default_i_val=12)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_VALIDATE", &
+                          description="On the first step, repeat the input energy/KS state and compare "// &
+                          "the KS directional derivative with two forward energy differences.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_READ", &
                 description="Read a certified paired full Bloch/real-space density before the first KS evaluation; one MPI rank.", &
                           type_of_var=lchar_t, default_lc_val="")
@@ -1098,5 +1137,14 @@ CONTAINS
       mixing_store%dm_pulay_ncall = 0
 
    END SUBROUTINE dm_pulay_storage_release
+
+! **************************************************************************************************
+!> \brief Default-safe opt-in query, including methods without a mixing store.
+   LOGICAL FUNCTION mixing_free_energy_active(store) RESULT(active)
+      TYPE(mixing_storage_type), POINTER                 :: store
+
+      active = .FALSE.
+      IF (ASSOCIATED(store)) active = store%dm_trial_free_energy
+   END FUNCTION mixing_free_energy_active
 
 END MODULE qs_density_mixing_types
