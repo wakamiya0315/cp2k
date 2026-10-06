@@ -3960,7 +3960,8 @@ CONTAINS
             ! ATOMIC initializes only the central image. Its constant Bloch lift is certified
             ! by the forward transform below; restart guesses need a separate full-state hook.
             IF (scf_control%density_guess /= atomic_guess) &
-               CALL cp_abort(__LOCATION__, "Full Bloch trial diagnostics currently require SCF_GUESS ATOMIC")
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch trial diagnostics currently require SCF_GUESS ATOMIC")
             ALLOCATE (store%dm_trial_k_input(nao, nao, nspin, nkp), &
                       store%dm_trial_k_last(nao, nao, nspin, nkp), &
                       store%dm_trial_k_reslast(nao, nao, nspin, nkp), &
@@ -3981,7 +3982,8 @@ CONTAINS
          CALL trial_bloch_roundtrip(qs_env, scf_env, trial, mixed_k, roundtrip_error)
          IF (iw > 0) WRITE (iw, '(T2,A,ES22.12E3)') "SCF_TRIAL| full Bloch to real candidate max error ", roundtrip_error
          IF (roundtrip_error > 1.0E-8_dp) &
-            CALL cp_abort(__LOCATION__, "Full Bloch companion does not represent the actual real-space candidate")
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch companion does not represent the actual real-space candidate")
          CALL kp_transform_plan_create(pplan, sab_nl, cell_to_index, SIZE(trial, 2), trial(1, 1)%matrix)
          CALL kp_transform_plan_create(splan, sab_nl, cell_to_index, SIZE(matrix_s, 2), matrix_s(1, 1)%matrix)
       END IF
@@ -4038,7 +4040,8 @@ CONTAINS
          END DO
          IF (MAXVAL(ABS(kcounts(:, 1) - counts(:, 3))) > store%dm_trial_charge_tol .OR. &
              MAXVAL(ABS(kcounts(:, 2) - counts(:, 2))) > store%dm_trial_charge_tol) &
-            CALL cp_abort(__LOCATION__, "Full Bloch and real-space electron traces disagree")
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch and real-space electron traces disagree")
       END IF
       rejected = store%dm_trial_reject .AND. bad
       IF (store%dm_trial_step_limit > 0.0_dp) THEN
@@ -4081,7 +4084,8 @@ CONTAINS
             mixed_k = store%dm_trial_k_input + fallback_alpha*(raw_k - store%dm_trial_k_input)
             CALL trial_bloch_roundtrip(qs_env, scf_env, trial, mixed_k, roundtrip_error)
             IF (roundtrip_error > 1.0E-8_dp) &
-               CALL cp_abort(__LOCATION__, "Full Bloch fallback does not represent the real-space fallback")
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch fallback does not represent the real-space fallback")
          END IF
          ! Certify the convex fallback in the same metric before fields can consume it.
          DO ik = 1, nkp
