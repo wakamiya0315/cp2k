@@ -13,161 +13,165 @@
 !>      05.2009
 ! **************************************************************************************************
 MODULE qs_scf_diagonalization
-   USE cp_array_utils,                  ONLY: cp_1d_r_p_type
-   USE cp_blacs_env,                    ONLY: cp_blacs_env_type
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_column_scale,&
-                                              cp_cfm_scale_and_add,&
-                                              cp_cfm_scale_and_add_fm
-   USE cp_cfm_diag,                     ONLY: cp_cfm_geeig,&
-                                              cp_cfm_geeig_canon,&
-                                              cp_cfm_geeig_canon_local,&
-                                              cp_cfm_geeig_local,&
-                                              cp_cfm_heevd
-   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
-                                              cp_cfm_release,&
-                                              cp_cfm_set_all,&
-                                              cp_cfm_to_cfm,&
-                                              cp_cfm_to_fm,&
-                                              cp_cfm_type
-   USE cp_control_types,                ONLY: dft_control_type,&
-                                              hairy_probes_type
-   USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
-        dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
-        dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, &
-        dbcsr_type_symmetric
-   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
-   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
-                                              copy_fm_to_dbcsr,&
-                                              copy_fm_to_dbcsr_bc,&
-                                              cp_dbcsr_sm_fm_multiply,&
-                                              dbcsr_allocate_matrix_set
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
-                                              cp_fm_scale_and_add,&
-                                              cp_fm_symm,&
-                                              cp_fm_uplo_to_full
-   USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_reduce,&
-                                              cp_fm_cholesky_restore
-   USE cp_fm_diag,                      ONLY: FM_DIAG_TYPE_CUSOLVER,&
-                                              FM_DIAG_TYPE_DLAF,&
-                                              choose_eigv_solver,&
-                                              cp_fm_geeig,&
-                                              cp_fm_geeig_canon,&
-                                              diag_check_requested,&
-                                              diag_type,&
-                                              direct_generalized_diagonalization
-   USE cp_fm_pool_types,                ONLY: cp_fm_pool_p_type,&
-                                              fm_pool_create_fm,&
-                                              fm_pool_get_el_struct,&
-                                              fm_pool_give_back_fm
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
-                                              cp_fm_struct_release,&
-                                              cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: &
-        copy_info_type, cp_fm_add_to_element, cp_fm_cleanup_copy_general, cp_fm_create, &
-        cp_fm_finish_copy_general, cp_fm_get_info, cp_fm_release, cp_fm_set_all, &
-        cp_fm_start_copy_general, cp_fm_to_fm, cp_fm_type
-   USE cp_log_handling,                 ONLY: cp_get_default_logger,&
-                                              cp_logger_get_default_unit_nr,&
-                                              cp_logger_type
-   USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
-                                              cp_print_key_unit_nr,&
-                                              debug_print_level
-   USE ieee_arithmetic,                 ONLY: ieee_is_finite
-   USE input_constants,                 ONLY: &
-        cholesky_dbcsr, cholesky_inverse, cholesky_off, cholesky_reduce, cholesky_restore, &
-        core_guess, diag_update_method_adiis, general_roks, high_spin_roks, ot_precond_full_all, &
-        ot_precond_full_kinetic, ot_precond_full_single_inverse, ot_precond_none, &
-        ot_precond_s_inverse, restart_guess
-   USE input_cp2k_kpoints,              ONLY: lattice_fft_auto,&
-                                              lattice_fft_off,&
-                                              lattice_fft_on
-   USE input_section_types,             ONLY: section_vals_get_subs_vals,&
-                                              section_vals_type
-   USE kinds,                           ONLY: dp,&
-                                              int_8
-   USE kpoint_methods,                  ONLY: &
-        kp_transform_plan_create, kp_transform_plan_release, kp_transform_plan_type, &
-        kpoint_density_matrices, kpoint_density_transform, kpoint_set_mo_occupation, &
-        rskp_grid_type, rskp_transform, rskp_transform_grid_extract, rskp_transform_grid_prepare, &
-        rskp_transform_grid_release
-   USE kpoint_types,                    ONLY: get_kpoint_info,&
-                                              kpoint_env_type,&
-                                              kpoint_type
-   USE machine,                         ONLY: m_flush,&
-                                              m_walltime
-   USE mathconstants,                   ONLY: gaussi,&
-                                              twopi,&
-                                              z_one,&
-                                              z_zero
-   USE message_passing,                 ONLY: mp_para_env_type
-   USE parallel_gemm_api,               ONLY: parallel_gemm
-   USE preconditioner,                  ONLY: dbcsr_pair_to_cfm,&
-                                              make_preconditioner_complex_full_kinetic,&
-                                              make_preconditioner_complex_full_s_inverse,&
-                                              prepare_preconditioner,&
-                                              restart_preconditioner
-   USE preconditioner_makes,            ONLY: make_complex_full_all,&
-                                              make_complex_full_single_inverse
-   USE preconditioner_types,            ONLY: destroy_preconditioner,&
-                                              init_preconditioner
-   USE qs_density_matrices,             ONLY: calculate_density_matrix
-   USE qs_density_mixing_types,         ONLY: direct_mixing_nr,&
-                                              dm_pulay_storage_release,&
-                                              gspace_mixing_nr,&
-                                              mixing_storage_type
-   USE qs_diis,                         ONLY: qs_diis_b_calc_err_kp,&
-                                              qs_diis_b_check_i_alloc_kp,&
-                                              qs_diis_b_clear,&
-                                              qs_diis_b_clear_kp,&
-                                              qs_diis_b_info_kp,&
-                                              qs_diis_b_step,&
-                                              qs_diis_b_step_kp
-   USE qs_energy_types,                 ONLY: qs_energy_type
-   USE qs_environment_types,            ONLY: get_qs_env,&
-                                              qs_environment_type
-   USE qs_gspace_mixing,                ONLY: gspace_mixing
-   USE qs_kpoint_operators,             ONLY: &
-        kpoint_operator_cfm_to_mo, kpoint_operator_context_create, &
-        kpoint_operator_context_release, kpoint_operator_context_type, kpoint_operator_finish, &
-        kpoint_operator_get, kpoint_operator_start, kpoint_slot_ks, kpoint_slot_s, kpoint_slot_t, &
-        kpoint_spin_free
-   USE qs_ks_methods,                   ONLY: qs_ks_update_qs_env
-   USE qs_ks_types,                     ONLY: qs_ks_did_change,&
-                                              qs_ks_env_type
-   USE qs_matrix_pools,                 ONLY: mpools_get,&
-                                              qs_matrix_pools_type
-   USE qs_mixing_utils,                 ONLY: charge_mixing_init,&
-                                              mixing_allocate,&
-                                              mixing_init,&
-                                              self_consistency_check
-   USE qs_mo_methods,                   ONLY: calculate_subspace_eigenvalues
-   USE qs_mo_occupation,                ONLY: set_mo_occupation
-   USE qs_mo_types,                     ONLY: get_mo_set,&
-                                              mo_set_type
-   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
-   USE qs_ot_eigensolver,               ONLY: ot_eigensolver,&
-                                              ot_eigensolver_complex
-   USE qs_rho_atom_types,               ONLY: rho_atom_type
-   USE qs_rho_methods,                  ONLY: qs_rho_update_rho
-   USE qs_rho_types,                    ONLY: qs_rho_get,&
-                                              qs_rho_type
-   USE qs_scf_block_davidson,           ONLY: generate_extended_space,&
-                                              generate_extended_space_c,&
-                                              generate_extended_space_sparse
-   USE qs_scf_lanczos,                  ONLY: lanczos_refinement,&
-                                              lanczos_refinement_2v
-   USE qs_scf_methods,                  ONLY: combine_ks_matrices,&
-                                              eigensolver,&
-                                              eigensolver_dbcsr,&
-                                              eigensolver_generalized,&
-                                              eigensolver_simple,&
-                                              eigensolver_symm,&
-                                              scf_env_density_mixing
-   USE qs_scf_types,                    ONLY: qs_scf_env_type,&
-                                              subspace_env_type
-   USE scf_control_types,               ONLY: scf_control_type
+   USE cp_array_utils, ONLY: cp_1d_r_p_type
+   USE cp_blacs_env, ONLY: cp_blacs_env_type
+   USE cp_cfm_basic_linalg, ONLY: cp_cfm_column_scale, &
+                                  cp_cfm_scale_and_add, &
+                                  cp_cfm_scale_and_add_fm
+   USE cp_cfm_diag, ONLY: cp_cfm_geeig, &
+                          cp_cfm_geeig_canon, &
+                          cp_cfm_geeig_canon_local, &
+                          cp_cfm_geeig_local, &
+                          cp_cfm_heevd
+   USE cp_cfm_types, ONLY: cp_cfm_create, &
+                           cp_cfm_release, &
+                           cp_cfm_set_all, &
+                           cp_cfm_to_cfm, &
+                           cp_cfm_to_fm, &
+                           cp_cfm_type
+   USE cp_control_types, ONLY: dft_control_type, &
+                               hairy_probes_type
+   USE cp_dbcsr_api, ONLY: &
+      dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
+      dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
+      dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, &
+      dbcsr_type_symmetric
+   USE cp_dbcsr_contrib, ONLY: dbcsr_dot
+   USE cp_dbcsr_cp2k_link, ONLY: cp_dbcsr_alloc_block_from_nbl
+   USE cp_dbcsr_operations, ONLY: copy_dbcsr_to_fm, &
+                                  copy_fm_to_dbcsr, &
+                                  copy_fm_to_dbcsr_bc, &
+                                  cp_dbcsr_sm_fm_multiply, &
+                                  dbcsr_allocate_matrix_set
+   USE cp_fm_basic_linalg, ONLY: cp_fm_column_scale, &
+                                 cp_fm_scale_and_add, &
+                                 cp_fm_symm, &
+                                 cp_fm_uplo_to_full
+   USE cp_fm_cholesky, ONLY: cp_fm_cholesky_reduce, &
+                             cp_fm_cholesky_restore
+   USE cp_fm_diag, ONLY: FM_DIAG_TYPE_CUSOLVER, &
+                         FM_DIAG_TYPE_DLAF, &
+                         choose_eigv_solver, &
+                         cp_fm_geeig, &
+                         cp_fm_geeig_canon, &
+                         diag_check_requested, &
+                         diag_type, &
+                         direct_generalized_diagonalization
+   USE cp_fm_pool_types, ONLY: cp_fm_pool_p_type, &
+                               fm_pool_create_fm, &
+                               fm_pool_get_el_struct, &
+                               fm_pool_give_back_fm
+   USE cp_fm_struct, ONLY: cp_fm_struct_create, &
+                           cp_fm_struct_release, &
+                           cp_fm_struct_type
+   USE cp_fm_types, ONLY: &
+      copy_info_type, cp_fm_add_to_element, cp_fm_cleanup_copy_general, cp_fm_create, &
+      cp_fm_finish_copy_general, cp_fm_get_info, cp_fm_release, cp_fm_set_all, &
+      cp_fm_start_copy_general, cp_fm_to_fm, cp_fm_type
+   USE cp_log_handling, ONLY: cp_get_default_logger, &
+                              cp_logger_get_default_unit_nr, &
+                              cp_logger_type
+   USE cp_output_handling, ONLY: cp_print_key_finished_output, &
+                                 cp_print_key_unit_nr, &
+                                 debug_print_level
+   USE ieee_arithmetic, ONLY: ieee_is_finite
+#if defined(__HAS_IEEE_EXCEPTIONS)
+   USE ieee_exceptions, ONLY: ieee_status_type, ieee_get_status, ieee_set_status, &
+                              ieee_set_halting_mode, IEEE_ALL
+#endif
+   USE input_constants, ONLY: &
+      cholesky_dbcsr, cholesky_inverse, cholesky_off, cholesky_reduce, cholesky_restore, &
+      core_guess, diag_update_method_adiis, general_roks, high_spin_roks, ot_precond_full_all, &
+      ot_precond_full_kinetic, ot_precond_full_single_inverse, ot_precond_none, &
+      ot_precond_s_inverse, restart_guess
+   USE input_cp2k_kpoints, ONLY: lattice_fft_auto, &
+                                 lattice_fft_off, &
+                                 lattice_fft_on
+   USE input_section_types, ONLY: section_vals_get_subs_vals, &
+                                  section_vals_type
+   USE kinds, ONLY: dp, &
+                    int_8
+   USE kpoint_methods, ONLY: &
+      kp_transform_plan_create, kp_transform_plan_release, kp_transform_plan_type, &
+      kpoint_density_matrices, kpoint_density_transform, kpoint_set_mo_occupation, &
+      rskp_grid_type, rskp_transform, rskp_transform_grid_extract, rskp_transform_grid_prepare, &
+      rskp_transform_grid_release
+   USE kpoint_types, ONLY: get_kpoint_info, &
+                           kpoint_env_type, &
+                           kpoint_type
+   USE machine, ONLY: m_flush, &
+                      m_walltime
+   USE mathconstants, ONLY: gaussi, &
+                            twopi, &
+                            z_one, &
+                            z_zero
+   USE message_passing, ONLY: mp_para_env_type
+   USE parallel_gemm_api, ONLY: parallel_gemm
+   USE preconditioner, ONLY: dbcsr_pair_to_cfm, &
+                             make_preconditioner_complex_full_kinetic, &
+                             make_preconditioner_complex_full_s_inverse, &
+                             prepare_preconditioner, &
+                             restart_preconditioner
+   USE preconditioner_makes, ONLY: make_complex_full_all, &
+                                   make_complex_full_single_inverse
+   USE preconditioner_types, ONLY: destroy_preconditioner, &
+                                   init_preconditioner
+   USE qs_density_matrices, ONLY: calculate_density_matrix
+   USE qs_density_mixing_types, ONLY: direct_mixing_nr, &
+                                      dm_pulay_storage_release, &
+                                      gspace_mixing_nr, &
+                                      mixing_storage_type
+   USE qs_diis, ONLY: qs_diis_b_calc_err_kp, &
+                      qs_diis_b_check_i_alloc_kp, &
+                      qs_diis_b_clear, &
+                      qs_diis_b_clear_kp, &
+                      qs_diis_b_info_kp, &
+                      qs_diis_b_step, &
+                      qs_diis_b_step_kp
+   USE qs_energy_types, ONLY: qs_energy_type
+   USE qs_environment_types, ONLY: get_qs_env, &
+                                   qs_environment_type
+   USE qs_gspace_mixing, ONLY: gspace_mixing
+   USE qs_kpoint_operators, ONLY: &
+      kpoint_operator_cfm_to_mo, kpoint_operator_context_create, &
+      kpoint_operator_context_release, kpoint_operator_context_type, kpoint_operator_finish, &
+      kpoint_operator_get, kpoint_operator_start, kpoint_slot_ks, kpoint_slot_s, kpoint_slot_t, &
+      kpoint_spin_free
+   USE qs_ks_methods, ONLY: qs_ks_update_qs_env
+   USE qs_ks_types, ONLY: qs_ks_did_change, &
+                          qs_ks_env_type
+   USE qs_matrix_pools, ONLY: mpools_get, &
+                              qs_matrix_pools_type
+   USE qs_mixing_utils, ONLY: charge_mixing_init, &
+                              mixing_allocate, &
+                              mixing_init, &
+                              self_consistency_check
+   USE qs_mo_methods, ONLY: calculate_subspace_eigenvalues
+   USE qs_mo_occupation, ONLY: set_mo_occupation
+   USE qs_mo_types, ONLY: get_mo_set, &
+                          mo_set_type
+   USE qs_neighbor_list_types, ONLY: neighbor_list_set_p_type
+   USE qs_ot_eigensolver, ONLY: ot_eigensolver, &
+                                ot_eigensolver_complex
+   USE qs_rho_atom_types, ONLY: rho_atom_type
+   USE qs_rho_methods, ONLY: qs_rho_update_rho
+   USE qs_rho_types, ONLY: qs_rho_get, &
+                           qs_rho_type
+   USE qs_scf_block_davidson, ONLY: generate_extended_space, &
+                                    generate_extended_space_c, &
+                                    generate_extended_space_sparse
+   USE qs_scf_lanczos, ONLY: lanczos_refinement, &
+                             lanczos_refinement_2v
+   USE qs_scf_methods, ONLY: combine_ks_matrices, &
+                             eigensolver, &
+                             eigensolver_dbcsr, &
+                             eigensolver_generalized, &
+                             eigensolver_simple, &
+                             eigensolver_symm, &
+                             scf_env_density_mixing
+   USE qs_scf_types, ONLY: qs_scf_env_type, &
+                           subspace_env_type
+   USE scf_control_types, ONLY: scf_control_type
 
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, &
 !$                    omp_get_thread_num
@@ -3822,8 +3826,8 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: iw
       LOGICAL, INTENT(INOUT)                             :: density_full_step
 
-      INTEGER                                            :: ic, ik, ispin, nelectron_total, nkp, &
-                                                            nspin, opposite
+      INTEGER                                            :: ic, ik, ispin, nao, nelectron_total, &
+                                                            nkp, nspin, opposite
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: bad, do_kpoints, finite_trial, &
                                                             full_step, rejected, spectral_ok
@@ -3914,10 +3918,10 @@ CONTAINS
       IF (iw > 0) THEN
          WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| step ", scf_env%iter_count
          DO ispin = 1, nspin
-            WRITE (iw, '(T2,A,I2,3ES22.12)') "SCF_TRIAL| spin,input,output,trial Tr(PS) ", ispin, counts(ispin, :)
+            WRITE (iw, '(T2,A,I2,3ES22.12E3)') "SCF_TRIAL| spin,input,output,trial Tr(PS) ", ispin, counts(ispin, :)
          END DO
          ratio_step = SQRT(snorm2/MAX(rnorm2, TINY(1.0_dp)))
-         WRITE (iw, '(T2,A,5ES22.12)') "SCF_TRIAL| norms R,step,linear,extrapolation,step/R ", &
+         WRITE (iw, '(T2,A,5ES22.12E3)') "SCF_TRIAL| norms R,step,linear,extrapolation,step/R ", &
             SQRT(rnorm2), SQRT(snorm2), SQRT(linear_norm2), SQRT(extrap_norm2), ratio_step
       END IF
       bad = .NOT. finite_trial .OR. &
@@ -3929,6 +3933,11 @@ CONTAINS
       CALL cp_cfm_create(pk, fmstruct)
       CALL cp_cfm_create(sk, fmstruct)
       CALL cp_cfm_create(raw, fmstruct)
+      nao = pk%matrix_struct%nrow_global
+      IF (nao /= pk%matrix_struct%ncol_global) &
+         CALL cp_abort(__LOCATION__, "Pulay occupation diagnostics require a square AO matrix")
+      IF (iw > 0 .AND. scf_env%iter_count == 1) WRITE (iw, '(T2,A,3I8)') &
+         "SCF_TRIAL| AO dimension,stored rows,stored columns ", nao, SIZE(pk%local_data, 1), SIZE(pk%local_data, 2)
       nkp = 1
       IF (do_kpoints) THEN
          CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
@@ -3949,10 +3958,10 @@ CONTAINS
                CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
                CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
             END IF
-            CALL trial_occupation_bounds(pk%local_data, sk%local_data, &
+            CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
                                          scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
                                          occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
-            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12,L3)') &
+            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12E3,L3)') &
                "SCF_TRIAL| k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
                occmin, occmax, normalized_trace, hermitian_error, spectral_ok
             bad = bad .OR. .NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
@@ -3970,10 +3979,10 @@ CONTAINS
                END IF
                pk%local_data = pk%local_data + raw%local_data
             END IF
-            CALL trial_occupation_bounds(pk%local_data, sk%local_data, &
+            CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
                                          scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
                                          occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
-            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12,L3)') &
+            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12E3,L3)') &
                "SCF_TRIAL| raw-output k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
                occmin, occmax, normalized_trace, hermitian_error, spectral_ok
 
@@ -4031,10 +4040,10 @@ CONTAINS
                   CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
                   CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
                END IF
-               CALL trial_occupation_bounds(pk%local_data, sk%local_data, &
+               CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
                                             scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
                                             occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
-               IF (iw > 0) WRITE (iw, '(T2,A,2I6,2ES22.12,L3)') &
+               IF (iw > 0) WRITE (iw, '(T2,A,2I6,2ES22.12E3,L3)') &
                   "SCF_TRIAL| fallback k,spin,min,max,finite ", ik, ispin, occmin, occmax, spectral_ok
                IF (.NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
                    occmax > 1.0_dp + store%dm_trial_occ_tol) CALL cp_abort(__LOCATION__, &
@@ -4052,7 +4061,7 @@ CONTAINS
             CALL cp_abort(__LOCATION__, "Linear Pulay fallback has the wrong electron count")
          store%dm_pulay_ncall = 0
          store%dm_trial_fallback = .TRUE.
-         IF (iw > 0) WRITE (iw, '(T2,A,I6,ES22.12,L3)') &
+         IF (iw > 0) WRITE (iw, '(T2,A,I6,ES22.12E3,L3)') &
             "SCF_TRIAL| rejected,common-linear-alpha,invalid-domain ", scf_env%iter_count, fallback_alpha, bad
       END IF
       IF (do_kpoints) THEN
@@ -4091,6 +4100,9 @@ CONTAINS
       INTEGER                                            :: first, i, info, j, n, nr
       REAL(KIND=dp), ALLOCATABLE                         :: eig(:), rwork(:)
 
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      TYPE(ieee_status_type) :: saved_status
+#endif
       n = SIZE(p, 1)
       occmin = 0.0_dp
       occmax = 0.0_dp
@@ -4102,6 +4114,10 @@ CONTAINS
       hermitian_error = MAXVAL(ABS(p - CONJG(TRANSPOSE(p))))
       ALLOCATE (metric(n, n), eig(n), work(MAX(1, 2*n)), rwork(MAX(1, 3*n)))
       metric = s
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_get_status(saved_status)
+      CALL ieee_set_halting_mode(IEEE_ALL, .FALSE.)
+#endif
       IF (canonical) THEN
          CALL zheev('V', 'U', n, metric, n, eig, work, SIZE(work), rwork, info)
          finite = info == 0
@@ -4148,6 +4164,9 @@ CONTAINS
             END IF
          END IF
       END IF
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_set_status(saved_status)
+#endif
       IF (ALLOCATED(physical)) DEALLOCATE (physical)
       DEALLOCATE (metric, eig, work, rwork)
    END SUBROUTINE trial_occupation_bounds

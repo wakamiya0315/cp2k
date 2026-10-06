@@ -17,47 +17,51 @@
 !>        new subroutine shift_unocc_mos (03.2016, Sergey Chulkov)
 ! **************************************************************************************************
 MODULE qs_scf_methods
-   USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_desymmetrize, dbcsr_get_block_p, &
-        dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
-        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_scale, &
-        dbcsr_type
-   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot,&
-                                              dbcsr_maxabs
-   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
-                                              cp_dbcsr_sm_fm_multiply
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
-                                              cp_fm_symm,&
-                                              cp_fm_triangular_multiply,&
-                                              cp_fm_uplo_to_full
-   USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_reduce,&
-                                              cp_fm_cholesky_restore
-   USE cp_fm_diag,                      ONLY: choose_eigv_solver,&
-                                              cp_fm_block_jacobi,&
-                                              cp_fm_geeig
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
-                                              cp_fm_struct_equivalent,&
-                                              cp_fm_struct_release,&
-                                              cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: cp_fm_create,&
-                                              cp_fm_get_info,&
-                                              cp_fm_release,&
-                                              cp_fm_to_fm,&
-                                              cp_fm_type
-   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
-   USE ieee_arithmetic,                 ONLY: ieee_is_finite
-   USE input_constants,                 ONLY: cholesky_inverse,&
-                                              cholesky_off,&
-                                              cholesky_reduce,&
-                                              cholesky_restore
-   USE kinds,                           ONLY: dp
-   USE mathlib,                         ONLY: invert_matrix
-   USE message_passing,                 ONLY: mp_para_env_type
-   USE parallel_gemm_api,               ONLY: parallel_gemm
-   USE qs_density_mixing_types,         ONLY: dm_pulay_storage_release,&
-                                              mixing_storage_type
-   USE qs_mo_types,                     ONLY: get_mo_set,&
-                                              mo_set_type
+   USE cp_dbcsr_api, ONLY: &
+      dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_desymmetrize, dbcsr_get_block_p, &
+      dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
+      dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_scale, &
+      dbcsr_type
+   USE cp_dbcsr_contrib, ONLY: dbcsr_dot, &
+                               dbcsr_maxabs
+   USE cp_dbcsr_operations, ONLY: copy_dbcsr_to_fm, &
+                                  cp_dbcsr_sm_fm_multiply
+   USE cp_fm_basic_linalg, ONLY: cp_fm_column_scale, &
+                                 cp_fm_symm, &
+                                 cp_fm_triangular_multiply, &
+                                 cp_fm_uplo_to_full
+   USE cp_fm_cholesky, ONLY: cp_fm_cholesky_reduce, &
+                             cp_fm_cholesky_restore
+   USE cp_fm_diag, ONLY: choose_eigv_solver, &
+                         cp_fm_block_jacobi, &
+                         cp_fm_geeig
+   USE cp_fm_struct, ONLY: cp_fm_struct_create, &
+                           cp_fm_struct_equivalent, &
+                           cp_fm_struct_release, &
+                           cp_fm_struct_type
+   USE cp_fm_types, ONLY: cp_fm_create, &
+                          cp_fm_get_info, &
+                          cp_fm_release, &
+                          cp_fm_to_fm, &
+                          cp_fm_type
+   USE cp_log_handling, ONLY: cp_logger_get_default_io_unit
+   USE ieee_arithmetic, ONLY: ieee_is_finite
+#if defined(__HAS_IEEE_EXCEPTIONS)
+   USE ieee_exceptions, ONLY: ieee_status_type, ieee_get_status, ieee_set_status, &
+                              ieee_set_halting_mode, IEEE_ALL
+#endif
+   USE input_constants, ONLY: cholesky_inverse, &
+                              cholesky_off, &
+                              cholesky_reduce, &
+                              cholesky_restore
+   USE kinds, ONLY: dp
+   USE mathlib, ONLY: invert_matrix
+   USE message_passing, ONLY: mp_para_env_type
+   USE parallel_gemm_api, ONLY: parallel_gemm
+   USE qs_density_mixing_types, ONLY: dm_pulay_storage_release, &
+                                      mixing_storage_type
+   USE qs_mo_types, ONLY: get_mo_set, &
+                          mo_set_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -1417,6 +1421,9 @@ CONTAINS
       REAL(KIND=dp)                                      :: condition1, condition2
       REAL(KIND=dp), ALLOCATABLE                         :: eig(:), gram(:, :), work(:)
 
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      TYPE(ieee_status_type) :: saved_status
+#endif
       iw = cp_logger_get_default_io_unit()
       n = SIZE(g)
       IF (.NOT. ALL(ieee_is_finite(a)) .OR. .NOT. ALL(ieee_is_finite(b)) .OR. &
@@ -1430,13 +1437,20 @@ CONTAINS
       DO i = 1, n
          gram(i, i) = gram(i, i) - mixing_store%broy_w0
       END DO
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_get_status(saved_status)
+      CALL ieee_set_halting_mode(IEEE_ALL, .FALSE.)
+#endif
       CALL dsyev('N', 'U', n, gram, n, eig, work, SIZE(work), info)
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_set_status(saved_status)
+#endif
       condition2 = HUGE(1.0_dp)
       IF (info == 0 .AND. MINVAL(eig) > 0.0_dp) condition2 = MAXVAL(eig)/MINVAL(eig)
       IF (iw > 0) THEN
-         WRITE (iw, '(T2,A,I6,2ES22.12)') "SCF_TRIAL| history,raw-cond2,regularized-cond1 ", &
+         WRITE (iw, '(T2,A,I6,2ES22.12E3)') "SCF_TRIAL| history,raw-cond2,regularized-cond1 ", &
             n, condition2, condition1
-         WRITE (iw, '(T2,A,*(ES22.12))') "SCF_TRIAL| coefficients ", g
+         WRITE (iw, '(T2,A,*(ES22.12E3))') "SCF_TRIAL| coefficients ", g
       END IF
       DEALLOCATE (gram, eig, work)
    END SUBROUTINE trial_history_report
