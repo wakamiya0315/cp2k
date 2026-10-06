@@ -3311,6 +3311,7 @@ CONTAINS
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(qs_charges_type), POINTER                     :: qs_charges
       TYPE(qs_rho_type), POINTER                         :: rho
       TYPE(scf_control_type), POINTER                    :: scf_control
 
@@ -3318,7 +3319,7 @@ CONTAINS
       IF (dft_control%nspins /= 2 .OR. dft_control%roks) RETURN
       IF (.NOT. scf_control%smear%do_smear) RETURN
       IF (.NOT. separate_smear_spins(scf_control%smear)) RETURN
-      CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, mos=mos, matrix_s_kp=matrix_s, do_kpoints=do_kpoints)
+      CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, mos=mos, matrix_s_kp=matrix_s, do_kpoints=do_kpoints, qs_charges=qs_charges)
       CALL qs_rho_get(rho, rho_ao_kp=rho_ao, tot_rho_r=tot_rho_r)
       occupation_count = 0.0_dp
       IF (do_kpoints) THEN
@@ -3352,7 +3353,12 @@ CONTAINS
       DO ispin = 1, 2
          tolerance = MAX(1.0E-6_dp, &
                          10.0_dp*scf_control%smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin)))
-         grid_count = ABS(tot_rho_r(ispin))
+         ! GAPW's regular grid is the soft density; add the spin-resolved one-center correction.
+         ! GAPW_XC and GPW keep the physical electronic density on the regular grid.
+         grid_count = tot_rho_r(ispin)
+         IF (dft_control%qs_control%gapw) grid_count = grid_count + &
+                                                       qs_charges%total_rho1_hard(ispin) - qs_charges%total_rho1_soft(ispin)
+         grid_count = ABS(grid_count)
          IF (iw > 0) WRITE (iw, '(T2,A,I2,4ES22.12)') &
             "FIXED_MOMENT| spin,target,occupation,Tr(PS),grid ", ispin, nel_spin(ispin), &
             occupation_count(ispin), trace_count(ispin), grid_count
