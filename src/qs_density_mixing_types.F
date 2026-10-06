@@ -247,7 +247,8 @@ CONTAINS
       IF (mixing_store%dm_trial_diagnostics) THEN
          IF (.NOT. mixing_store%dm_pulay) CALL cp_abort(__LOCATION__, &
                                                         "PULAY_P trial checks require DIRECT_P_MIXING with PULAY_P")
-         CPASSERT(mixing_store%dm_trial_occ_tol >= 0.0_dp .AND. mixing_store%dm_trial_charge_tol >= 0.0_dp)
+         CPASSERT(mixing_store%dm_trial_occ_tol >= 0.0_dp)
+         CPASSERT(mixing_store%dm_trial_charge_tol >= 0.0_dp)
          CPASSERT(mixing_store%dm_trial_step_limit >= 0.0_dp)
          CPASSERT(mixing_store%alpha > 0.0_dp .AND. mixing_store%alpha <= 1.0_dp)
       END IF
