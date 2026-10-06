@@ -172,15 +172,29 @@ MODULE qs_vxc_atom
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: row_first
    END TYPE cross_candidate_list_type
 
+   ! Points of the atom grid of one kind relative to its atom, as the atom-composite route builds
+   ! them: the radii (bohr) and the sines and cosines of the polar and azimuthal angles.
+   TYPE composite_kind_grid_type
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: rad
+      ! sin_pol, cos_pol, sin_azi and cos_azi of every direction, (4, ng_sphere)
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: angles
+   END TYPE composite_kind_grid_type
+
    ! Geometry-only quantities of the atom-composite route, kept between calls (SCF steps). The key
-   ! holds everything they depend on; any change of it discards them.
+   ! holds everything they depend on; any change of it discards them. The grids enter through
+   ! their points, not through counts or sums: a rotation of the Lebedev grids
+   ! (QS%LEBEDEV_GRID_ROTATION) keeps every count and every sum of radii and weights, while the
+   ! cached values belong to grid rows. The cache is a module variable, so the end of a force
+   ! environment empties it as well (release_composite_geometry_cache).
    TYPE composite_geometry_cache_type
       LOGICAL                                            :: partition_ready = .FALSE.
       INTEGER                                            :: mepos = -1, num_pe = -1
       INTEGER, DIMENSION(3)                              :: perd = -1
       REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat = 0.0_dp
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_end, atom_kind, atom_start
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: atom_coords, kind_grid
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: atom_coords
+      TYPE(composite_kind_grid_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: kind_grid
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: partition_weight
       TYPE(cross_candidate_list_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: cross
@@ -190,7 +204,8 @@ MODULE qs_vxc_atom
 
    PUBLIC :: calculate_vxc_atom, &
              calculate_vxc_atom_epr, &
-             gapw_cdft_one_center
+             gapw_cdft_one_center, &
+             release_composite_geometry_cache
 
 ! **************************************************************************************************
 
@@ -4085,10 +4100,20 @@ CONTAINS
    END SUBROUTINE release_composite_geometry
 
 ! **************************************************************************************************
-!> \brief Keep the geometry cache if the atoms, the cell, the atomic grids and the distribution of
-!>        the atom grids over the ranks are those it was built for; otherwise empty it and store
-!>        the new key. Values are compared exactly, so any displacement of an atom or any strain
-!>        of the cell (geometry optimisation, finite differences, stress) rebuilds the cache.
+!> \brief Empty the geometry cache of the atom-composite route at the end of a force environment,
+!>        so that no later environment of the process meets values it did not compute.
+! **************************************************************************************************
+   SUBROUTINE release_composite_geometry_cache()
+
+      CALL release_composite_geometry(composite_geometry)
+   END SUBROUTINE release_composite_geometry_cache
+
+! **************************************************************************************************
+!> \brief Keep the geometry cache if the atoms, the cell, the points of the atomic grids and the
+!>        distribution of the atom grids over the ranks are those it was built for; otherwise
+!>        empty it and store the new key. Values are compared exactly, so any displacement of an
+!>        atom, any strain of the cell (geometry optimisation, finite differences, stress) and any
+!>        turn of the grids rebuilds the cache.
 !> \param cache ...
 !> \param atom_coords coordinates of all atoms (bohr)
 !> \param cell ...
@@ -4107,51 +4132,69 @@ CONTAINS
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: kind_set
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
-      INTEGER                                            :: ikind, natom, nkind
+      INTEGER                                            :: ikind, na, natom, nkind, nr
       LOGICAL                                            :: same
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: kind_grid
+      TYPE(composite_kind_grid_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: kind_grid
       TYPE(grid_atom_type), POINTER                      :: grid_atom
 
       natom = SIZE(atom_coords, 2)
       nkind = SIZE(kind_set)
-      ! The grids enter through their sizes and the sums of their radii and weights.
-      ALLOCATE (kind_grid(4, nkind))
-      kind_grid = 0.0_dp
+      ! The grids enter through the points that the atom-composite route builds from them.
+      ALLOCATE (kind_grid(nkind))
       DO ikind = 1, nkind
+         nr = 0
+         na = 0
          NULLIFY (grid_atom)
          CALL get_qs_kind(kind_set(ikind), grid_atom=grid_atom)
-         IF (.NOT. ASSOCIATED(grid_atom)) CYCLE
-         IF (.NOT. (ASSOCIATED(grid_atom%rad) .AND. ASSOCIATED(grid_atom%weight))) CYCLE
-         kind_grid(:, ikind) = [REAL(grid_atom%nr, dp), REAL(grid_atom%ng_sphere, dp), &
-                                SUM(grid_atom%rad(1:grid_atom%nr)), SUM(grid_atom%weight)]
+         IF (ASSOCIATED(grid_atom)) THEN
+            IF (ASSOCIATED(grid_atom%rad) .AND. ASSOCIATED(grid_atom%cos_azi)) THEN
+               nr = grid_atom%nr
+               na = grid_atom%ng_sphere
+            END IF
+         END IF
+         ALLOCATE (kind_grid(ikind)%rad(nr), kind_grid(ikind)%angles(4, na))
+         IF (nr > 0) kind_grid(ikind)%rad(:) = grid_atom%rad(1:nr)
+         IF (na > 0) THEN
+            kind_grid(ikind)%angles(1, :) = grid_atom%sin_pol(1:na)
+            kind_grid(ikind)%angles(2, :) = grid_atom%cos_pol(1:na)
+            kind_grid(ikind)%angles(3, :) = grid_atom%sin_azi(1:na)
+            kind_grid(ikind)%angles(4, :) = grid_atom%cos_azi(1:na)
+         END IF
       END DO
 
       same = ALLOCATED(cache%atom_coords)
       IF (same) same = SIZE(cache%atom_coords, 2) == natom .AND. &
-                       SIZE(cache%kind_grid, 2) == nkind
+                       SIZE(cache%kind_grid) == nkind
       IF (same) same = ALL(cache%atom_coords == atom_coords) .AND. &
                        ALL(cache%hmat == cell%hmat) .AND. ALL(cache%perd == cell%perd) .AND. &
                        ALL(cache%atom_start == atom_start) .AND. &
                        ALL(cache%atom_end == atom_end) .AND. &
                        ALL(cache%atom_kind == atom_kind) .AND. &
-                       ALL(cache%kind_grid == kind_grid) .AND. &
                        cache%num_pe == para_env%num_pe .AND. cache%mepos == para_env%mepos
+      DO ikind = 1, nkind
+         IF (.NOT. same) EXIT
+         same = SIZE(cache%kind_grid(ikind)%rad) == SIZE(kind_grid(ikind)%rad) .AND. &
+                SIZE(cache%kind_grid(ikind)%angles, 2) == SIZE(kind_grid(ikind)%angles, 2)
+         IF (same) same = ALL(cache%kind_grid(ikind)%rad == kind_grid(ikind)%rad) .AND. &
+                          ALL(cache%kind_grid(ikind)%angles == kind_grid(ikind)%angles)
+      END DO
       IF (.NOT. same) THEN
          CALL release_composite_geometry(cache)
          ALLOCATE (cache%atom_coords(3, natom), cache%atom_start(natom), cache%atom_end(natom), &
-                   cache%atom_kind(natom), cache%kind_grid(4, nkind), cache%cross(natom))
+                   cache%atom_kind(natom), cache%cross(natom))
          cache%atom_coords = atom_coords
          cache%atom_start = atom_start
          cache%atom_end = atom_end
          cache%atom_kind = atom_kind
-         cache%kind_grid = kind_grid
+         CALL MOVE_ALLOC(kind_grid, cache%kind_grid)
          cache%hmat = cell%hmat
          cache%perd = cell%perd
          cache%num_pe = para_env%num_pe
          cache%mepos = para_env%mepos
          ALLOCATE (cache%partition_weight(MAXVAL([0, atom_end])))
       END IF
-      DEALLOCATE (kind_grid)
+      IF (ALLOCATED(kind_grid)) DEALLOCATE (kind_grid)
    END SUBROUTINE update_composite_geometry_key
 
 ! **************************************************************************************************

@@ -137,6 +137,7 @@ MODULE f77_interface
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_env_create,&
                                               qs_environment_type
+   USE qs_vxc_atom,                     ONLY: release_composite_geometry_cache
    USE reference_manager,               ONLY: remove_all_references
    USE sirius_interface,                ONLY: cp_sirius_finalize,&
                                               cp_sirius_init,&
@@ -1018,6 +1019,8 @@ CONTAINS
       CPASSERT(ASSOCIATED(globenv))
       NULLIFY (f_env%force_env%globenv)
       CALL f_env_dealloc(f_env)
+      ! Native-grid Skala keeps geometry data of its atom-composite route in a module variable
+      CALL release_composite_geometry_cache()
       IF (PRESENT(q_finalize)) THEN
          CALL cp2k_finalize(root_section, para_env, globenv, f_env%old_path, q_finalize)
       ELSE
