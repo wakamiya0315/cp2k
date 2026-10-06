@@ -45,7 +45,7 @@ MODULE qs_mo_occupation
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_mo_occupation'
 
-   PUBLIC :: set_mo_occupation
+   PUBLIC :: set_mo_occupation, fixed_spin_targets, separate_smear_spins
 
    INTERFACE set_mo_occupation
       MODULE PROCEDURE set_mo_occupation_1, set_mo_occupation_2
@@ -904,13 +904,19 @@ CONTAINS
             mo_set%homo = nmo
          END SELECT
 
-         ! Check, if the smearing involves more than one MO
-         IF (mo_set%lfomo == mo_set%homo) THEN
-            mo_set%homo = nomo
-            mo_set%lfomo = nomo + 1
-         ELSE
-            mo_set%uniform_occupation = .FALSE.
-         END IF
+         ! Occupied bounds also govern P and the energy-weighted force density W.
+         ! A single fractional orbital must not be replaced by the integer reference HOMO.
+         ! Keep the existing occupation cutoff, including negative MP/MV occupations.
+         mo_set%homo = 0
+         mo_set%lfomo = nmo + 1
+         DO imo = 1, nmo
+            IF (ABS(mo_set%occupation_numbers(imo)) > smear%eps_fermi_dirac) mo_set%homo = imo
+            IF (ABS(mo_set%occupation_numbers(imo) - mo_set%maxocc) > smear%eps_fermi_dirac) &
+               mo_set%lfomo = MIN(mo_set%lfomo, imo)
+         END DO
+         is_large = ABS(nelec - accurate_sum(mo_set%occupation_numbers(1:mo_set%homo))) > &
+                    smear%eps_fermi_dirac*MAX(1.0_dp, nelec)
+         CPWARN_IF(is_large .AND. my_emit_warnings, "Retained density occupations differ from the electron target")
 
       END IF ! do smear
 
@@ -921,5 +927,34 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE set_mo_occupation_1
+
+! **************************************************************************************************
+!> \brief Whether smearing fixes separate spin populations, with the Gamma semantics.
+!> \param smear ...
+   LOGICAL FUNCTION separate_smear_spins(smear)
+      TYPE(smear_type), INTENT(IN) :: smear
+      separate_smear_spins = smear%fixed_mag_mom >= 0.0_dp .OR. smear%fixed_mag_mom == -1.0_dp
+   END FUNCTION separate_smear_spins
+
+! **************************************************************************************************
+!> \brief Spin targets: a real nonnegative moment, or the initial integer counts for -1.
+!> \param smear ...
+!> \param ne_a ...
+!> \param ne_b ...
+!> \param nel_spin ...
+   SUBROUTINE fixed_spin_targets(smear, ne_a, ne_b, nel_spin)
+      TYPE(smear_type), INTENT(IN) :: smear
+      INTEGER, INTENT(IN) :: ne_a, ne_b
+      REAL(KIND=dp), DIMENSION(2), INTENT(OUT) :: nel_spin
+      REAL(KIND=dp) :: ne_total
+      nel_spin = REAL([ne_a, ne_b], KIND=dp)
+      IF (smear%do_smear .AND. smear%fixed_mag_mom >= 0.0_dp) THEN
+         ne_total = REAL(ne_a + ne_b, KIND=dp)
+         IF (smear%fixed_mag_mom > ne_total) &
+            CPABORT("FIXED_MAGNETIC_MOMENT exceeds the total electron count")
+         nel_spin(1) = 0.5_dp*(ne_total + smear%fixed_mag_mom)
+         nel_spin(2) = 0.5_dp*(ne_total - smear%fixed_mag_mom)
+      END IF
+   END SUBROUTINE fixed_spin_targets
 
 END MODULE qs_mo_occupation

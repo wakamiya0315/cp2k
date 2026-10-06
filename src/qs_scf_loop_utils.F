@@ -83,7 +83,9 @@ MODULE qs_scf_loop_utils
                                               qs_ks_env_type
    USE qs_linres_kernel,                ONLY: apply_hxc_kernel_kp
    USE qs_mixing_utils,                 ONLY: self_consistency_check
-   USE qs_mo_occupation,                ONLY: set_mo_occupation
+   USE qs_mo_occupation,                ONLY: fixed_spin_targets,&
+                                              separate_smear_spins,&
+                                              set_mo_occupation
    USE qs_mo_types,                     ONLY: get_mo_set,&
                                               mo_set_type
    USE qs_mom_methods,                  ONLY: do_mom_diag
@@ -1809,7 +1811,7 @@ CONTAINS
       INTEGER                                            :: energy_start, ikpoint, ispin, &
                                                             local_channel, local_kpoint, ne_a, &
                                                             ne_b, nelectron, nkpoint, nmo
-      REAL(KIND=dp)                                      :: kTS, mu, nel, sigma
+      REAL(KIND=dp)                                      :: kTS, mu, nel, sigma, nel_spin(2)
       REAL(KIND=dp), DIMENSION(2)                        :: mus
       TYPE(kpoint_env_type), POINTER                     :: kp
 
@@ -1829,7 +1831,11 @@ CONTAINS
       CALL get_mo_set(kp%mos(1, 1), nelectron=nelectron, nmo=nmo)
       ne_a = nelectron
       ne_b = 0
-      IF (nspin_energy == 2) CALL get_mo_set(kp%mos(1, 2), nelectron=ne_b)
+      IF (nspin_energy == 2) THEN
+         CALL get_mo_set(kp%mos(1, 2), nelectron=ne_b)
+         CALL fixed_spin_targets(smear, ne_a, ne_b, nel_spin)
+         ! ROKS retains its explicit spin counts when no fixed-M target is requested.
+      END IF
 
       ALLOCATE (trial_eigenvalues(nmo, nkpoint, nspin_energy))
       ALLOCATE (trial_occupation(nmo, nkpoint, nspin_energy))
@@ -1857,12 +1863,12 @@ CONTAINS
          nel = REAL(nelectron, KIND=dp)
          CALL Smearkp(trial_occupation(:, :, 1), mus(1), trial_kTS, &
                       trial_eigenvalues(:, :, 1), nel, wkp, sigma, 2.0_dp, smear%method)
-      ELSE IF (restricted_roks .OR. smear%fixed_mag_mom > 0.0_dp) THEN
-         nel = REAL(ne_a, KIND=dp)
+      ELSE IF (restricted_roks .OR. separate_smear_spins(smear)) THEN
+         nel = nel_spin(1)
          CALL Smearkp(trial_occupation(:, :, 1), mus(1), kTS, &
                       trial_eigenvalues(:, :, 1), nel, wkp, sigma, 1.0_dp, smear%method)
          trial_kTS = kTS
-         nel = REAL(ne_b, KIND=dp)
+         nel = nel_spin(2)
          CALL Smearkp(trial_occupation(:, :, 2), mus(2), kTS, &
                       trial_eigenvalues(:, :, 2), nel, wkp, sigma, 1.0_dp, smear%method)
          trial_kTS = trial_kTS + kTS
@@ -1929,7 +1935,7 @@ CONTAINS
 
       ngroups = 1
       IF (restricted_roks .OR. &
-          (nspin_energy == 2 .AND. smear%fixed_mag_mom > 0.0_dp)) ngroups = 2
+          (nspin_energy == 2 .AND. separate_smear_spins(smear))) ngroups = 2
       nmo = SIZE(trial_eigenvalues, 1)
       ALLOCATE (fixed_n_residual(ngroups), fixed_n_weight(ngroups), &
                 preconditioner_count(ngroups), preconditioner_shift(ngroups), &
@@ -2168,7 +2174,7 @@ CONTAINS
       END DO
 
       ngroups = 1
-      IF (nspin_ot == 2 .AND. smear%fixed_mag_mom > 0.0_dp) ngroups = 2
+      IF (nspin_ot == 2 .AND. separate_smear_spins(smear)) ngroups = 2
       shadow_pending = local_ot_env(1)%response_shadow_pending
       ALLOCATE (coupling(nrotation), curvature_sum(ngroups), energy_count(ngroups), &
                 energy_mean(ngroups), energy_metric_step(nmo), energy_shift(ngroups), &

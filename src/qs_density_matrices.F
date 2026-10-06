@@ -105,6 +105,7 @@ CONTAINS
 
       CALL dbcsr_set(density_matrix, 0.0_dp)
 
+      ! HOMO is the bound of the actual occupation array, including a lone fractional orbital.
       IF (.NOT. mo_set%uniform_occupation) THEN ! not all orbitals 1..homo are equally occupied
          IF (my_use_dbcsr) THEN
             CALL dbcsr_copy(dbcsr_tmp, mo_set%mo_coeff_b)
@@ -173,6 +174,7 @@ CONTAINS
       CALL cp_fm_create(weighted_vectors, mo_set%mo_coeff%matrix_struct, "weighted_vectors")
       CALL cp_fm_to_fm(mo_set%mo_coeff, weighted_vectors)
 
+      ! Use the same occupation bound as P, including a lone fractional orbital in W.
       ! scale every column with the occupation
       ALLOCATE (eigocc(mo_set%homo))
 
