@@ -10,14 +10,9 @@
 MODULE qs_scf_loop_utils
    USE cp_control_types,                ONLY: dft_control_type,&
                                               hairy_probes_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_copy,&
-                                              dbcsr_get_info,&
-                                              dbcsr_p_type,&
-                                              dbcsr_release,&
-                                              dbcsr_release_p,&
-                                              dbcsr_scale,&
-                                              dbcsr_set,&
-                                              dbcsr_type
+   USE cp_dbcsr_api,                    ONLY: &
+        dbcsr_add, dbcsr_copy, dbcsr_get_info, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
+        dbcsr_scale, dbcsr_set, dbcsr_type
    USE cp_dbcsr_contrib,                ONLY: dbcsr_dot,&
                                               dbcsr_get_diag,&
                                               dbcsr_scale_by_vector
