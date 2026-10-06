@@ -499,11 +499,22 @@ CONTAINS
       CPASSERT(ASSOCIATED(mo_set%occupation_numbers))
       mo_set%occupation_numbers(:) = 0.0_dp
 
-      ! Quick return, if no electrons are available
-      IF (mo_set%nelectron == 0) THEN
+      ! A fixed real spin target can populate an initially empty channel or empty a populated one.
+      ! Use that target for the reference occupations and the zero-electron shortcut.
+      my_nelec = REAL(mo_set%nelectron, KIND=dp)
+      IF (PRESENT(smear)) THEN
+         IF (smear%do_smear .AND. smear%fixed_mag_mom >= 0.0_dp) my_nelec = mo_set%n_el_f
+      END IF
+      IF (my_nelec == 0.0_dp) THEN
+         mo_set%homo = 0
+         mo_set%lfomo = 1
+         mo_set%uniform_occupation = .FALSE.
+         mo_set%kTS = 0.0_dp
          CALL timestop(handle)
          RETURN
       END IF
+      IF (my_nelec < 0.0_dp .OR. my_nelec > SIZE(mo_set%occupation_numbers)*mo_set%maxocc) &
+         CALL cp_abort(__LOCATION__, "Fixed spin population is outside the available orbital capacity")
 
       xas_estate = -1
       occ_estate = 0.0_dp
@@ -569,16 +580,9 @@ CONTAINS
             RETURN
          END IF
 
-         IF (MODULO(mo_set%nelectron, INT(mo_set%maxocc)) == 0) THEN
-            nomo = NINT(mo_set%nelectron/mo_set%maxocc)
-            ! Initialize MO occupations
-            mo_set%occupation_numbers(1:nomo) = mo_set%maxocc
-         ELSE
-            nomo = INT(mo_set%nelectron/mo_set%maxocc) + 1
-            ! Initialize MO occupations
-            mo_set%occupation_numbers(1:nomo - 1) = mo_set%maxocc
-            mo_set%occupation_numbers(nomo) = mo_set%nelectron - (nomo - 1)*mo_set%maxocc
-         END IF
+         nomo = CEILING(my_nelec/mo_set%maxocc)
+         mo_set%occupation_numbers(1:nomo) = mo_set%maxocc
+         mo_set%occupation_numbers(nomo) = my_nelec - REAL(nomo - 1, KIND=dp)*mo_set%maxocc
 ! introduce applied potential correction here
 ! electron density is adjusted according to applied core correction
 ! ref: SS, MT, MWF, JN PRL, 2018, 120, 246801
