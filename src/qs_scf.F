@@ -3389,7 +3389,7 @@ CONTAINS
    END SUBROUTINE qs_scf_trial_finite_probe
 
 ! **************************************************************************************************
-!> rief Capture F[P_in] before the raw diagonalization replaces the occupation entropy.
+!> \brief Capture F[P_in] before the raw diagonalization replaces the occupation entropy.
    SUBROUTINE qs_scf_free_input(qs_env, scf_env, control, iw)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
@@ -3426,7 +3426,7 @@ CONTAINS
    END SUBROUTINE qs_scf_free_input
 
 ! **************************************************************************************************
-!> rief Build every field, core trace and KS matrix from this same physical P; no shallow rollback.
+!> \brief Build every field, core trace and KS matrix from this same physical P; no shallow rollback.
    SUBROUTINE qs_scf_free_evaluate(qs_env, scf_env, control, bloch, free_energy, eks, valid)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
@@ -3456,9 +3456,9 @@ CONTAINS
    END SUBROUTINE qs_scf_free_evaluate
 
 ! **************************************************************************************************
-!> rief Strict non-increasing F acceptance, then a common raw-map direction if Pulay is not descent.
+!> \brief Strict non-increasing F acceptance, then a common raw-map direction if Pulay is not descent.
 !>
-   ote iter_delta is never replaced by the shortened step.Exhaustion is explicit failure.
+!> \note iter_delta is never replaced by the shortened step. Exhaustion is explicit failure.
    SUBROUTINE qs_scf_free_accept(qs_env, scf_env, control, iw, density_full_step)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
@@ -3580,7 +3580,7 @@ CONTAINS
    END SUBROUTINE qs_scf_free_accept
 
 ! **************************************************************************************************
-!> rief Fixed-P rebuild and forward energy derivatives in the certified physical segment.
+!> \brief Fixed-P rebuild and forward energy derivatives in the certified physical segment.
    SUBROUTINE qs_scf_free_validate(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env

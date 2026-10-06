@@ -4426,7 +4426,7 @@ CONTAINS
 !> \brief Apply the exact real-space Pulay coefficients and normalization to full Bloch densities.
 
 ! **************************************************************************************************
-!> rief Entropy of a certified complete ensemble and its actual real-space image.
+!> \brief Entropy of a certified complete ensemble and its actual real-space image.
 !> \param bloch full density, not an inverse transform of truncated real-space images
 !> \param entropy dimensionless S/k_B including spin normalization and k weights
 !> \param valid finite, physical bounds, Hermiticity, forward map and charge/spin certificate
