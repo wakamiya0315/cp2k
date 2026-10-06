@@ -121,6 +121,13 @@ MODULE qs_density_mixing_types
       LOGICAL                                           :: dm_pulay = .FALSE.
       LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
       REAL(KIND=dp) :: dm_trial_occ_tol = 1.0E-6_dp, dm_trial_charge_tol = 1.0E-6_dp, dm_trial_step_limit = 0.0_dp
+      ! Full Bloch companion: the same affine Pulay candidate, before real-space truncation.
+      ! Allocated only for opt-in one-rank diagnostics; never Fourier-invert a density as an operator.
+      INTEGER :: dm_trial_k_slot = 0
+      REAL(KIND=dp) :: dm_trial_k_norm = 0.0_dp
+      REAL(KIND=dp), ALLOCATABLE :: dm_trial_k_g(:)
+      COMPLEX(KIND=dp), ALLOCATABLE :: dm_trial_k_input(:, :, :, :), dm_trial_k_last(:, :, :, :), &
+                                       dm_trial_k_reslast(:, :, :, :), dm_trial_k_dp(:, :, :, :, :), dm_trial_k_dres(:, :, :, :, :)
       INTEGER                                           :: dm_pulay_ncall = 0
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: dm_pulay_p_last => NULL(), &
                                                            dm_pulay_res_last => NULL()
@@ -323,6 +330,10 @@ CONTAINS
       END IF
 
       CALL dm_pulay_storage_release(mixing_store)
+      IF (ALLOCATED(mixing_store%dm_trial_k_input)) DEALLOCATE (mixing_store%dm_trial_k_input, &
+                                                                mixing_store%dm_trial_k_last, mixing_store%dm_trial_k_reslast, &
+                                                                mixing_store%dm_trial_k_dp, mixing_store%dm_trial_k_dres)
+      IF (ALLOCATED(mixing_store%dm_trial_k_g)) DEALLOCATE (mixing_store%dm_trial_k_g)
       CALL release_field_storage(mixing_store)
 
       IF (ASSOCIATED(mixing_store%pulay_matrix)) THEN

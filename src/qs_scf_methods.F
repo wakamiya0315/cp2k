@@ -231,6 +231,11 @@ CONTAINS
       END IF
 
       mixing_store%dm_trial_fallback = .FALSE.
+      IF (mixing_store%dm_trial_diagnostics) THEN
+         mixing_store%dm_trial_k_slot = 0
+         mixing_store%dm_trial_k_norm = 0.0_dp
+         IF (ALLOCATED(mixing_store%dm_trial_k_g)) DEALLOCATE (mixing_store%dm_trial_k_g)
+      END IF
 
       ! residual R = P_out - P_in, kept in p_mix_new until the update
       DO ic = 1, nimg
@@ -296,6 +301,10 @@ CONTAINS
             END DO
          END DO
          norm = SQRT(norm)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_slot = ib
+            mixing_store%dm_trial_k_norm = norm
+         END IF
          IF (norm > 0.0_dp) THEN
             DO ic = 1, nimg
                DO ispin = 1, nspin
@@ -334,7 +343,10 @@ CONTAINS
          END DO
          CALL invert_matrix(a, b, inv_err)
          g = MATMUL(b, c)
-         IF (mixing_store%dm_trial_diagnostics) CALL trial_history_report(mixing_store, a, b, g)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_g = g
+            CALL trial_history_report(mixing_store, a, b, g)
+         END IF
       END IF
 
       ! keep P_in and R of this step, then form the next input in place of R
@@ -433,6 +445,11 @@ CONTAINS
       END IF
 
       mixing_store%dm_trial_fallback = .FALSE.
+      IF (mixing_store%dm_trial_diagnostics) THEN
+         mixing_store%dm_trial_k_slot = 0
+         mixing_store%dm_trial_k_norm = 0.0_dp
+         IF (ALLOCATED(mixing_store%dm_trial_k_g)) DEALLOCATE (mixing_store%dm_trial_k_g)
+      END IF
 
       ! residuals of both spins in p_mix_new
       DO ic = 1, nimg
@@ -510,6 +527,10 @@ CONTAINS
             END DO
          END DO
          norm = SQRT(norm)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_slot = ib
+            mixing_store%dm_trial_k_norm = norm
+         END IF
          IF (norm > 0.0_dp) THEN
             DO ic = 1, nimg
                DO ich = 1, nch
@@ -587,7 +608,10 @@ CONTAINS
          CALL invert_matrix(a, b, inv_err)
          g = MATMUL(b, c)
          IF (nch == 2 .AND. .NOT. joint_step) g(:) = g(:)/t(:)
-         IF (mixing_store%dm_trial_diagnostics) CALL trial_history_report(mixing_store, a, b, g)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_g = g
+            CALL trial_history_report(mixing_store, a, b, g)
+         END IF
       END IF
 
       ! steps of the total (Pulay) and spin (linear, or Pulay with PULAY_P_JOINT) density matrices,
