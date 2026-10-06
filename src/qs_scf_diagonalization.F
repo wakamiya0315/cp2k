@@ -4112,14 +4112,14 @@ CONTAINS
                ALL(ieee_is_finite(REAL(s))) .AND. ALL(ieee_is_finite(AIMAG(s)))
       IF (.NOT. finite) RETURN
       hermitian_error = MAXVAL(ABS(p - CONJG(TRANSPOSE(p))))
-      ALLOCATE (metric(n, n), eig(n), work(MAX(1, 2*n)), rwork(MAX(1, 3*n)))
+      ALLOCATE (metric(n, n), eig(n))
       metric = s
 #if defined(__HAS_IEEE_EXCEPTIONS)
       CALL ieee_get_status(saved_status)
       CALL ieee_set_halting_mode(IEEE_ALL, .FALSE.)
 #endif
       IF (canonical) THEN
-         CALL zheev('V', 'U', n, metric, n, eig, work, SIZE(work), rwork, info)
+         CALL trial_metric_heevd(metric, eig, info)
          finite = info == 0
          IF (finite) THEN
             first = 1
@@ -4139,7 +4139,7 @@ CONTAINS
             END IF
          END IF
       ELSE
-         CALL zpotrf('U', n, metric, n, info)
+         CALL zpotrf('U', n, metric(1, 1), n, info)
          finite = info == 0
          IF (finite) THEN
             DO j = 1, n
@@ -4155,7 +4155,7 @@ CONTAINS
          physical = 0.5_dp*(physical + CONJG(TRANSPOSE(physical)))
          finite = ALL(ieee_is_finite(REAL(physical))) .AND. ALL(ieee_is_finite(AIMAG(physical)))
          IF (finite) THEN
-            CALL zheev('N', 'U', nr, physical, nr, eig, work, SIZE(work), rwork, info)
+            CALL trial_metric_heevd(physical, eig(1:nr), info)
             finite = info == 0 .AND. ALL(ieee_is_finite(eig(1:nr)))
             IF (finite) THEN
                occmin = MINVAL(eig(1:nr))
@@ -4168,7 +4168,40 @@ CONTAINS
       CALL ieee_set_status(saved_status)
 #endif
       IF (ALLOCATED(physical)) DEALLOCATE (physical)
-      DEALLOCATE (metric, eig, work, rwork)
+      DEALLOCATE (metric, eig)
    END SUBROUTINE trial_occupation_bounds
+
+! **************************************************************************************************
+!> \brief Use CP2K's established divide-and-conquer complex eigensolver kernel and workspace query.
+!> \param matrix overwritten by eigenvectors
+!> \param eigenvalues ...
+!> \param info ...
+   SUBROUTINE trial_metric_heevd(matrix, eigenvalues, info)
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT)   :: matrix
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: eigenvalues
+      INTEGER, INTENT(OUT)                               :: info
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: work(:)
+      INTEGER                                            :: liwork, lrwork, lwork, n
+      INTEGER, ALLOCATABLE                               :: iwork(:)
+      REAL(KIND=dp), ALLOCATABLE                         :: rwork(:)
+
+      n = SIZE(eigenvalues)
+      ALLOCATE (work(1), rwork(1), iwork(1))
+      CALL zheevd('V', 'U', n, matrix(1, 1), SIZE(matrix, 1), eigenvalues(1), &
+                  work(1), -1, rwork(1), -1, iwork(1), -1, info)
+      IF (info /= 0) THEN
+         DEALLOCATE (work, rwork, iwork)
+         RETURN
+      END IF
+      lwork = MAX(1, CEILING(REAL(work(1), KIND=dp)))
+      lrwork = MAX(1, CEILING(rwork(1)))
+      liwork = MAX(1, iwork(1))
+      DEALLOCATE (work, rwork, iwork)
+      ALLOCATE (work(lwork), rwork(lrwork), iwork(liwork))
+      CALL zheevd('V', 'U', n, matrix(1, 1), SIZE(matrix, 1), eigenvalues(1), &
+                  work(1), lwork, rwork(1), lrwork, iwork(1), liwork, info)
+      DEALLOCATE (work, rwork, iwork)
+   END SUBROUTINE trial_metric_heevd
 
 END MODULE qs_scf_diagonalization
