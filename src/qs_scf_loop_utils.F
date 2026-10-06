@@ -3179,10 +3179,23 @@ CONTAINS
          nc = SIZE(scf_env%p_mix_new, 2)
          SELECT CASE (scf_env%mixing_method)
          CASE (direct_mixing_nr)
-            CALL scf_env_density_mixing(scf_env%p_mix_new, scf_env%mixing_store, &
-                                        rho_ao_kp, para_env, scf_env%iter_delta, &
-                                        scf_env%iter_count, diis=diis_step, &
-                                        invert=.TRUE.)
+            IF (mixing_free_energy_active(scf_env%mixing_store)) THEN
+               ! Trial evaluations have replaced rho_ao_kp by the accepted candidate.
+               ! Restore raw P_out from the saved original P_in and R, not that candidate.
+               DO ic = 1, nc
+                  DO ispin = 1, dft_control%nspins
+                     CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, &
+                                     scf_env%mixing_store%dm_pulay_p_last(ispin, ic)%matrix)
+                     CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, &
+                                    scf_env%mixing_store%dm_pulay_res_last(ispin, ic)%matrix, 1.0_dp, 1.0_dp)
+                  END DO
+               END DO
+            ELSE
+               CALL scf_env_density_mixing(scf_env%p_mix_new, scf_env%mixing_store, &
+                                           rho_ao_kp, para_env, scf_env%iter_delta, &
+                                           scf_env%iter_count, diis=diis_step, &
+                                           invert=.TRUE.)
+            END IF
             DO ic = 1, nc
                DO ispin = 1, dft_control%nspins
                   CALL dbcsr_get_info(rho_ao_kp(ispin, ic)%matrix, name=name) ! keep the name
