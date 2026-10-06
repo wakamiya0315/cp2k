@@ -35,7 +35,7 @@ MODULE qs_density_mixing_types
                                   section_type, &
                                   section_vals_type, &
                                   section_vals_val_get
-   USE input_val_types, ONLY: real_t
+   USE input_val_types, ONLY: real_t, lchar_t
    USE kinds, ONLY: default_path_length, default_string_length, &
                     dp
    USE qs_rho_atom_types, ONLY: rho_atom_coeff
@@ -1022,12 +1022,12 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_READ", &
                 description="Read a certified paired full Bloch/real-space density before the first KS evaluation; one MPI rank.", &
-                          default_c_val="")
+                          type_of_var=lchar_t, default_lc_val="")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_WRITE", &
        description="Write a new paired full Bloch/real-space density only from a converged endpoint with at least two SCF steps.", &
-                          default_c_val="")
+                          type_of_var=lchar_t, default_lc_val="")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
