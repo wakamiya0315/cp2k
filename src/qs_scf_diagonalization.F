@@ -3826,14 +3826,16 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: iw
       LOGICAL, INTENT(INOUT)                             :: density_full_step
 
-      COMPLEX(KIND=dp), ALLOCATABLE                      :: mixed_k(:, :, :, :), raw_k(:, :, :, :)
-      INTEGER                                            :: ic, ik, ispin, nao, nelectron_total, &
-                                                            nkp, nspin, opposite
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: coeff(:, :), gram(:, :), &
+                                                            mixed_k(:, :, :, :), raw_k(:, :, :, :)
+      INTEGER                                            :: ic, ik, im, ispin, nao, nelectron_total, &
+                                                            nkp, nmo, nspin, opposite
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: bad, do_kpoints, finite_trial, &
-                                                            full_step, rejected, spectral_ok
+                                                            full_step, have_bloch_candidate, &
+                                                            rejected, spectral_ok
       REAL(KIND=dp) :: alpha, charge_target, dot, extrap_norm2, fallback_alpha, hermitian_error, &
-         linear_norm2, maxocc, normalized_trace, occmax, occmin, ratio_step, rnorm2, &
+         linear_norm2, maxocc, normalized_trace, occmax, occmin, ortho_error, ratio_step, rnorm2, &
          roundtrip_error, snorm2
       REAL(KIND=dp), ALLOCATABLE                         :: counts(:, :), kcounts(:, :), rcounts(:)
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
@@ -3841,7 +3843,7 @@ CONTAINS
       TYPE(cp_cfm_type)                                  :: pk, raw, sk
       TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
       TYPE(cp_fm_type)                                   :: monitor_work
-      TYPE(cp_fm_type), POINTER                          :: fmwork
+      TYPE(cp_fm_type), POINTER                          :: coeff_im, coeff_re, fmwork
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s, pin, trial
       TYPE(dbcsr_type)                                   :: linear, residual, step
       TYPE(kp_transform_plan_type)                       :: pplan, splan
@@ -3940,10 +3942,12 @@ CONTAINS
       CALL cp_cfm_create(raw, fmstruct)
       nao = pk%matrix_struct%nrow_global
       IF (nao /= pk%matrix_struct%ncol_global) &
-         CALL cp_abort(__LOCATION__, "Pulay occupation diagnostics require a square AO matrix")
+         CALL cp_abort(__LOCATION__, &
+                       "Pulay occupation diagnostics require a square AO matrix")
       IF (iw > 0 .AND. scf_env%iter_count == 1) WRITE (iw, '(T2,A,3I8)') &
          "SCF_TRIAL| AO dimension,stored rows,stored columns ", nao, SIZE(pk%local_data, 1), SIZE(pk%local_data, 2)
       nkp = 1
+      have_bloch_candidate = .TRUE.
       IF (do_kpoints) THEN
          CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
          ALLOCATE (raw_k(nao, nao, nspin, nkp), mixed_k(nao, nao, nspin, nkp))
@@ -3956,12 +3960,18 @@ CONTAINS
                         kp%pmat(2, ispin)%local_data(1:nao, 1:nao), KIND=dp)
             END DO
          END DO
-         IF (.NOT. ALLOCATED(store%dm_trial_k_input)) THEN
+         have_bloch_candidate = scf_control%density_guess == atomic_guess .OR. &
+                                ALLOCATED(store%dm_trial_k_input)
+         IF (.NOT. have_bloch_candidate) THEN
+            IF (scf_env%iter_count == 1 .AND. iw > 0) WRITE (iw, '(T2,A)') &
+               "SCF_TRIAL| trial spectrum unavailable: density-only restart has no full initial Bloch state"
+            IF (store%dm_trial_reject .OR. store%dm_trial_step_limit > 0.0_dp) &
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch safeguards require a certified full initial density")
+         END IF
+         IF (have_bloch_candidate .AND. .NOT. ALLOCATED(store%dm_trial_k_input)) THEN
             ! ATOMIC initializes only the central image. Its constant Bloch lift is certified
             ! by the forward transform below; restart guesses need a separate full-state hook.
-            IF (scf_control%density_guess /= atomic_guess) &
-               CALL cp_abort(__LOCATION__, &
-                             "Full Bloch trial diagnostics currently require SCF_GUESS ATOMIC")
             ALLOCATE (store%dm_trial_k_input(nao, nao, nspin, nkp), &
                       store%dm_trial_k_last(nao, nao, nspin, nkp), &
                       store%dm_trial_k_reslast(nao, nao, nspin, nkp), &
@@ -3978,12 +3988,14 @@ CONTAINS
             store%dm_trial_k_last = store%dm_trial_k_input
             store%dm_trial_k_reslast = z_zero
          END IF
-         CALL trial_bloch_mix(store, raw_k, mixed_k, full_step)
-         CALL trial_bloch_roundtrip(qs_env, scf_env, trial, mixed_k, roundtrip_error)
-         IF (iw > 0) WRITE (iw, '(T2,A,ES22.12E3)') "SCF_TRIAL| full Bloch to real candidate max error ", roundtrip_error
-         IF (roundtrip_error > 1.0E-8_dp) &
-            CALL cp_abort(__LOCATION__, &
-                          "Full Bloch companion does not represent the actual real-space candidate")
+         IF (have_bloch_candidate) THEN
+            CALL trial_bloch_mix(store, raw_k, mixed_k, full_step)
+            CALL trial_bloch_roundtrip(qs_env, scf_env, trial, mixed_k, roundtrip_error)
+            IF (iw > 0) WRITE (iw, '(T2,A,ES22.12E3)') "SCF_TRIAL| full Bloch to real candidate max error ", roundtrip_error
+            IF (roundtrip_error > 1.0E-8_dp) &
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch companion does not represent the actual real-space candidate")
+         END IF
          CALL kp_transform_plan_create(pplan, sab_nl, cell_to_index, SIZE(trial, 2), trial(1, 1)%matrix)
          CALL kp_transform_plan_create(splan, sab_nl, cell_to_index, SIZE(matrix_s, 2), matrix_s(1, 1)%matrix)
       END IF
@@ -3995,22 +4007,46 @@ CONTAINS
             CALL cp_cfm_scale_and_add_fm(z_zero, sk, z_one, monitor_work)
          END IF
          DO ispin = 1, nspin
-            IF (do_kpoints) THEN
-               pk%local_data = z_zero
-               pk%local_data(1:nao, 1:nao) = mixed_k(:, :, ispin, ik)
-            ELSE
-               CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
-               CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+            IF (have_bloch_candidate) THEN
+               IF (do_kpoints) THEN
+                  pk%local_data = z_zero
+                  pk%local_data(1:nao, 1:nao) = mixed_k(:, :, ispin, ik)
+               ELSE
+                  CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
+                  CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+               END IF
+               CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
+                                            scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                            occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
+               IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12E3,L3)') &
+                  "SCF_TRIAL| k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
+                  occmin, occmax, normalized_trace, hermitian_error, spectral_ok
+               IF (do_kpoints) kcounts(ispin, 1) = kcounts(ispin, 1) + wkp(ik)*normalized_trace
+               bad = bad .OR. .NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
+                     occmax > 1.0_dp + store%dm_trial_occ_tol
             END IF
-            CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
-                                         scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
-                                         occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
-            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12E3,L3)') &
-               "SCF_TRIAL| k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
-               occmin, occmax, normalized_trace, hermitian_error, spectral_ok
-            IF (do_kpoints) kcounts(ispin, 1) = kcounts(ispin, 1) + wkp(ik)*normalized_trace
-            bad = bad .OR. .NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
-                  occmax > 1.0_dp + store%dm_trial_occ_tol
+            ! Certify the overlap against the actual diagonalization orbitals, independent of
+            ! the density reconstruction, before interpreting raw-output occupation noise.
+            IF (do_kpoints .AND. scf_env%iter_count == 1) THEN
+               kp => kpoints%kp_env(ik)%kpoint_env
+               CALL get_mo_set(kp%mos(1, ispin), mo_coeff=coeff_re, nmo=nmo)
+               coeff = CMPLX(coeff_re%local_data(1:nao, 1:nmo), 0.0_dp, KIND=dp)
+               IF (SIZE(kp%mos, 1) == 2) THEN
+                  CALL get_mo_set(kp%mos(2, ispin), mo_coeff=coeff_im)
+                  coeff = CMPLX(REAL(coeff, KIND=dp), coeff_im%local_data(1:nao, 1:nmo), KIND=dp)
+               END IF
+               gram = MATMUL(CONJG(TRANSPOSE(coeff)), MATMUL(sk%local_data(1:nao, 1:nao), coeff))
+               DO im = 1, nmo
+                  gram(im, im) = gram(im, im) - z_one
+               END DO
+               ortho_error = MAXVAL(ABS(gram))
+               IF (iw > 0) WRITE (iw, '(T2,A,2I6,ES22.12E3)') &
+                  "SCF_TRIAL| raw MO metric k,spin,max identity error ", ik, ispin, ortho_error
+               IF (ortho_error > 1.0E-6_dp) &
+                  CALL cp_abort(__LOCATION__, &
+                                "Diagnostic overlap differs from the diagonalization metric")
+               DEALLOCATE (coeff, gram)
+            END IF
             ! The untruncated diagonalization density is the physical numerical-noise control.
             IF (do_kpoints) THEN
                pk%local_data = z_zero
@@ -4034,14 +4070,23 @@ CONTAINS
       END DO
       IF (do_kpoints) THEN
          DO ispin = 1, nspin
-            IF (iw > 0) WRITE (iw, '(T2,A,I3,4ES22.12E3)') &
-               "SCF_TRIAL| spin,Bloch trial,real trial,Bloch raw,real raw count ", &
-               ispin, kcounts(ispin, 1), counts(ispin, 3), kcounts(ispin, 2), counts(ispin, 2)
+            IF (have_bloch_candidate) THEN
+               IF (iw > 0) WRITE (iw, '(T2,A,I3,4ES22.12E3)') &
+                  "SCF_TRIAL| spin,Bloch trial,real trial,Bloch raw,real raw count ", &
+                  ispin, kcounts(ispin, 1), counts(ispin, 3), kcounts(ispin, 2), counts(ispin, 2)
+            ELSE
+               IF (iw > 0) WRITE (iw, '(T2,A,I3,2ES22.12E3)') &
+                  "SCF_TRIAL| spin,Bloch raw,real raw count ", ispin, kcounts(ispin, 2), counts(ispin, 2)
+            END IF
          END DO
-         IF (MAXVAL(ABS(kcounts(:, 1) - counts(:, 3))) > store%dm_trial_charge_tol .OR. &
-             MAXVAL(ABS(kcounts(:, 2) - counts(:, 2))) > store%dm_trial_charge_tol) &
+         IF (MAXVAL(ABS(kcounts(:, 2) - counts(:, 2))) > store%dm_trial_charge_tol) &
             CALL cp_abort(__LOCATION__, &
-                          "Full Bloch and real-space electron traces disagree")
+                          "Raw Bloch and real-space electron traces disagree")
+         IF (have_bloch_candidate) THEN
+            IF (MAXVAL(ABS(kcounts(:, 1) - counts(:, 3))) > store%dm_trial_charge_tol) &
+               CALL cp_abort(__LOCATION__, &
+                             "Trial Bloch and real-space electron traces disagree")
+         END IF
       END IF
       rejected = store%dm_trial_reject .AND. bad
       IF (store%dm_trial_step_limit > 0.0_dp) THEN
@@ -4121,14 +4166,15 @@ CONTAINS
             END DO
          END DO
          IF (ABS(SUM(counts(:, 3)) - charge_target) > store%dm_trial_charge_tol) &
-            CALL cp_abort(__LOCATION__, "Linear Pulay fallback has the wrong electron count")
+            CALL cp_abort(__LOCATION__, &
+                          "Linear Pulay fallback has the wrong electron count")
          store%dm_pulay_ncall = 0
          store%dm_trial_fallback = .TRUE.
          IF (iw > 0) WRITE (iw, '(T2,A,I6,ES22.12E3,L3)') &
             "SCF_TRIAL| rejected,common-linear-alpha,invalid-domain ", scf_env%iter_count, fallback_alpha, bad
       END IF
       IF (do_kpoints) THEN
-         store%dm_trial_k_input = mixed_k
+         IF (have_bloch_candidate) store%dm_trial_k_input = mixed_k
          DEALLOCATE (raw_k, mixed_k)
          CALL kp_transform_plan_release(pplan)
          CALL kp_transform_plan_release(splan)
