@@ -7,3 +7,10 @@
                                         {matcher="SKALA_GAPW_composite_electrons", tol=1e-8, ref=9.22796177813233}]
 "HF_NATIVE_SKALA_GAPW_PAW_NLCC_STRESS.inp" = [{matcher="E_total", tol=5e-4, ref=-23.72450827765146},
                                                 {matcher="SKALA_GAPW_composite_electrons", tol=1e-8, ref=9.23040392825558}]
+
+"HF_NATIVE_SKALA_GPW_NLCC_UKS_FORCE.inp" = [{matcher="M072", tol=1e-06, ref=0.165665936},
+    {matcher="M031", tol=1e-06, ref=-9430698.8665},
+    {matcher="SKALA_GAPW_composite_electrons", tol=1e-08, ref=9.224066657384729}]
+
+"HF_NATIVE_SKALA_GAPW_PAW_NLCC_UKS_STRESS.inp" = [{matcher="E_total", tol=1e-08, ref=-23.72309322054821},
+    {matcher="SKALA_GAPW_composite_electrons", tol=1e-08, ref=9.225301625858458}]
