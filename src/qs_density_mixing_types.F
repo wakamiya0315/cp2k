@@ -263,6 +263,9 @@ CONTAINS
       CPASSERT(mixing_store%dm_trial_free_backtracks >= 0)
       CPASSERT(mixing_store%dm_trial_free_backtracks <= 30)
       CALL section_vals_val_get(mixing_section, "PULAY_P_OCC_TOL", r_val=mixing_store%dm_trial_occ_tol)
+      ! Entropy is defined only on physical ensembles: the validated dense-kernel noise floor
+      ! may round logarithm endpoints, but a broad diagnostic tolerance cannot justify clipping.
+      IF (mixing_store%dm_trial_free_energy) mixing_store%dm_trial_occ_tol = MIN(mixing_store%dm_trial_occ_tol, 1.0E-12_dp)
       CALL section_vals_val_get(mixing_section, "PULAY_P_CHARGE_TOL", r_val=mixing_store%dm_trial_charge_tol)
       CALL section_vals_val_get(mixing_section, "PULAY_P_STEP_LIMIT", r_val=mixing_store%dm_trial_step_limit)
       CALL section_vals_val_get(mixing_section, "PULAY_P_K_STATE_READ", c_val=mixing_store%dm_trial_k_read)
@@ -1042,7 +1045,8 @@ CONTAINS
                           description="Accept only non-increasing same-density finite-temperature free energy. "// &
                           "Rebuild rho, tau and KS state for each physical full-Bloch trial. Requires "// &
                           "Fermi-Dirac smearing, a paired initial checkpoint and one MPI rank. "// &
-                          "Enables domain rejection; preserves the raw residual convergence test.", &
+                          "Enables domain rejection with occupation tolerance capped at 1e-12; "// &
+                          "preserves the raw residual convergence test.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)

@@ -3492,6 +3492,7 @@ CONTAINS
       CALL dbcsr_allocate_matrix_set(proposal, nspin, nimg)
       DO ic = 1, nimg
          DO ispin = 1, nspin
+            ALLOCATE (initial(ispin, ic)%matrix, proposal(ispin, ic)%matrix)
             CALL dbcsr_create(initial(ispin, ic)%matrix, template=current(ispin, ic)%matrix)
             CALL dbcsr_create(proposal(ispin, ic)%matrix, template=current(ispin, ic)%matrix)
             CALL dbcsr_copy(initial(ispin, ic)%matrix, current(ispin, ic)%matrix)
@@ -3506,6 +3507,7 @@ CONTAINS
          CALL dbcsr_allocate_matrix_set(store%dm_pulay_res_last, nspin, nimg)
          DO ic = 1, nimg
             DO ispin = 1, nspin
+               ALLOCATE (store%dm_pulay_p_last(ispin, ic)%matrix, store%dm_pulay_res_last(ispin, ic)%matrix)
                CALL dbcsr_create(store%dm_pulay_p_last(ispin, ic)%matrix, template=initial(ispin, ic)%matrix)
                CALL dbcsr_create(store%dm_pulay_res_last(ispin, ic)%matrix, template=initial(ispin, ic)%matrix)
                CALL dbcsr_copy(store%dm_pulay_p_last(ispin, ic)%matrix, initial(ispin, ic)%matrix)
@@ -3604,6 +3606,7 @@ CONTAINS
       derivative = 0.0_dp
       DO ic = 1, SIZE(initial, 2)
          DO ispin = 1, SIZE(initial, 1)
+            ALLOCATE (reference_ks(ispin, ic)%matrix)
             CALL dbcsr_create(reference_ks(ispin, ic)%matrix, template=matrix_ks(ispin, ic)%matrix)
             CALL dbcsr_copy(reference_ks(ispin, ic)%matrix, matrix_ks(ispin, ic)%matrix)
             CALL dbcsr_create(delta, template=initial(ispin, ic)%matrix)
