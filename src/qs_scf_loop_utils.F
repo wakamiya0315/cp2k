@@ -3591,7 +3591,8 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: output_unit
 
       LOGICAL                                            :: valid
-      REAL(KIND=dp)                                      :: density_kts, eks, entropy
+      REAL(KIND=dp)                                      :: density_kts, eks, entropy, &
+                                                            final_raw_residual
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -3606,6 +3607,7 @@ CONTAINS
                       rho=rho, dft_control=dft_control, para_env=para_env, &
                       kpoints=kpoints, scf_control=control)
 
+      final_raw_residual = scf_env%iter_delta
       CALL cleanup_scf_loop(scf_env)
 
       ! now, print out energies and charges corresponding to the obtained wfn
@@ -3633,7 +3635,7 @@ CONTAINS
          energy%total = eks + density_kts; energy%kTS = density_kts
          IF (output_unit > 0) WRITE (output_unit, '(T2,A,3ES24.14E3)') &
             "SCF_FREE_ENERGY| finalized raw-state F,raw-residual,entropy consistency error ", &
-            energy%total, scf_env%iter_delta, density_kts - scf_env%mixing_store%dm_trial_raw_kts
+            energy%total, final_raw_residual, density_kts - scf_env%mixing_store%dm_trial_raw_kts
          CALL qs_scf_print_summary(output_unit, qs_env)
       END IF
 
