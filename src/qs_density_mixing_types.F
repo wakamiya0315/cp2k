@@ -36,7 +36,7 @@ MODULE qs_density_mixing_types
                                   section_vals_type, &
                                   section_vals_val_get
    USE input_val_types, ONLY: real_t
-   USE kinds, ONLY: default_string_length, &
+   USE kinds, ONLY: default_path_length, default_string_length, &
                     dp
    USE qs_rho_atom_types, ONLY: rho_atom_coeff
    USE string_utilities, ONLY: s2a
@@ -123,6 +123,8 @@ MODULE qs_density_mixing_types
       REAL(KIND=dp) :: dm_trial_occ_tol = 1.0E-6_dp, dm_trial_charge_tol = 1.0E-6_dp, dm_trial_step_limit = 0.0_dp
       ! Full Bloch companion: the same affine Pulay candidate, before real-space truncation.
       ! Allocated only for opt-in one-rank diagnostics; never Fourier-invert a density as an operator.
+      CHARACTER(LEN=default_path_length) :: dm_trial_k_read = "", dm_trial_k_write = ""
+      LOGICAL :: dm_trial_k_loaded = .FALSE.
       INTEGER :: dm_trial_k_slot = 0
       REAL(KIND=dp) :: dm_trial_k_norm = 0.0_dp
       REAL(KIND=dp), ALLOCATABLE :: dm_trial_k_g(:)
@@ -249,6 +251,16 @@ CONTAINS
       CALL section_vals_val_get(mixing_section, "PULAY_P_OCC_TOL", r_val=mixing_store%dm_trial_occ_tol)
       CALL section_vals_val_get(mixing_section, "PULAY_P_CHARGE_TOL", r_val=mixing_store%dm_trial_charge_tol)
       CALL section_vals_val_get(mixing_section, "PULAY_P_STEP_LIMIT", r_val=mixing_store%dm_trial_step_limit)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_K_STATE_READ", c_val=mixing_store%dm_trial_k_read)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_K_STATE_WRITE", c_val=mixing_store%dm_trial_k_write)
+      IF (LEN_TRIM(mixing_store%dm_trial_k_read) > 0 .OR. LEN_TRIM(mixing_store%dm_trial_k_write) > 0) THEN
+         IF (.NOT. mixing_store%dm_pulay) CALL cp_abort(__LOCATION__, &
+                                                        "Full Bloch checkpoints require DIRECT_P_MIXING with PULAY_P")
+         IF (LEN_TRIM(mixing_store%dm_trial_k_read) > 0 .AND. &
+             mixing_store%dm_trial_k_read == mixing_store%dm_trial_k_write) &
+            CALL cp_abort(__LOCATION__, &
+                          "Read and write full Bloch checkpoints must have different paths")
+      END IF
       mixing_store%dm_trial_diagnostics = mixing_store%dm_trial_diagnostics .OR. &
                                           mixing_store%dm_trial_reject .OR. mixing_store%dm_trial_step_limit > 0.0_dp
       IF (mixing_store%dm_trial_diagnostics) THEN
@@ -1005,6 +1017,17 @@ CONTAINS
                           description="Bound on the full-step Frobenius norm divided by the residual norm; "// &
                           "zero disables the bound.", &
                           default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_READ", &
+                description="Read a certified paired full Bloch/real-space density before the first KS evaluation; one MPI rank.", &
+                          default_c_val="")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_WRITE", &
+       description="Write a new paired full Bloch/real-space density only from a converged endpoint with at least two SCF steps.", &
+                          default_c_val="")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

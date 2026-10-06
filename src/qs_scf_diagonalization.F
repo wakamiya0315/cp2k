@@ -187,6 +187,7 @@ MODULE qs_scf_diagonalization
       TYPE(cp_cfm_type) :: cksmat, cmos, csmat, csmat_base, cwork
    END TYPE kp_diag_omp_workspace_type
 
+   PUBLIC :: qs_scf_full_bloch_initialize, qs_scf_full_bloch_save
    PUBLIC :: do_general_diag, do_general_diag_kp, do_roks_diag, &
              do_special_diag, do_ot_diag, do_ot_diag_kp, do_block_davidson_diag, &
              do_block_davidson_diag_kp, &
@@ -4187,6 +4188,241 @@ CONTAINS
    END SUBROUTINE qs_scf_pulay_trial_check
 
 ! **************************************************************************************************
+!> \brief Load/save a matched full Bloch and real-space density with strict physical bindings.
+!> Default-off, one-rank stream format; paths/hashes and producer inputs are recorded externally.
+   SUBROUTINE qs_scf_full_bloch_initialize(qs_env, scf_env, changed)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      LOGICAL, INTENT(OUT)                               :: changed
+
+      TYPE(mixing_storage_type), POINTER                 :: store
+
+      changed = .FALSE.
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (LEN_TRIM(store%dm_trial_k_read) == 0 .OR. store%dm_trial_k_loaded) RETURN
+      CALL trial_bloch_checkpoint(qs_env, scf_env, .FALSE.)
+      store%dm_trial_k_loaded = .TRUE.
+      changed = .TRUE.
+   END SUBROUTINE qs_scf_full_bloch_initialize
+
+! **************************************************************************************************
+!> \brief A checkpoint is never written from a one-step or unconverged smeared restart.
+   SUBROUTINE qs_scf_full_bloch_save(qs_env, scf_env, converged)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      LOGICAL, INTENT(IN)                                :: converged
+
+      TYPE(mixing_storage_type), POINTER                 :: store
+
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (LEN_TRIM(store%dm_trial_k_write) == 0) RETURN
+      IF (.NOT. converged .OR. scf_env%iter_count < 2) &
+         CALL cp_abort(__LOCATION__, &
+                       "Full Bloch checkpoint needs a converged state with at least two SCF steps")
+      CALL trial_bloch_checkpoint(qs_env, scf_env, .TRUE.)
+   END SUBROUTINE qs_scf_full_bloch_save
+
+! **************************************************************************************************
+!> \brief V1 stream contains P(k), its real-space image, S(k), k mesh and image-index map.
+   SUBROUTINE trial_bloch_checkpoint(qs_env, scf_env, writing)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      LOGICAL, INTENT(IN)                                :: writing
+
+      CHARACTER(LEN=1024)                                :: filename
+      CHARACTER(LEN=64)                                  :: magic
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: bloch(:, :, :, :), file_metric(:, :, :), &
+                                                            metric(:, :, :)
+      CHARACTER(LEN=64), PARAMETER :: magic_expected = 'skala2pw-full-bloch-density-v1'
+
+      INTEGER :: bounds_hi(3), bounds_lo(3), file_hi(3), file_lo(3), file_nao, file_nel, &
+         file_nimg, file_nkp, file_nspin, ic, ik, ios, ispin, iw, nao, ne_a, ne_b, nel, nimg, nkp, &
+         nspin, steps, unit
+      INTEGER, ALLOCATABLE                               :: file_map(:, :, :)
+      INTEGER, POINTER                                   :: cell_to_index(:, :, :)
+      LOGICAL                                            :: do_kpoints, spectral_ok
+      REAL(KIND=dp)                                      :: dot, fixed_target(2), herm, hi, lo, &
+                                                            maxocc, roundtrip, s_error, trace
+      REAL(KIND=dp), ALLOCATABLE                         :: counts(:, :), file_wkp(:), file_xkp(:, :)
+      REAL(KIND=dp), POINTER                             :: wkp(:), xkp(:, :)
+      TYPE(cp_cfm_type)                                  :: sk
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(cp_fm_type)                                   :: work
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), POINTER                        :: overlap(:, :), real_density(:, :)
+      TYPE(dbcsr_type), POINTER                          :: full_real
+      TYPE(kp_transform_plan_type)                       :: plan
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+      TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(scf_control_type), POINTER                    :: scf_control
+
+      store => scf_env%mixing_store
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_s_kp=overlap, rho=rho, para_env=para_env, &
+                      do_kpoints=do_kpoints, nelectron_total=nel, scf_control=scf_control)
+      IF (.NOT. do_kpoints .OR. para_env%num_pe /= 1) &
+         CALL cp_abort(__LOCATION__, &
+                       "Full Bloch checkpoints currently require k-points and one MPI rank")
+      logger => cp_get_default_logger()
+      iw = cp_logger_get_default_unit_nr(logger)
+      CALL qs_rho_get(rho, rho_ao_kp=real_density)
+      IF (.NOT. writing) real_density => scf_env%p_mix_new
+      nspin = SIZE(real_density, 1); nimg = SIZE(real_density, 2)
+      CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
+      bounds_lo = LBOUND(cell_to_index); bounds_hi = UBOUND(cell_to_index)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      nao = fmstruct%nrow_global
+      CALL cp_fm_create(work, fmstruct); CALL cp_cfm_create(sk, fmstruct)
+      CALL kp_transform_plan_create(plan, sab_nl, cell_to_index, SIZE(overlap, 2), overlap(1, 1)%matrix)
+      ALLOCATE (bloch(nao, nao, nspin, nkp), metric(nao, nao, nkp), counts(nspin, 2))
+      DO ik = 1, nkp
+         CALL kp_build_cfm(overlap, 1, xkp(:, ik), plan, sk)
+         metric(:, :, ik) = sk%local_data(1:nao, 1:nao)
+      END DO
+      filename = store%dm_trial_k_read
+      IF (writing) filename = store%dm_trial_k_write
+      IF (writing) THEN
+         DO ik = 1, nkp
+            kp => kpoints%kp_env(ik)%kpoint_env
+            DO ispin = 1, nspin
+               bloch(:, :, ispin, ik) = CMPLX(kp%pmat(1, ispin)%local_data(1:nao, 1:nao), 0.0_dp, KIND=dp)
+               IF (SIZE(kp%pmat, 1) == 2) bloch(:, :, ispin, ik) = &
+                  CMPLX(REAL(bloch(:, :, ispin, ik), KIND=dp), &
+                        kp%pmat(2, ispin)%local_data(1:nao, 1:nao), KIND=dp)
+            END DO
+         END DO
+      ELSE
+         OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='OLD', FORM='UNFORMATTED', ACCESS='STREAM', ACTION='READ', IOSTAT=ios)
+         IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                     "Cannot read the requested full Bloch checkpoint")
+         READ (unit, IOSTAT=ios) magic, file_nao, file_nkp, file_nspin, file_nimg, file_nel, steps
+         IF (ios /= 0 .OR. magic /= magic_expected) &
+            CALL cp_abort(__LOCATION__, &
+                          "Invalid full Bloch checkpoint header")
+         IF (file_nao /= nao .OR. file_nkp /= nkp .OR. file_nspin /= nspin .OR. file_nimg /= nimg .OR. file_nel /= nel) &
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch checkpoint basis, mesh, spin or electron count differs")
+         IF (steps < 2) CALL cp_abort(__LOCATION__, &
+                                      "One-step full Bloch checkpoints are not accepted")
+         READ (unit, IOSTAT=ios) file_lo, file_hi
+         IF (ios /= 0 .OR. ANY(file_lo /= bounds_lo) .OR. ANY(file_hi /= bounds_hi)) &
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch checkpoint image-map bounds differ")
+         ALLOCATE (file_map(file_lo(1):file_hi(1), file_lo(2):file_hi(2), file_lo(3):file_hi(3)))
+         ALLOCATE (file_xkp(3, nkp), file_wkp(nkp), file_metric(nao, nao, nkp))
+         READ (unit, IOSTAT=ios) file_map, file_xkp, file_wkp, file_metric, bloch
+         IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                     "Incomplete full Bloch checkpoint")
+         IF (.NOT. ALL(ieee_is_finite(REAL(file_metric))) .OR. .NOT. ALL(ieee_is_finite(AIMAG(file_metric)))) &
+            CALL cp_abort(__LOCATION__, &
+                          "Non-finite checkpoint overlap binding")
+         s_error = MAXVAL(ABS(file_metric - metric))
+         IF (ANY(file_map /= cell_to_index) .OR. MAXVAL(ABS(file_xkp - xkp)) > 1.0E-14_dp .OR. &
+             MAXVAL(ABS(file_wkp - wkp)) > 1.0E-14_dp .OR. s_error > 1.0E-12_dp) &
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch checkpoint geometry, overlap, k mesh or image map differs")
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               work%local_data = 0.0_dp
+               READ (unit, IOSTAT=ios) work%local_data(1:nao, 1:nao)
+               IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                           "Incomplete real-space checkpoint pair")
+               IF (.NOT. ALL(ieee_is_finite(work%local_data))) &
+                  CALL cp_abort(__LOCATION__, &
+                                "Non-finite real-space checkpoint pair")
+               CALL copy_fm_to_dbcsr(work, real_density(ispin, ic)%matrix, keep_sparsity=.TRUE.)
+            END DO
+         END DO
+         CLOSE (unit)
+         DEALLOCATE (file_map, file_xkp, file_wkp, file_metric)
+         IF (iw > 0) WRITE (iw, '(T2,A,ES22.12E3)') "SCF_TRIAL| checkpoint overlap binding max error ", s_error
+      END IF
+      CALL trial_bloch_roundtrip(qs_env, scf_env, real_density, bloch, roundtrip)
+      IF (roundtrip > 1.0E-8_dp) CALL cp_abort(__LOCATION__, &
+                                               "Full Bloch and real-space checkpoint pair disagrees")
+      counts = 0.0_dp; maxocc = MERGE(2.0_dp, 1.0_dp, nspin == 1)
+      DO ik = 1, nkp
+         DO ispin = 1, nspin
+            CALL trial_occupation_bounds(bloch(:, :, ispin, ik), metric(:, :, ik), &
+                                         scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                         lo, hi, trace, herm, spectral_ok)
+            IF (.NOT. spectral_ok .OR. lo < -store%dm_trial_occ_tol .OR. hi > 1.0_dp + store%dm_trial_occ_tol) &
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch checkpoint is outside the physical occupation domain")
+            counts(ispin, 1) = counts(ispin, 1) + wkp(ik)*trace
+         END DO
+      END DO
+      DO ic = 1, nimg
+         DO ispin = 1, nspin
+            CALL dbcsr_dot(real_density(ispin, ic)%matrix, overlap(1, ic)%matrix, dot)
+            counts(ispin, 2) = counts(ispin, 2) + dot
+         END DO
+      END DO
+      IF (MAXVAL(ABS(counts(:, 1) - counts(:, 2))) > store%dm_trial_charge_tol .OR. &
+          ABS(SUM(counts(:, 1)) - REAL(nel, KIND=dp)) > store%dm_trial_charge_tol) &
+         CALL cp_abort(__LOCATION__, &
+                       "Full Bloch checkpoint has inconsistent spin or total electron traces")
+      IF (nspin == 2 .AND. scf_control%smear%do_smear) THEN
+         IF (scf_control%smear%fixed_mag_mom >= 0.0_dp .OR. scf_control%smear%fixed_mag_mom == -1.0_dp) THEN
+            IF (scf_control%smear%fixed_mag_mom >= 0.0_dp) THEN
+               fixed_target(1) = 0.5_dp*(REAL(nel, KIND=dp) + scf_control%smear%fixed_mag_mom)
+               fixed_target(2) = 0.5_dp*(REAL(nel, KIND=dp) - scf_control%smear%fixed_mag_mom)
+            ELSE
+               kp => kpoints%kp_env(1)%kpoint_env
+               CALL get_mo_set(kp%mos(1, 1), nelectron=ne_a)
+               CALL get_mo_set(kp%mos(1, 2), nelectron=ne_b)
+               fixed_target = REAL([ne_a, ne_b], KIND=dp)
+            END IF
+            IF (MAXVAL(ABS(counts(:, 1) - fixed_target)) > store%dm_trial_charge_tol) &
+               CALL cp_abort(__LOCATION__, &
+                             "Checkpoint spin counts differ from the requested fixed moment")
+         END IF
+      END IF
+      IF (writing) THEN
+         OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='NEW', FORM='UNFORMATTED', ACCESS='STREAM', ACTION='WRITE', IOSTAT=ios)
+         IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                     "Cannot create a new full Bloch checkpoint")
+         WRITE (unit) magic_expected, nao, nkp, nspin, nimg, nel, scf_env%iter_count
+         WRITE (unit) bounds_lo, bounds_hi
+         WRITE (unit) cell_to_index, xkp, wkp, metric, bloch
+         ALLOCATE (full_real)
+         CALL dbcsr_create(full_real, template=real_density(1, 1)%matrix, matrix_type=dbcsr_type_no_symmetry)
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               CALL dbcsr_desymmetrize(real_density(ispin, ic)%matrix, full_real)
+               CALL copy_dbcsr_to_fm(full_real, work)
+               WRITE (unit) work%local_data(1:nao, 1:nao)
+            END DO
+         END DO
+         CALL dbcsr_deallocate_matrix(full_real)
+         CLOSE (unit)
+      ELSE
+         IF (ALLOCATED(store%dm_trial_k_input)) DEALLOCATE (store%dm_trial_k_input, store%dm_trial_k_last, &
+                                                            store%dm_trial_k_reslast, store%dm_trial_k_dp, store%dm_trial_k_dres)
+         store%dm_trial_k_input = bloch
+         store%dm_trial_k_last = bloch
+         ALLOCATE (store%dm_trial_k_reslast(nao, nao, nspin, nkp), &
+                   store%dm_trial_k_dp(nao, nao, nspin, nkp, MAX(store%nbuffer, 1)), &
+                   store%dm_trial_k_dres(nao, nao, nspin, nkp, MAX(store%nbuffer, 1)))
+         store%dm_trial_k_reslast = z_zero; store%dm_trial_k_dp = z_zero; store%dm_trial_k_dres = z_zero
+      END IF
+      IF (iw > 0) THEN
+         WRITE (iw, '(T2,A,L3,ES22.12E3)') "SCF_TRIAL| paired checkpoint write,forward max error ", writing, roundtrip
+         DO ispin = 1, nspin
+            WRITE (iw, '(T2,A,I3,2ES22.12E3)') "SCF_TRIAL| checkpoint spin,Bloch,real count ", ispin, counts(ispin, :)
+         END DO
+      END IF
+      CALL kp_transform_plan_release(plan)
+      CALL cp_cfm_release(sk); CALL cp_fm_release(work)
+      DEALLOCATE (bloch, metric, counts)
+   END SUBROUTINE trial_bloch_checkpoint
+
+! **************************************************************************************************
 !> \brief Apply the exact real-space Pulay coefficients and normalization to full Bloch densities.
    SUBROUTINE trial_bloch_mix(store, raw, mixed, full_step)
       TYPE(mixing_storage_type), POINTER                 :: store
@@ -4277,7 +4513,7 @@ CONTAINS
          END DO
       END DO
       CALL kpoint_density_transform(kpoints, reconstructed, .FALSE., overlap(1, 1)%matrix, &
-                                    sab_nl, scf_env%scf_work1, pmat_ext=ext)
+                                    sab_nl, scf_env%scf_work1, pmat_ext=ext, overlap_rs=overlap)
       error = 0.0_dp
       DO ic = 1, SIZE(real_candidate, 2)
          DO ispin = 1, nspin
