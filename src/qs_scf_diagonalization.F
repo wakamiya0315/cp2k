@@ -114,6 +114,7 @@ MODULE qs_scf_diagonalization
                                               init_preconditioner
    USE qs_density_matrices,             ONLY: calculate_density_matrix
    USE qs_density_mixing_types,         ONLY: direct_mixing_nr,&
+                                              dm_pulay_storage_release,&
                                               gspace_mixing_nr,&
                                               mixing_storage_type
    USE qs_diis,                         ONLY: qs_diis_b_calc_err_kp,&
@@ -3814,13 +3815,15 @@ CONTAINS
 !> \param scf_env ...
 !> \param scf_control ...
 !> \param iw ...
-   SUBROUTINE qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, iw)
+   SUBROUTINE qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, iw, density_full_step)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       TYPE(scf_control_type), POINTER                    :: scf_control
       INTEGER, INTENT(IN)                                :: iw
+      LOGICAL, INTENT(INOUT)                             :: density_full_step
 
-      INTEGER                                            :: ic, ik, ispin, nkp, nspin, opposite
+      INTEGER                                            :: ic, ik, ispin, nelectron_total, nkp, &
+                                                            nspin, opposite
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: bad, do_kpoints, finite_trial, &
                                                             full_step, rejected, spectral_ok
@@ -3846,7 +3849,7 @@ CONTAINS
       IF (.NOT. ASSOCIATED(store)) RETURN
       IF (.NOT. store%dm_trial_diagnostics) RETURN
       CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, matrix_s_kp=matrix_s, &
-                      do_kpoints=do_kpoints, para_env=para_env)
+                      do_kpoints=do_kpoints, para_env=para_env, nelectron_total=nelectron_total)
       IF (para_env%num_pe /= 1) CALL cp_abort(__LOCATION__, &
                                               "PULAY_P trial diagnostics currently require one MPI rank")
       CALL qs_rho_get(rho, rho_ao_kp=pin)
@@ -3907,7 +3910,7 @@ CONTAINS
       finite_trial = ALL(ieee_is_finite(counts)) .AND. ieee_is_finite(snorm2)
       IF (.NOT. finite_trial .AND. iw > 0) &
          WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| NONFINITE density candidate, step ", scf_env%iter_count
-      charge_target = SUM(counts(:, 2))
+      charge_target = REAL(nelectron_total, KIND=dp)
       IF (iw > 0) THEN
          WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| step ", scf_env%iter_count
          DO ispin = 1, nspin
@@ -3982,12 +3985,30 @@ CONTAINS
                     snorm2 > store%dm_trial_step_limit**2*rnorm2
       END IF
       IF (rejected) THEN
-         IF (full_step .OR. .NOT. ALL(ieee_is_finite(counts(:, 1:2))) .OR. &
+         IF (.NOT. ALL(ieee_is_finite(counts(:, 1:2))) .OR. &
              .NOT. ieee_is_finite(rnorm2)) &
             CALL cp_abort(__LOCATION__, &
                           "Pulay trial fallback has no finite physical endpoints; first failure is the raw map")
          fallback_alpha = alpha
          IF (store%dm_trial_step_limit > 0.0_dp) fallback_alpha = MIN(alpha, store%dm_trial_step_limit)
+         IF (full_step) THEN
+            ! Keep the raw output even when a skipped-mixing/full step is shortened.
+            ! Finalization can then recover P_out without accepting the shortened input as a zero residual.
+            CALL dm_pulay_storage_release(store)
+            ALLOCATE (store%dm_pulay_p_last(nspin, SIZE(trial, 2)), &
+                      store%dm_pulay_res_last(nspin, SIZE(trial, 2)))
+            DO ic = 1, SIZE(trial, 2)
+               DO ispin = 1, nspin
+                  ALLOCATE (store%dm_pulay_p_last(ispin, ic)%matrix, store%dm_pulay_res_last(ispin, ic)%matrix)
+                  CALL dbcsr_create(store%dm_pulay_p_last(ispin, ic)%matrix, template=pin(ispin, ic)%matrix)
+                  CALL dbcsr_create(store%dm_pulay_res_last(ispin, ic)%matrix, template=pin(ispin, ic)%matrix)
+                  CALL dbcsr_copy(store%dm_pulay_p_last(ispin, ic)%matrix, pin(ispin, ic)%matrix)
+                  CALL dbcsr_copy(store%dm_pulay_res_last(ispin, ic)%matrix, trial(ispin, ic)%matrix)
+                  CALL dbcsr_add(store%dm_pulay_res_last(ispin, ic)%matrix, pin(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               END DO
+            END DO
+         END IF
+         density_full_step = .FALSE.
          DO ic = 1, SIZE(trial, 2)
             DO ispin = 1, nspin
                CALL dbcsr_copy(trial(ispin, ic)%matrix, pin(ispin, ic)%matrix)

@@ -927,7 +927,7 @@ CONTAINS
             ELSE
                density_full_step = diis_step .OR. tblite_native_mixer .OR. internal_tblite_density_full_step
                CALL qs_scf_density_mixing(scf_env, rho, para_env, density_full_step)
-               CALL qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, output_unit)
+               CALL qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, output_unit, density_full_step)
             END IF
             IF (dft_control%qs_control%xtb_control%do_tblite .AND. &
                 .NOT. (dft_control%qs_control%do_ls_scf .OR. scf_control%use_ot)) THEN
