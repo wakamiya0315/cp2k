@@ -1550,7 +1550,8 @@ CONTAINS
       INTEGER, DIMENSION(2)                              :: kp_range
       LOGICAL                                            :: my_added_mos_auto_grow, &
                                                             my_separate_spin_occupations
-      REAL(KIND=dp)                                      :: kTS, kTS_spin(2), mu, mus(2), nel
+      REAL(KIND=dp)                                      :: kTS, kTS_spin(2), mu, mus(2), nel, &
+                                                            nel_spin(2)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: smatrix
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: weig, wocc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: icoeff, rcoeff
@@ -1569,7 +1570,8 @@ CONTAINS
       CALL get_kpoint_info(kpoint, nkp=nkp)
       kp => kpoint%kp_env(1)%kpoint_env
       nspin = SIZE(kp%mos, 2)
-      my_separate_spin_occupations = smear%fixed_mag_mom > 0.0_dp
+      my_separate_spin_occupations = smear%fixed_mag_mom > 0.0_dp .OR. &
+                                     (smear%fractional_fixed_moment .AND. smear%fixed_mag_mom >= 0.0_dp)
       IF (PRESENT(separate_spin_occupations)) THEN
          my_separate_spin_occupations = my_separate_spin_occupations .OR. separate_spin_occupations
       END IF
@@ -1579,6 +1581,15 @@ CONTAINS
       IF (nspin == 2) THEN
          CALL get_mo_set(kp%mos(1, 2), nmo=nb, nelectron=ne_b)
          CPASSERT(nmo == nb)
+      END IF
+      ! electrons per spin of the separate Fermi levels: the integer counts of MULTIPLICITY, or
+      ! (N +- m)/2 for FRACTIONAL_FIXED_MOMENT
+      nel_spin(1) = REAL(ne_a, KIND=dp)
+      nel_spin(2) = 0.0_dp
+      IF (nspin == 2) nel_spin(2) = REAL(ne_b, KIND=dp)
+      IF (nspin == 2 .AND. smear%fractional_fixed_moment .AND. smear%fixed_mag_mom >= 0.0_dp) THEN
+         nel_spin(1) = 0.5_dp*(REAL(ne_a, KIND=dp) + REAL(ne_b, KIND=dp)) + 0.5_dp*smear%fixed_mag_mom
+         nel_spin(2) = 0.5_dp*(REAL(ne_a, KIND=dp) + REAL(ne_b, KIND=dp)) - 0.5_dp*smear%fixed_mag_mom
       END IF
       ALLOCATE (weig(nmo, nkp, nspin), wocc(nmo, nkp, nspin))
       weig = 0.0_dp
@@ -1708,11 +1719,11 @@ CONTAINS
                                smear%electronic_temperature, 2.0_dp, smear_fermi_dirac)
                   kTS_spin(1) = kTS
                ELSE IF (my_separate_spin_occupations) THEN
-                  nel = REAL(ne_a, KIND=dp)
+                  nel = nel_spin(1)
                   CALL Smearkp(wocc(:, :, 1), mus(1), kTS, weig(:, :, 1), nel, wkp, &
                                smear%electronic_temperature, 1.0_dp, smear_fermi_dirac)
                   kTS_spin(1) = kTS
-                  nel = REAL(ne_b, KIND=dp)
+                  nel = nel_spin(2)
                   CALL Smearkp(wocc(:, :, 2), mus(2), kTS, weig(:, :, 2), nel, wkp, &
                                smear%electronic_temperature, 1.0_dp, smear_fermi_dirac)
                   kTS_spin(2) = kTS
@@ -1731,11 +1742,11 @@ CONTAINS
                                smear%smearing_width, 2.0_dp, smear%method)
                   kTS_spin(1) = kTS
                ELSE IF (my_separate_spin_occupations) THEN
-                  nel = REAL(ne_a, KIND=dp)
+                  nel = nel_spin(1)
                   CALL Smearkp(wocc(:, :, 1), mus(1), kTS, weig(:, :, 1), nel, wkp, &
                                smear%smearing_width, 1.0_dp, smear%method)
                   kTS_spin(1) = kTS
-                  nel = REAL(ne_b, KIND=dp)
+                  nel = nel_spin(2)
                   CALL Smearkp(wocc(:, :, 2), mus(2), kTS, weig(:, :, 2), nel, wkp, &
                                smear%smearing_width, 1.0_dp, smear%method)
                   kTS_spin(2) = kTS

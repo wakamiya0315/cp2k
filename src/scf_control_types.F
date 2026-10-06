@@ -104,6 +104,15 @@ MODULE scf_control_types
                                                window_size = -1.0_dp, &
                                                smearing_width = -1.0_dp
       REAL(KIND=dp), DIMENSION(:), POINTER  :: list => NULL()
+      ! FRACTIONAL_FIXED_MOMENT: with k-points, fix N(up) - N(down) to FIXED_MAGNETIC_MOMENT
+      ! (fractional values allowed) instead of the integer counts of MULTIPLICITY.
+      ! FIXED_MOMENT_RELEASE / _STEP: drop the constraint inside the SCF once the change falls
+      ! below the threshold or after the number of steps; the run continues with a common
+      ! Fermi level (moment_released records that it happened).
+      LOGICAL                               :: fractional_fixed_moment = .FALSE., &
+                                               moment_released = .FALSE.
+      REAL(KIND=dp)                         :: moment_release_eps = -1.0_dp
+      INTEGER                               :: moment_release_step = 0
    END TYPE smear_type
 
    TYPE diagonalization_type
@@ -604,6 +613,18 @@ CONTAINS
          END IF
          CALL section_vals_val_get(smear_section, "FIXED_MAGNETIC_MOMENT", &
                                    r_val=smear%fixed_mag_mom)
+         CALL section_vals_val_get(smear_section, "FRACTIONAL_FIXED_MOMENT", &
+                                   l_val=smear%fractional_fixed_moment)
+         CALL section_vals_val_get(smear_section, "FIXED_MOMENT_RELEASE", &
+                                   r_val=smear%moment_release_eps)
+         CALL section_vals_val_get(smear_section, "FIXED_MOMENT_RELEASE_STEP", &
+                                   i_val=smear%moment_release_step)
+         smear%moment_released = .FALSE.
+         IF (smear%fractional_fixed_moment .AND. smear%fixed_mag_mom < 0.0_dp) &
+            CPABORT("FRACTIONAL_FIXED_MOMENT needs FIXED_MAGNETIC_MOMENT >= 0")
+         IF ((smear%moment_release_eps > 0.0_dp .OR. smear%moment_release_step > 0) .AND. &
+             smear%fixed_mag_mom < 0.0_dp) &
+            CPABORT("FIXED_MOMENT_RELEASE needs FIXED_MAGNETIC_MOMENT >= 0")
       END IF ! do smear
    END SUBROUTINE read_smear_section
 
@@ -765,6 +786,12 @@ CONTAINS
                      "Accuracy threshold:", scf_control%smear%eps_fermi_dirac
                   IF (scf_control%smear%fixed_mag_mom > 0.0_dp) WRITE (UNIT=output_unit, FMT="(T25,A,T61,F20.1)") &
                      "Fixed magnetic moment set to:", scf_control%smear%fixed_mag_mom
+                  IF (scf_control%smear%fractional_fixed_moment) WRITE (UNIT=output_unit, FMT="(T25,A,T61,F20.6)") &
+                     "Fractional fixed moment (k-points):", scf_control%smear%fixed_mag_mom
+                  IF (scf_control%smear%moment_release_eps > 0.0_dp) WRITE (UNIT=output_unit, FMT="(T25,A,T71,ES10.2)") &
+                     "Fixed moment released below change:", scf_control%smear%moment_release_eps
+                  IF (scf_control%smear%moment_release_step > 0) WRITE (UNIT=output_unit, FMT="(T25,A,T71,I10)") &
+                     "Fixed moment released after step:", scf_control%smear%moment_release_step
                CASE (smear_gaussian, smear_mp, smear_mv)
                   WRITE (UNIT=output_unit, FMT="(T25,A,T71,ES10.2)") &
                      "Smearing width (sigma) [a.u.]:", scf_control%smear%smearing_width, &

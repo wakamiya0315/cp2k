@@ -1560,6 +1560,33 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="FRACTIONAL_FIXED_MOMENT", &
+                          description="With k-points and diagonalization, impose FIXED_MAGNETIC_MOMENT "// &
+                          "itself (fractional values and zero allowed): the spin-up and spin-down "// &
+                          "occupations are filled to (N + m)/2 and (N - m)/2 electrons with separate "// &
+                          "Fermi levels. Without it, k-point runs with FIXED_MAGNETIC_MOMENT > 0 keep the "// &
+                          "integer electron counts of MULTIPLICITY. Needs ADDED_MOS for both spins.", &
+                          usage="FRACTIONAL_FIXED_MOMENT", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="FIXED_MOMENT_RELEASE", &
+                          description="Release the fixed magnetic moment inside the SCF once the "// &
+                          "change falls below this value (it should lie above EPS_SCF): the run then "// &
+                          "continues with a common Fermi level for both spins and a fresh mixing "// &
+                          "history. Negative (default): never.", &
+                          usage="FIXED_MOMENT_RELEASE 1.0E-3", default_r_val=-1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="FIXED_MOMENT_RELEASE_STEP", &
+                          description="Release the fixed magnetic moment after this SCF step (see "// &
+                          "FIXED_MOMENT_RELEASE; whichever comes first). Zero (default): never.", &
+                          usage="FIXED_MOMENT_RELEASE_STEP 40", default_i_val=0)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
    END SUBROUTINE create_smear_section
 
 ! **************************************************************************************************

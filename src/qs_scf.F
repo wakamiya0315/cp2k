@@ -426,7 +426,8 @@ CONTAINS
       LOGICAL :: ace_active, added_mos_auto_grow, adiis_pushed, adiis_restarted, adiis_stagnated, &
          adiis_validation, density_full_step, diis_step, do_kpoints, energy_only, exit_inner_loop, &
          exit_outer_loop, inner_loop_converged, internal_tblite_density_full_step, &
-         internal_tblite_mixer, just_energy, oda_applied, oda_eligible, oda_globalization_active, &
+         internal_tblite_mixer, just_energy, moment_released_now, oda_applied, oda_eligible, &
+         oda_globalization_active, &
          oda_interior, oda_predictor_valid, oda_restart_trigger, oda_state_evaluated, oda_trigger, &
          ot_kp_subspace_refresh, ot_kp_subspace_refresh_pending, outer_loop_converged, &
          tblite_native_mixer
@@ -961,8 +962,36 @@ CONTAINS
                CALL external_comm%send(energy%total, ext_master_id, scf_energy_message_tag)
             END IF
 
-            CALL qs_scf_check_inner_exit(qs_env, scf_env, scf_control, should_stop, just_energy, &
-                                         exit_inner_loop, inner_loop_converged, output_unit)
+            moment_released_now = .FALSE.
+            IF (scf_control%smear%do_smear .AND. .NOT. scf_control%smear%moment_released .AND. &
+                scf_control%smear%fixed_mag_mom >= 0.0_dp) THEN
+               IF ((scf_control%smear%moment_release_eps > 0.0_dp .AND. &
+                    scf_env%iter_delta < scf_control%smear%moment_release_eps) .OR. &
+                   (scf_control%smear%moment_release_step > 0 .AND. &
+                    scf_env%iter_count >= scf_control%smear%moment_release_step)) THEN
+                  ! common Fermi level from the next step on; the mixing history belongs to the
+                  ! constrained occupations and starts again
+                  scf_control%smear%fixed_mag_mom = -100.0_dp
+                  scf_control%smear%fractional_fixed_moment = .FALSE.
+                  scf_control%smear%moment_released = .TRUE.
+                  IF (ASSOCIATED(scf_env%mixing_store)) THEN
+                     scf_env%mixing_store%ncall = 0
+                     scf_env%mixing_store%ncall_p = 0
+                     scf_env%mixing_store%dm_pulay_ncall = 0
+                  END IF
+                  moment_released_now = .TRUE.
+                  IF (output_unit > 0) WRITE (UNIT=output_unit, FMT="(/,T3,A,I0,A,ES10.2,/)") &
+                     "FIXED_MAGNETIC_MOMENT| released after step ", scf_env%iter_count, &
+                     ", change ", scf_env%iter_delta
+               END IF
+            END IF
+            IF (moment_released_now) THEN
+               exit_inner_loop = .FALSE.
+               inner_loop_converged = .FALSE.
+            ELSE
+               CALL qs_scf_check_inner_exit(qs_env, scf_env, scf_control, should_stop, just_energy, &
+                                            exit_inner_loop, inner_loop_converged, output_unit)
+            END IF
 
             ! In case we decide to exit we perform few more check to see if this one
             ! is really the last SCF step
