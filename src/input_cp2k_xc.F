@@ -1673,6 +1673,12 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="NATIVE_GRID_TRIAL_DIAGNOSTICS", &
+                          description="Report finite-state, field and adjoint ranges of the atom-composite Skala input.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="NATIVE_GRID_DIAGNOSTICS", &
                           description="Print diagnostic integrals of the CP2K-native SKALA GPW feature "// &
                           "block, including electron count, spin moment, and summed grid weights.", &

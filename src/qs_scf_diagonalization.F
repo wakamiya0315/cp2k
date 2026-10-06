@@ -32,9 +32,11 @@ MODULE qs_scf_diagonalization
    USE cp_control_types,                ONLY: dft_control_type,&
                                               hairy_probes_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
-        dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release_p, dbcsr_set, &
-        dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, dbcsr_type_symmetric
+        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
+        dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
+        dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, &
+        dbcsr_type_symmetric
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
@@ -112,7 +114,8 @@ MODULE qs_scf_diagonalization
                                               init_preconditioner
    USE qs_density_matrices,             ONLY: calculate_density_matrix
    USE qs_density_mixing_types,         ONLY: direct_mixing_nr,&
-                                              gspace_mixing_nr
+                                              gspace_mixing_nr,&
+                                              mixing_storage_type
    USE qs_diis,                         ONLY: qs_diis_b_calc_err_kp,&
                                               qs_diis_b_check_i_alloc_kp,&
                                               qs_diis_b_clear,&
@@ -184,7 +187,7 @@ MODULE qs_scf_diagonalization
              do_block_davidson_diag_kp, &
              do_block_krylov_diag, do_scf_diag_subspace, diag_subspace_allocate, &
              general_eigenproblem, diag_kp_smat, diag_kp_basic, &
-             qs_scf_get_ot_kpoint_operator
+             qs_scf_get_ot_kpoint_operator, qs_scf_pulay_trial_check
 
 CONTAINS
 
@@ -3802,5 +3805,330 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE diag_kp_smat
+
+! **************************************************************************************************
+!> \brief Diagnose and optionally reject a Pulay density candidate before any fields use it.
+!>        Dense occupation checks currently require a single MPI rank. Default-off calls return
+!>        before allocating or evaluating matrices. The raw map residual remains the convergence test.
+!> \param qs_env ...
+!> \param scf_env ...
+!> \param scf_control ...
+!> \param iw ...
+   SUBROUTINE qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, iw)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: scf_control
+      INTEGER, INTENT(IN)                                :: iw
+
+      INTEGER                                            :: ic, ik, ispin, nkp, nspin, opposite
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      LOGICAL                                            :: bad, do_kpoints, finite_trial, &
+                                                            full_step, rejected, spectral_ok
+      REAL(KIND=dp) :: alpha, charge_target, dot, extrap_norm2, fallback_alpha, hermitian_error, &
+         linear_norm2, maxocc, normalized_trace, occmax, occmin, ratio_step, rnorm2, snorm2
+      REAL(KIND=dp), ALLOCATABLE                         :: counts(:, :), rcounts(:)
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
+      TYPE(cp_cfm_type)                                  :: pk, raw, sk
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(cp_fm_type)                                   :: monitor_work
+      TYPE(cp_fm_type), POINTER                          :: fmwork
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s, pin, trial
+      TYPE(dbcsr_type)                                   :: linear, residual, step
+      TYPE(kp_transform_plan_type)                       :: pplan, splan
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_nl
+      TYPE(qs_rho_type), POINTER                         :: rho
+
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (.NOT. store%dm_trial_diagnostics) RETURN
+      CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, matrix_s_kp=matrix_s, &
+                      do_kpoints=do_kpoints, para_env=para_env)
+      IF (para_env%num_pe /= 1) CALL cp_abort(__LOCATION__, &
+                                              "PULAY_P trial diagnostics currently require one MPI rank")
+      CALL qs_rho_get(rho, rho_ao_kp=pin)
+      trial => scf_env%p_mix_new
+      nspin = SIZE(trial, 1)
+      full_step = store%dm_pulay_ncall == 0
+      ALLOCATE (counts(nspin, 3), rcounts(nspin))
+      counts = 0.0_dp
+      rcounts = 0.0_dp
+      rnorm2 = 0.0_dp
+      snorm2 = 0.0_dp
+      linear_norm2 = 0.0_dp
+      extrap_norm2 = 0.0_dp
+      finite_trial = .TRUE.
+      alpha = store%alpha
+      DO ic = 1, SIZE(trial, 2)
+         DO ispin = 1, nspin
+            CALL dbcsr_create(residual, template=pin(ispin, ic)%matrix)
+            CALL dbcsr_create(step, template=pin(ispin, ic)%matrix)
+            CALL dbcsr_create(linear, template=pin(ispin, ic)%matrix)
+            IF (full_step) THEN
+               CALL dbcsr_copy(residual, trial(ispin, ic)%matrix)
+               CALL dbcsr_add(residual, pin(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            ELSE
+               CALL dbcsr_copy(residual, store%dm_pulay_res_last(ispin, ic)%matrix)
+            END IF
+            CALL dbcsr_dot(residual, residual, dot)
+            rnorm2 = rnorm2 + dot
+            CALL dbcsr_dot(residual, matrix_s(1, ic)%matrix, dot)
+            rcounts(ispin) = rcounts(ispin) + dot
+            CALL dbcsr_copy(step, trial(ispin, ic)%matrix)
+            CALL dbcsr_add(step, pin(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            CALL dbcsr_dot(step, step, dot)
+            snorm2 = snorm2 + dot
+            CALL dbcsr_copy(linear, residual)
+            IF (nspin == 2 .AND. .NOT. full_step) THEN
+               opposite = 3 - ispin
+               CALL dbcsr_add(linear, store%dm_pulay_res_last(opposite, ic)%matrix, &
+                              0.5_dp*(alpha + store%alpha_mag), 0.5_dp*(alpha - store%alpha_mag))
+            ELSE
+               CALL dbcsr_scale(linear, MERGE(1.0_dp, alpha, full_step))
+            END IF
+            CALL dbcsr_dot(linear, linear, dot)
+            linear_norm2 = linear_norm2 + dot
+            CALL dbcsr_add(step, linear, 1.0_dp, -1.0_dp)
+            CALL dbcsr_dot(step, step, dot)
+            extrap_norm2 = extrap_norm2 + dot
+            CALL dbcsr_dot(pin(ispin, ic)%matrix, matrix_s(1, ic)%matrix, dot)
+            counts(ispin, 1) = counts(ispin, 1) + dot
+            CALL dbcsr_dot(trial(ispin, ic)%matrix, matrix_s(1, ic)%matrix, dot)
+            counts(ispin, 3) = counts(ispin, 3) + dot
+            CALL dbcsr_release(residual)
+            CALL dbcsr_release(step)
+            CALL dbcsr_release(linear)
+         END DO
+      END DO
+      counts(:, 2) = counts(:, 1) + rcounts
+      finite_trial = ALL(ieee_is_finite(counts)) .AND. ieee_is_finite(snorm2)
+      IF (.NOT. finite_trial .AND. iw > 0) &
+         WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| NONFINITE density candidate, step ", scf_env%iter_count
+      charge_target = SUM(counts(:, 2))
+      IF (iw > 0) THEN
+         WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| step ", scf_env%iter_count
+         DO ispin = 1, nspin
+            WRITE (iw, '(T2,A,I2,3ES22.12)') "SCF_TRIAL| spin,input,output,trial Tr(PS) ", ispin, counts(ispin, :)
+         END DO
+         ratio_step = SQRT(snorm2/MAX(rnorm2, TINY(1.0_dp)))
+         WRITE (iw, '(T2,A,5ES22.12)') "SCF_TRIAL| norms R,step,linear,extrapolation,step/R ", &
+            SQRT(rnorm2), SQRT(snorm2), SQRT(linear_norm2), SQRT(extrap_norm2), ratio_step
+      END IF
+      bad = .NOT. finite_trial .OR. &
+            ABS(SUM(counts(:, 3)) - charge_target) > store%dm_trial_charge_tol
+      maxocc = MERGE(2.0_dp, 1.0_dp, nspin == 1)
+      fmwork => scf_env%scf_work1(1)
+      CALL cp_fm_get_info(fmwork, matrix_struct=fmstruct)
+      CALL cp_fm_create(monitor_work, fmstruct)
+      CALL cp_cfm_create(pk, fmstruct)
+      CALL cp_cfm_create(sk, fmstruct)
+      CALL cp_cfm_create(raw, fmstruct)
+      nkp = 1
+      IF (do_kpoints) THEN
+         CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
+         CALL kp_transform_plan_create(pplan, sab_nl, cell_to_index, SIZE(trial, 2), trial(1, 1)%matrix)
+         CALL kp_transform_plan_create(splan, sab_nl, cell_to_index, SIZE(matrix_s, 2), matrix_s(1, 1)%matrix)
+      END IF
+      DO ik = 1, nkp
+         IF (do_kpoints) THEN
+            CALL kp_build_cfm(matrix_s, 1, xkp(:, ik), splan, sk)
+         ELSE
+            CALL copy_dbcsr_to_fm(matrix_s(1, 1)%matrix, monitor_work)
+            CALL cp_cfm_scale_and_add_fm(z_zero, sk, z_one, monitor_work)
+         END IF
+         DO ispin = 1, nspin
+            IF (do_kpoints) THEN
+               CALL kp_build_cfm(trial, ispin, xkp(:, ik), pplan, pk)
+            ELSE
+               CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
+               CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+            END IF
+            CALL trial_occupation_bounds(pk%local_data, sk%local_data, &
+                                         scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                         occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
+            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12,L3)') &
+               "SCF_TRIAL| k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
+               occmin, occmax, normalized_trace, hermitian_error, spectral_ok
+            bad = bad .OR. .NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
+                  occmax > 1.0_dp + store%dm_trial_occ_tol
+            ! The unmixed diagonalization output provides a physical noise reference at every k point.
+            IF (.NOT. full_step) THEN
+               IF (do_kpoints) THEN
+                  CALL kp_build_cfm(pin, ispin, xkp(:, ik), pplan, pk)
+                  CALL kp_build_cfm(store%dm_pulay_res_last, ispin, xkp(:, ik), pplan, raw)
+               ELSE
+                  CALL copy_dbcsr_to_fm(pin(ispin, 1)%matrix, monitor_work)
+                  CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+                  CALL copy_dbcsr_to_fm(store%dm_pulay_res_last(ispin, 1)%matrix, monitor_work)
+                  CALL cp_cfm_scale_and_add_fm(z_zero, raw, z_one, monitor_work)
+               END IF
+               pk%local_data = pk%local_data + raw%local_data
+            END IF
+            CALL trial_occupation_bounds(pk%local_data, sk%local_data, &
+                                         scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                         occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
+            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12,L3)') &
+               "SCF_TRIAL| raw-output k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
+               occmin, occmax, normalized_trace, hermitian_error, spectral_ok
+
+         END DO
+      END DO
+      rejected = store%dm_trial_reject .AND. bad
+      IF (store%dm_trial_step_limit > 0.0_dp) THEN
+         rejected = rejected .OR. .NOT. ieee_is_finite(snorm2) .OR. &
+                    snorm2 > store%dm_trial_step_limit**2*rnorm2
+      END IF
+      IF (rejected) THEN
+         IF (full_step .OR. .NOT. ALL(ieee_is_finite(counts(:, 1:2))) .OR. &
+             .NOT. ieee_is_finite(rnorm2)) &
+            CALL cp_abort(__LOCATION__, &
+                          "Pulay trial fallback has no finite physical endpoints; first failure is the raw map")
+         fallback_alpha = alpha
+         IF (store%dm_trial_step_limit > 0.0_dp) fallback_alpha = MIN(alpha, store%dm_trial_step_limit)
+         DO ic = 1, SIZE(trial, 2)
+            DO ispin = 1, nspin
+               CALL dbcsr_copy(trial(ispin, ic)%matrix, pin(ispin, ic)%matrix)
+               CALL dbcsr_add(trial(ispin, ic)%matrix, store%dm_pulay_res_last(ispin, ic)%matrix, &
+                              1.0_dp, fallback_alpha)
+            END DO
+         END DO
+         ! Certify the convex fallback in the same metric before fields can consume it.
+         DO ik = 1, nkp
+            IF (do_kpoints) THEN
+               CALL kp_build_cfm(matrix_s, 1, xkp(:, ik), splan, sk)
+            ELSE
+               CALL copy_dbcsr_to_fm(matrix_s(1, 1)%matrix, monitor_work)
+               CALL cp_cfm_scale_and_add_fm(z_zero, sk, z_one, monitor_work)
+            END IF
+            DO ispin = 1, nspin
+               IF (do_kpoints) THEN
+                  CALL kp_build_cfm(trial, ispin, xkp(:, ik), pplan, pk)
+               ELSE
+                  CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
+                  CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+               END IF
+               CALL trial_occupation_bounds(pk%local_data, sk%local_data, &
+                                            scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                            occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
+               IF (iw > 0) WRITE (iw, '(T2,A,2I6,2ES22.12,L3)') &
+                  "SCF_TRIAL| fallback k,spin,min,max,finite ", ik, ispin, occmin, occmax, spectral_ok
+               IF (.NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
+                   occmax > 1.0_dp + store%dm_trial_occ_tol) CALL cp_abort(__LOCATION__, &
+                                             "Linear Pulay fallback is outside the physical occupation domain; check the endpoints")
+            END DO
+         END DO
+         counts(:, 3) = 0.0_dp
+         DO ic = 1, SIZE(trial, 2)
+            DO ispin = 1, nspin
+               CALL dbcsr_dot(trial(ispin, ic)%matrix, matrix_s(1, ic)%matrix, dot)
+               counts(ispin, 3) = counts(ispin, 3) + dot
+            END DO
+         END DO
+         IF (ABS(SUM(counts(:, 3)) - charge_target) > store%dm_trial_charge_tol) &
+            CALL cp_abort(__LOCATION__, "Linear Pulay fallback has the wrong electron count")
+         store%dm_pulay_ncall = 0
+         store%dm_trial_fallback = .TRUE.
+         IF (iw > 0) WRITE (iw, '(T2,A,I6,ES22.12,L3)') &
+            "SCF_TRIAL| rejected,common-linear-alpha,invalid-domain ", scf_env%iter_count, fallback_alpha, bad
+      END IF
+      IF (do_kpoints) THEN
+         CALL kp_transform_plan_release(pplan)
+         CALL kp_transform_plan_release(splan)
+      END IF
+      CALL cp_cfm_release(pk)
+      CALL cp_cfm_release(sk)
+      CALL cp_cfm_release(raw)
+      CALL cp_fm_release(monitor_work)
+      DEALLOCATE (counts, rcounts)
+   END SUBROUTINE qs_scf_pulay_trial_check
+
+! **************************************************************************************************
+!> \brief Eigenvalues of the density in the overlap metric, normalized to [0,1].
+!> \param p ...
+!> \param s ...
+!> \param canonical ...
+!> \param eps_eigval ...
+!> \param maxocc ...
+!> \param occmin ...
+!> \param occmax ...
+!> \param trace ...
+!> \param hermitian_error ...
+!> \param finite ...
+   SUBROUTINE trial_occupation_bounds(p, s, canonical, eps_eigval, maxocc, &
+                                      occmin, occmax, trace, hermitian_error, finite)
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: p, s
+      LOGICAL, INTENT(IN)                                :: canonical
+      REAL(KIND=dp), INTENT(IN)                          :: eps_eigval, maxocc
+      REAL(KIND=dp), INTENT(OUT)                         :: occmin, occmax, trace, hermitian_error
+      LOGICAL, INTENT(OUT)                               :: finite
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: basis(:, :), metric(:, :), &
+                                                            physical(:, :), work(:)
+      INTEGER                                            :: first, i, info, j, n, nr
+      REAL(KIND=dp), ALLOCATABLE                         :: eig(:), rwork(:)
+
+      n = SIZE(p, 1)
+      occmin = 0.0_dp
+      occmax = 0.0_dp
+      trace = 0.0_dp
+      hermitian_error = 0.0_dp
+      finite = ALL(ieee_is_finite(REAL(p))) .AND. ALL(ieee_is_finite(AIMAG(p))) .AND. &
+               ALL(ieee_is_finite(REAL(s))) .AND. ALL(ieee_is_finite(AIMAG(s)))
+      IF (.NOT. finite) RETURN
+      hermitian_error = MAXVAL(ABS(p - CONJG(TRANSPOSE(p))))
+      ALLOCATE (metric(n, n), eig(n), work(MAX(1, 2*n)), rwork(MAX(1, 3*n)))
+      metric = s
+      IF (canonical) THEN
+         CALL zheev('V', 'U', n, metric, n, eig, work, SIZE(work), rwork, info)
+         finite = info == 0
+         IF (finite) THEN
+            first = 1
+            DO WHILE (first <= n)
+               IF (eig(first) >= eps_eigval) EXIT
+               first = first + 1
+            END DO
+            nr = n - first + 1
+            finite = nr > 0
+            IF (finite) THEN
+               ALLOCATE (basis(n, nr))
+               DO j = 1, nr
+                  basis(:, j) = metric(:, first + j - 1)*SQRT(eig(first + j - 1))
+               END DO
+               physical = MATMUL(CONJG(TRANSPOSE(basis)), MATMUL(p, basis))/maxocc
+               DEALLOCATE (basis)
+            END IF
+         END IF
+      ELSE
+         CALL zpotrf('U', n, metric, n, info)
+         finite = info == 0
+         IF (finite) THEN
+            DO j = 1, n
+               DO i = j + 1, n
+                  metric(i, j) = z_zero
+               END DO
+            END DO
+            nr = n
+            physical = MATMUL(metric, MATMUL(p, CONJG(TRANSPOSE(metric))))/maxocc
+         END IF
+      END IF
+      IF (finite) THEN
+         physical = 0.5_dp*(physical + CONJG(TRANSPOSE(physical)))
+         finite = ALL(ieee_is_finite(REAL(physical))) .AND. ALL(ieee_is_finite(AIMAG(physical)))
+         IF (finite) THEN
+            CALL zheev('N', 'U', nr, physical, nr, eig, work, SIZE(work), rwork, info)
+            finite = info == 0 .AND. ALL(ieee_is_finite(eig(1:nr)))
+            IF (finite) THEN
+               occmin = MINVAL(eig(1:nr))
+               occmax = MAXVAL(eig(1:nr))
+               trace = SUM(eig(1:nr))*maxocc
+            END IF
+         END IF
+      END IF
+      IF (ALLOCATED(physical)) DEALLOCATE (physical)
+      DEALLOCATE (metric, eig, work, rwork)
+   END SUBROUTINE trial_occupation_bounds
 
 END MODULE qs_scf_diagonalization

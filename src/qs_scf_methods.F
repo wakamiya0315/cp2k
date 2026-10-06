@@ -45,6 +45,7 @@ MODULE qs_scf_methods
                                               cp_fm_to_fm,&
                                               cp_fm_type
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
+   USE ieee_arithmetic,                 ONLY: ieee_is_finite
    USE input_constants,                 ONLY: cholesky_inverse,&
                                               cholesky_off,&
                                               cholesky_reduce,&
@@ -212,7 +213,7 @@ CONTAINS
 
       IF (invert) THEN
          ! P_out = P_in + R of the present step; after a full step p_mix_new is P_out already
-         IF (mixing_store%dm_pulay_ncall > 0) THEN
+         IF (mixing_store%dm_pulay_ncall > 0 .OR. mixing_store%dm_trial_fallback) THEN
             DO ic = 1, nimg
                DO ispin = 1, nspin
                   CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, 0.0_dp, 1.0_dp)
@@ -224,6 +225,8 @@ CONTAINS
          CALL timestop(handle)
          RETURN
       END IF
+
+      mixing_store%dm_trial_fallback = .FALSE.
 
       ! residual R = P_out - P_in, kept in p_mix_new until the update
       DO ic = 1, nimg
@@ -327,6 +330,7 @@ CONTAINS
          END DO
          CALL invert_matrix(a, b, inv_err)
          g = MATMUL(b, c)
+         IF (mixing_store%dm_trial_diagnostics) CALL trial_history_report(mixing_store, a, b, g)
       END IF
 
       ! keep P_in and R of this step, then form the next input in place of R
@@ -388,7 +392,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(OUT)                         :: iter_delta
       LOGICAL, INTENT(IN)                                :: full_step, invert
 
-      CHARACTER(len=*), PARAMETER                        :: routineN = 'dm_pulay_mixing_spin'
+      CHARACTER(len=*), PARAMETER :: routineN = 'dm_pulay_mixing_spin'
 
       INTEGER                                            :: handle, ib, ic, ich, ispin, iw, jb, kb, &
                                                             nb, nbuffer, nch, nimg
@@ -411,7 +415,7 @@ CONTAINS
       iter_delta = 0.0_dp
 
       IF (invert) THEN
-         IF (mixing_store%dm_pulay_ncall > 0) THEN
+         IF (mixing_store%dm_pulay_ncall > 0 .OR. mixing_store%dm_trial_fallback) THEN
             DO ic = 1, nimg
                DO ispin = 1, 2
                   CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, 0.0_dp, 1.0_dp)
@@ -423,6 +427,8 @@ CONTAINS
          CALL timestop(handle)
          RETURN
       END IF
+
+      mixing_store%dm_trial_fallback = .FALSE.
 
       ! residuals of both spins in p_mix_new
       DO ic = 1, nimg
@@ -577,6 +583,7 @@ CONTAINS
          CALL invert_matrix(a, b, inv_err)
          g = MATMUL(b, c)
          IF (nch == 2 .AND. .NOT. joint_step) g(:) = g(:)/t(:)
+         IF (mixing_store%dm_trial_diagnostics) CALL trial_history_report(mixing_store, a, b, g)
       END IF
 
       ! steps of the total (Pulay) and spin (linear, or Pulay with PULAY_P_JOINT) density matrices,
@@ -1394,5 +1401,44 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE shift_unocc_mos
+
+! **************************************************************************************************
+!> \brief Report regularized Gram conditioning and Pulay coefficients without changing the update.
+!> \param mixing_store ...
+!> \param a ...
+!> \param b ...
+!> \param g ...
+   SUBROUTINE trial_history_report(mixing_store, a, b, g)
+      TYPE(mixing_storage_type), POINTER                 :: mixing_store
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: a, b
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: g
+
+      INTEGER                                            :: i, info, iw, n
+      REAL(KIND=dp)                                      :: condition1, condition2
+      REAL(KIND=dp), ALLOCATABLE                         :: eig(:), gram(:, :), work(:)
+
+      iw = cp_logger_get_default_io_unit()
+      n = SIZE(g)
+      IF (.NOT. ALL(ieee_is_finite(a)) .OR. .NOT. ALL(ieee_is_finite(b)) .OR. &
+          .NOT. ALL(ieee_is_finite(g))) THEN
+         IF (iw > 0) WRITE (iw, '(T2,A)') "SCF_TRIAL| NONFINITE Pulay normal equations or coefficients"
+         RETURN
+      END IF
+      condition1 = MAXVAL(SUM(ABS(a), DIM=1))*MAXVAL(SUM(ABS(b), DIM=1))
+      ALLOCATE (gram(n, n), eig(n), work(MAX(1, 3*n)))
+      gram = a
+      DO i = 1, n
+         gram(i, i) = gram(i, i) - mixing_store%broy_w0
+      END DO
+      CALL dsyev('N', 'U', n, gram, n, eig, work, SIZE(work), info)
+      condition2 = HUGE(1.0_dp)
+      IF (info == 0 .AND. MINVAL(eig) > 0.0_dp) condition2 = MAXVAL(eig)/MINVAL(eig)
+      IF (iw > 0) THEN
+         WRITE (iw, '(T2,A,I6,2ES22.12)') "SCF_TRIAL| history,raw-cond2,regularized-cond1 ", &
+            n, condition2, condition1
+         WRITE (iw, '(T2,A,*(ES22.12))') "SCF_TRIAL| coefficients ", g
+      END IF
+      DEALLOCATE (gram, eig, work)
+   END SUBROUTINE trial_history_report
 
 END MODULE qs_scf_methods
