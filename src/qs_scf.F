@@ -3306,7 +3306,7 @@ CONTAINS
       REAL(KIND=dp)                                      :: dot, grid_count, nel_spin(2), &
                                                             occupation_count(2), tolerance, &
                                                             trace_count(2)
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: wkp
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: tot_rho_r, wkp
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s, rho_ao
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -3319,7 +3319,7 @@ CONTAINS
       IF (.NOT. scf_control%smear%do_smear) RETURN
       IF (.NOT. separate_smear_spins(scf_control%smear)) RETURN
       CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, mos=mos, matrix_s_kp=matrix_s, do_kpoints=do_kpoints)
-      CALL qs_rho_get(rho, rho_ao_kp=rho_ao)
+      CALL qs_rho_get(rho, rho_ao_kp=rho_ao, tot_rho_r=tot_rho_r)
       occupation_count = 0.0_dp
       IF (do_kpoints) THEN
          CALL get_mo_set(kpoints%kp_env(1)%kpoint_env%mos(1, 1), nelectron=ne_a)
@@ -3352,7 +3352,7 @@ CONTAINS
       DO ispin = 1, 2
          tolerance = MAX(1.0E-6_dp, &
                          10.0_dp*scf_control%smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin)))
-         grid_count = ABS(rho%tot_rho_r(ispin))
+         grid_count = ABS(tot_rho_r(ispin))
          IF (iw > 0) WRITE (iw, '(T2,A,I2,4ES22.12)') &
             "FIXED_MOMENT| spin,target,occupation,Tr(PS),grid ", ispin, nel_spin(ispin), &
             occupation_count(ispin), trace_count(ispin), grid_count
