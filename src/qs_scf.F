@@ -200,6 +200,8 @@ MODULE qs_scf
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
    USE qs_scf_diagonalization,          ONLY: do_general_diag_kp,&
+                                              qs_scf_full_bloch_initialize,&
+                                              qs_scf_full_bloch_save,&
                                               qs_scf_get_ot_kpoint_operator,&
                                               qs_scf_pulay_trial_check
    USE qs_scf_initialization,           ONLY: qs_scf_env_initialize
@@ -429,11 +431,11 @@ CONTAINS
          ot_kp_subspace_refresh_iter_count, output_unit, scf_energy_message_tag, total_steps
       LOGICAL :: ace_active, added_mos_auto_grow, adiis_pushed, adiis_restarted, adiis_stagnated, &
          adiis_validation, density_full_step, diis_step, do_kpoints, energy_only, exit_inner_loop, &
-         exit_outer_loop, inner_loop_converged, internal_tblite_density_full_step, &
-         internal_tblite_mixer, just_energy, oda_applied, oda_eligible, oda_globalization_active, &
-         oda_interior, oda_predictor_valid, oda_restart_trigger, oda_state_evaluated, oda_trigger, &
-         ot_kp_subspace_refresh, ot_kp_subspace_refresh_pending, outer_loop_converged, &
-         tblite_native_mixer
+         exit_outer_loop, full_bloch_changed, inner_loop_converged, &
+         internal_tblite_density_full_step, internal_tblite_mixer, just_energy, oda_applied, &
+         oda_eligible, oda_globalization_active, oda_interior, oda_predictor_valid, &
+         oda_restart_trigger, oda_state_evaluated, oda_trigger, ot_kp_subspace_refresh, &
+         ot_kp_subspace_refresh_pending, outer_loop_converged, tblite_native_mixer
       REAL(KIND=dp)                                      :: adiis_raw_delta, adiis_step_delta, &
                                                             oda_predictor_lambda, t1, t2
       REAL(KIND=dp), DIMENSION(3)                        :: res_val_3
@@ -640,6 +642,11 @@ CONTAINS
             total_steps = total_steps + 1
             just_energy = energy_only
 
+            CALL qs_scf_full_bloch_initialize(qs_env, scf_env, full_bloch_changed)
+            IF (full_bloch_changed) THEN
+               CALL qs_scf_commit_density_candidate(scf_env, rho)
+               CALL qs_scf_rho_update(rho, qs_env, scf_env, ks_env, mix_rho=.FALSE.)
+            END IF
             CALL qs_ks_update_qs_env(qs_env, just_energy=just_energy, &
                                      calculate_forces=.FALSE.)
             CALL qs_scf_trial_finite_probe(qs_env, scf_env, "KS")
@@ -1072,6 +1079,7 @@ CONTAINS
 
       converged = inner_loop_converged .AND. outer_loop_converged
       total_scf_steps = total_steps
+      CALL qs_scf_full_bloch_save(qs_env, scf_env, converged)
 
       IF (dft_control%qs_control%cdft) THEN
          dft_control%qs_control%cdft_control%total_steps = &
