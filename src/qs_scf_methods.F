@@ -18,9 +18,12 @@
 ! **************************************************************************************************
 MODULE qs_scf_methods
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_desymmetrize, dbcsr_get_block_p, dbcsr_iterator_blocks_left, &
-        dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
-        dbcsr_multiply, dbcsr_p_type, dbcsr_type
+        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_desymmetrize, dbcsr_get_block_p, &
+        dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
+        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_scale, &
+        dbcsr_type
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot,&
+                                              dbcsr_maxabs
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               cp_dbcsr_sm_fm_multiply
    USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
@@ -46,9 +49,11 @@ MODULE qs_scf_methods
                                               cholesky_reduce,&
                                               cholesky_restore
    USE kinds,                           ONLY: dp
+   USE mathlib,                         ONLY: invert_matrix
    USE message_passing,                 ONLY: mp_para_env_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
-   USE qs_density_mixing_types,         ONLY: mixing_storage_type
+   USE qs_density_mixing_types,         ONLY: dm_pulay_storage_release,&
+                                              mixing_storage_type
    USE qs_mo_types,                     ONLY: get_mo_set,&
                                               mo_set_type
 #include "./base/base_uses.f90"
@@ -118,6 +123,14 @@ CONTAINS
          my_p_mix = 1.0_dp
       END IF
 
+      IF (mixing_store%dm_pulay) THEN
+         CALL dm_pulay_mixing(p_mix_new, mixing_store, rho_ao, iter_delta, &
+                              full_step=my_diis .OR. iter_count < mixing_store%nskip_mixing, &
+                              invert=my_invert)
+         CALL timestop(handle)
+         RETURN
+      END IF
+
       iter_delta = 0.0_dp
       CPASSERT(ASSOCIATED(p_mix_new))
       DO ic = 1, SIZE(p_mix_new, 2)
@@ -144,6 +157,205 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE scf_env_density_mixing
+
+! **************************************************************************************************
+!> \brief Pulay (Anderson) mixing of the real-space density matrices (MIXING%PULAY_P)
+!> \param p_mix_new    on entry the output density matrices P_out of the diagonalization, on exit
+!>                     the input density matrices of the next step
+!> \param mixing_store holds the history: P_in and the residual of the previous step, and NBUFFER
+!>                     normalized differences of both
+!> \param rho_ao       input density matrices P_in of the present step
+!> \param iter_delta   largest element of |P_out - P_in| over all spins and images, the
+!>                     convergence measure of DIRECT_P_MIXING
+!> \param full_step    take P_out unmixed (NSKIP) and restart the history
+!> \param invert       recover P_out of the present step from the mixed matrices (after convergence)
+!> \par Method
+!>      With residuals R = P_out - P_in and the differences dR_j = R_j+1 - R_j and
+!>      dP_j = P_in,j+1 - P_in,j of consecutive steps, each pair divided by |dR_j|, the next input
+!>      is P_in + alpha R - sum_j g_j (dP_j + alpha dR_j), g = (<dR_j,dR_k> + w0 delta_jk)^-1 <dR_j,R>.
+!>      This is the update of broyden_mixing (qs_gspace_mixing) with the constant preconditioner
+!>      alpha in place of the Kerker factor, and the Frobenius inner product of the stored matrix
+!>      elements of all spins and images (off-diagonal blocks of symmetric matrices twice) in place
+!>      of the G-space metric. Unlike the G-space schemes it mixes one object from which the grid
+!>      densities, the kinetic energy density and the GAPW one-centre terms are all derived.
+!>      The first step and a full step mix linearly with alpha.
+! **************************************************************************************************
+   SUBROUTINE dm_pulay_mixing(p_mix_new, mixing_store, rho_ao, iter_delta, full_step, invert)
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: p_mix_new
+      TYPE(mixing_storage_type), POINTER                 :: mixing_store
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
+      REAL(KIND=dp), INTENT(OUT)                         :: iter_delta
+      LOGICAL, INTENT(IN)                                :: full_step, invert
+
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'dm_pulay_mixing'
+
+      INTEGER                                            :: handle, ib, ic, ispin, jb, kb, nb, &
+                                                            nbuffer, nimg, nspin
+      REAL(KIND=dp)                                      :: alpha, inv_err, norm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c, g
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a, b
+
+      CALL timeset(routineN, handle)
+
+      nspin = SIZE(p_mix_new, 1)
+      nimg = SIZE(p_mix_new, 2)
+      nbuffer = MAX(mixing_store%nbuffer, 1)
+      alpha = mixing_store%alpha
+      iter_delta = 0.0_dp
+
+      IF (invert) THEN
+         ! P_out = P_in + R of the present step; after a full step p_mix_new is P_out already
+         IF (mixing_store%dm_pulay_ncall > 0) THEN
+            DO ic = 1, nimg
+               DO ispin = 1, nspin
+                  CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, 0.0_dp, 1.0_dp)
+                  CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, &
+                                 mixing_store%dm_pulay_res_last(ispin, ic)%matrix, 1.0_dp, 1.0_dp)
+               END DO
+            END DO
+         END IF
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      ! residual R = P_out - P_in, kept in p_mix_new until the update
+      DO ic = 1, nimg
+         DO ispin = 1, nspin
+            CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            iter_delta = MAX(iter_delta, dbcsr_maxabs(p_mix_new(ispin, ic)%matrix))
+         END DO
+      END DO
+
+      IF (full_step) THEN
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, 1.0_dp, 1.0_dp)
+            END DO
+         END DO
+         mixing_store%dm_pulay_ncall = 0
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      mixing_store%dm_pulay_ncall = mixing_store%dm_pulay_ncall + 1
+      IF (mixing_store%dm_pulay_ncall == 1) THEN
+         ! a new history with the sparsity of the present matrices
+         CALL dm_pulay_storage_release(mixing_store)
+         mixing_store%dm_pulay_ncall = 1
+         ALLOCATE (mixing_store%dm_pulay_p_last(nspin, nimg), mixing_store%dm_pulay_res_last(nspin, nimg))
+         ALLOCATE (mixing_store%dm_pulay_dp(nbuffer, nspin, nimg), &
+                   mixing_store%dm_pulay_dres(nbuffer, nspin, nimg))
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               ALLOCATE (mixing_store%dm_pulay_p_last(ispin, ic)%matrix, &
+                         mixing_store%dm_pulay_res_last(ispin, ic)%matrix)
+               CALL dbcsr_create(mixing_store%dm_pulay_p_last(ispin, ic)%matrix, &
+                                 template=rho_ao(ispin, ic)%matrix, name="PULAY_P P_IN")
+               CALL dbcsr_create(mixing_store%dm_pulay_res_last(ispin, ic)%matrix, &
+                                 template=rho_ao(ispin, ic)%matrix, name="PULAY_P RESIDUAL")
+               DO ib = 1, nbuffer
+                  ALLOCATE (mixing_store%dm_pulay_dp(ib, ispin, ic)%matrix, &
+                            mixing_store%dm_pulay_dres(ib, ispin, ic)%matrix)
+                  CALL dbcsr_create(mixing_store%dm_pulay_dp(ib, ispin, ic)%matrix, &
+                                    template=rho_ao(ispin, ic)%matrix, name="PULAY_P DP")
+                  CALL dbcsr_create(mixing_store%dm_pulay_dres(ib, ispin, ic)%matrix, &
+                                    template=rho_ao(ispin, ic)%matrix, name="PULAY_P DRES")
+               END DO
+            END DO
+         END DO
+         nb = 0
+      ELSE
+         ! new pair of differences in slot ib, normalized by |dR|
+         nb = MIN(mixing_store%dm_pulay_ncall - 1, nbuffer)
+         ib = MODULO(mixing_store%dm_pulay_ncall - 2, nbuffer) + 1
+         norm = 0.0_dp
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               CALL dbcsr_copy(mixing_store%dm_pulay_dres(ib, ispin, ic)%matrix, p_mix_new(ispin, ic)%matrix)
+               CALL dbcsr_add(mixing_store%dm_pulay_dres(ib, ispin, ic)%matrix, &
+                              mixing_store%dm_pulay_res_last(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               CALL dbcsr_copy(mixing_store%dm_pulay_dp(ib, ispin, ic)%matrix, rho_ao(ispin, ic)%matrix)
+               CALL dbcsr_add(mixing_store%dm_pulay_dp(ib, ispin, ic)%matrix, &
+                              mixing_store%dm_pulay_p_last(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               norm = norm + frobenius_dot(mixing_store%dm_pulay_dres(ib, ispin, ic)%matrix, &
+                                           mixing_store%dm_pulay_dres(ib, ispin, ic)%matrix)
+            END DO
+         END DO
+         norm = SQRT(norm)
+         IF (norm > 0.0_dp) THEN
+            DO ic = 1, nimg
+               DO ispin = 1, nspin
+                  CALL dbcsr_scale(mixing_store%dm_pulay_dres(ib, ispin, ic)%matrix, 1.0_dp/norm)
+                  CALL dbcsr_scale(mixing_store%dm_pulay_dp(ib, ispin, ic)%matrix, 1.0_dp/norm)
+               END DO
+            END DO
+         ELSE
+            nb = 0 ! no new information: mix linearly
+         END IF
+      END IF
+
+      ! coefficients g of the history from the normal equations
+      IF (nb > 0) THEN
+         ALLOCATE (a(nb, nb), b(nb, nb), c(nb), g(nb))
+         a = 0.0_dp
+         c = 0.0_dp
+         DO jb = 1, nb
+            DO kb = jb, nb
+               DO ic = 1, nimg
+                  DO ispin = 1, nspin
+                     a(jb, kb) = a(jb, kb) + &
+                                 frobenius_dot(mixing_store%dm_pulay_dres(jb, ispin, ic)%matrix, &
+                                               mixing_store%dm_pulay_dres(kb, ispin, ic)%matrix)
+                  END DO
+               END DO
+               a(kb, jb) = a(jb, kb)
+            END DO
+            a(jb, jb) = a(jb, jb) + mixing_store%broy_w0
+            DO ic = 1, nimg
+               DO ispin = 1, nspin
+                  c(jb) = c(jb) + frobenius_dot(mixing_store%dm_pulay_dres(jb, ispin, ic)%matrix, &
+                                                p_mix_new(ispin, ic)%matrix)
+               END DO
+            END DO
+         END DO
+         CALL invert_matrix(a, b, inv_err)
+         g = MATMUL(b, c)
+      END IF
+
+      ! keep P_in and R of this step, then form the next input in place of R
+      DO ic = 1, nimg
+         DO ispin = 1, nspin
+            CALL dbcsr_copy(mixing_store%dm_pulay_p_last(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix)
+            CALL dbcsr_copy(mixing_store%dm_pulay_res_last(ispin, ic)%matrix, p_mix_new(ispin, ic)%matrix)
+            CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, alpha, 1.0_dp)
+            DO jb = 1, nb
+               CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, mixing_store%dm_pulay_dp(jb, ispin, ic)%matrix, &
+                              1.0_dp, -g(jb))
+               CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, mixing_store%dm_pulay_dres(jb, ispin, ic)%matrix, &
+                              1.0_dp, -alpha*g(jb))
+            END DO
+         END DO
+      END DO
+
+      IF (nb > 0) DEALLOCATE (a, b, c, g)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE dm_pulay_mixing
+
+! **************************************************************************************************
+!> \brief Sum of the products of the stored elements of two matrices of the same structure
+!> \param matrix_a ...
+!> \param matrix_b ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION frobenius_dot(matrix_a, matrix_b) RESULT(dot)
+      TYPE(dbcsr_type), INTENT(IN)                       :: matrix_a, matrix_b
+      REAL(KIND=dp)                                      :: dot
+
+      CALL dbcsr_dot(matrix_a, matrix_b, dot)
+
+   END FUNCTION frobenius_dot
 
 ! **************************************************************************************************
 !> \brief   Diagonalise the Kohn-Sham matrix to get a new set of MO eigen-

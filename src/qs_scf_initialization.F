@@ -825,6 +825,9 @@ CONTAINS
             scf_env%skip_diis = .TRUE.
             CPWARN("the DIIS scheme is disabled, since EPS_DIIS < EPS_SCF")
          END IF
+         ! PULAY_P accelerates on the density-matrix residual; a Kohn-Sham DIIS step would leave
+         ! its history, so the two are not combined
+         IF (scf_env%mixing_store%dm_pulay) scf_env%skip_diis = .TRUE.
       END IF
 
    END SUBROUTINE qs_scf_ensure_mixing
@@ -1452,6 +1455,16 @@ CONTAINS
             CALL lowdin_kp_initial_density(qs_env, scf_env%scf_work1(1))
             CALL get_qs_env(qs_env, kpoints=kpoints)
             auxiliary => kpoints%lowdin_q
+         END IF
+      END IF
+      IF (scf_env%mixing_method == direct_mixing_nr) THEN
+         ! a new SCF run starts the density-matrix Pulay history afresh
+         IF (scf_env%mixing_store%dm_pulay) THEN
+            ! The Lowdin k-point populations are mixed linearly with ALPHA beside the density
+            ! matrices; they are not part of the density-matrix Pulay history.
+            IF (ASSOCIATED(auxiliary)) &
+               CPABORT("MIXING%PULAY_P does not support Lowdin DFT+U with k-points")
+            scf_env%mixing_store%dm_pulay_ncall = 0
          END IF
       END IF
       IF (scf_env%mixing_method > 1) THEN
