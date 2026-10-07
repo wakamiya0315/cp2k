@@ -996,7 +996,7 @@ CONTAINS
          CALL qs_diis_b_step_kp(kpoints%scf_diis_buffer, coeffs, ib, nb, scf_env%iter_delta, diis_error, &
                                 cdiis_step, scf_control%eps_diis, nspin, nkp, kplocal, &
                                 MERGE(2, scf_control%nmixing, use_adiis), &
-                                scf_section, para_env_global)
+                                scf_section, para_env_global, complex_errors=.NOT. use_real_wfn)
          diis_weight = 1.0_dp
          IF (use_adiis) THEN
             diis_weight = scf_env%scf_subspace_buffer%diis_weight
@@ -1324,7 +1324,7 @@ CONTAINS
          CALL qs_diis_b_step_kp(kpoints%scf_diis_buffer, coeffs, ib, nb, scf_env%iter_delta, diis_error, &
                                 cdiis_step, scf_control%eps_diis, nspin, kplocal, kplocal, &
                                 MERGE(2, scf_control%nmixing, use_adiis), &
-                                scf_section, para_env_global)
+                                scf_section, para_env_global, complex_errors=.TRUE.)
          diis_weight = 1.0_dp
          IF (use_adiis) THEN
             diis_weight = scf_env%scf_subspace_buffer%diis_weight

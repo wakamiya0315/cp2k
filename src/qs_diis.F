@@ -1258,10 +1258,11 @@ CONTAINS
 !> \param nkp_local ...
 !> \param nmixing ...
 !> \param scf_section ...
-!> \param para_env ...
+!> \param para_env Global environment for summing independent k-point groups.
+!> \param complex_errors Normalize replicated complex group traces; absent preserves legacy real errors.
 ! **************************************************************************************************
    SUBROUTINE qs_diis_b_step_kp(diis_buffer, coeffs, ib, nb, delta, error_max, diis_step, eps_diis, &
-                                nspin, nkp, nkp_local, nmixing, scf_section, para_env)
+                                nspin, nkp, nkp_local, nmixing, scf_section, para_env, complex_errors)
 
       TYPE(qs_diis_buffer_type_kp), POINTER              :: diis_buffer
       COMPLEX(KIND=dp), DIMENSION(:), INTENT(INOUT)      :: coeffs
@@ -1274,6 +1275,7 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: nmixing
       TYPE(section_vals_type), POINTER                   :: scf_section
       TYPE(mp_para_env_type), POINTER                    :: para_env
+      LOGICAL, INTENT(IN), OPTIONAL                      :: complex_errors
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'qs_diis_b_step_kp'
       REAL(KIND=dp), PARAMETER :: eigenvalue_threshold = 1.0E-12_dp
@@ -1281,9 +1283,10 @@ CONTAINS
       CHARACTER(LEN=2*default_string_length)             :: message
       COMPLEX(KIND=dp)                                   :: tmp
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: a, b
-      INTEGER                                            :: handle, ikp, ispin, jb, my_nmixing, nb1, &
+      INTEGER                                            :: gauge_mode, group_size, handle, ikp, &
+                                                            ispin, jb, kb, my_nmixing, nb1, &
                                                             output_unit
-      LOGICAL                                            :: eigenvectors_discarded
+      LOGICAL                                            :: eigenvectors_discarded, my_complex_errors
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ev
       TYPE(cp_cfm_type)                                  :: old_errors
       TYPE(cp_cfm_type), POINTER                         :: new_errors
@@ -1297,6 +1300,12 @@ CONTAINS
 
       diis_step = .FALSE.
 
+      my_complex_errors = .FALSE.
+      IF (PRESENT(complex_errors)) my_complex_errors = complex_errors
+      gauge_mode = 0
+      IF (my_complex_errors) THEN
+         CALL section_vals_val_get(scf_section, "DIAGONALIZATION%DIIS_TEST_GAUGE", i_val=gauge_mode)
+      END IF
       my_nmixing = 2
       IF (PRESENT(nmixing)) my_nmixing = nmixing
 
@@ -1313,6 +1322,8 @@ CONTAINS
 
       ! Calculate the DIIS buffer, and update it if max_error < eps_diis
       CALL cp_cfm_get_info(diis_buffer%error(ib, 1, 1), matrix_struct=matrix_struct)
+      group_size = 1
+      IF (my_complex_errors) group_size = matrix_struct%para_env%num_pe
       CALL cp_fm_create(ierr, matrix_struct)
       CALL cp_fm_create(rerr, matrix_struct)
       CALL cp_cfm_create(old_errors, matrix_struct)
@@ -1327,6 +1338,9 @@ CONTAINS
                CALL cp_fm_scale(-1.0_dp, ierr)
                CALL cp_fm_to_cfm(rerr, ierr, old_errors)
                CALL cp_cfm_trace(old_errors, new_errors, tmp)
+               ! The group-reduced trace is replicated on every matrix-group rank.
+               ! A subsequent world sum must count it once, preserving the real route.
+               IF (group_size > 1) tmp = tmp/REAL(group_size, dp)
                b(jb, ib) = b(jb, ib) + 1.0_dp/REAL(nkp, dp)*tmp
             END DO
          END DO
@@ -1431,6 +1445,17 @@ CONTAINS
          coeffs(ib) = 1.0_dp
       END IF
 
+      IF (gauge_mode > 0 .AND. para_env%mepos == 0) THEN
+         DO jb = 1, nb
+            DO kb = 1, nb
+               WRITE (*, '(A,4I7,2ES23.14)') " DIIS_GRAM| ncall,nb,row,col,re,im ", &
+                  diis_buffer%ncall, nb, jb, kb, REAL(diis_buffer%b_matrix(jb, kb), dp), &
+                  AIMAG(diis_buffer%b_matrix(jb, kb))
+            END DO
+            WRITE (*, '(A,3I7,L3,2ES23.14)') " DIIS_COEFF| ncall,nb,row,diis,re,im ", &
+               diis_buffer%ncall, nb, jb, diis_step, REAL(coeffs(jb), dp), AIMAG(coeffs(jb))
+         END DO
+      END IF
       CALL cp_print_key_finished_output(output_unit, logger, scf_section, &
                                         "PRINT%DIIS_INFO")
 
