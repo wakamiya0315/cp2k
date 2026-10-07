@@ -865,6 +865,31 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="REFRESH_KEEP_STATE", &
+                          description="At a k-point OT reference-chart refresh, keep the current orbitals,"// &
+                          " occupations and auxiliary MO labels and reset only the chart and its history."// &
+                          " By default the refresh replaces them by a full Kohn-Sham diagonalization of H[P].", &
+                          usage="REFRESH_KEEP_STATE ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CHECK_INTERPOLATED_ENERGY", &
+                          description="In the three-point line search of occupation-preconditioned complex"// &
+                          " Mermin OT, evaluate the actual free energy at the interpolated point before the"// &
+                          " search ends. An uphill point is replaced by the lowest evaluated sample on the"// &
+                          " same direction, or the step is halved (at most 12 evaluations).", &
+                          usage="CHECK_INTERPOLATED_ENERGY ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COUNT_FULL_GRADIENTS", &
+                          description="Count only SCF steps with a full Kohn-Sham build towards the SCF step"// &
+                          " count used by the convergence test, and do not accept convergence on an"// &
+                          " energy-only line-search trial, which carries the residual of its origin.", &
+                          usage="COUNT_FULL_GRADIENTS ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create( &
          keyword, __LOCATION__, name="STEPSIZE", &
          description="Initial stepsize used for the line search, sometimes this parameter can be reduced to stabilize DIIS"// &

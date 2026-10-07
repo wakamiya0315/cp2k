@@ -347,7 +347,9 @@ CONTAINS
          search(1)%line_search_count = 0
          search(1)%ds_min = 0.15_dp
          DO channel = 1, 2
-            search(channel)%settings%occupation_preconditioner = scenario /= 3
+            ! Scenario 3 keeps the Mermin preconditioner with the actual-F check at its
+            ! default (off), which must leave the upstream three-point search unchanged.
+            search(channel)%settings%check_interpolated_energy = scenario /= 3
             CALL put_complex_pair(coordinate(1, channel), coordinate(2, channel), base_x(:, :, channel))
             CALL put_complex_pair(rotation(1, channel), rotation(2, channel), base_a(:, :, channel))
             search(channel)%ener_x = base_labels((channel - 1)*k + 1:channel*k)
@@ -363,7 +365,7 @@ CONTAINS
             CALL do_line_search_3pnt(search)
             IF (sample == 3) THEN
                IF (scenario == 3) THEN
-                  ! The conventional three-point path keeps its original gradient request.
+                  ! Without the check the three-point path keeps its original gradient request.
                   IF (search(1)%energy_only .OR. .NOT. search(1)%line_search_might_be_done) nfail = nfail + 1
                ELSE
                   IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done) nfail = nfail + 1

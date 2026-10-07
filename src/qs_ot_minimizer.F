@@ -1283,7 +1283,10 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      guarded_mermin = use_three_point_mermin_search(qs_ot_env)
+      ! The actual-F check is opt-in (CHECK_INTERPOLATED_ENERGY); without it this search is
+      ! the upstream three-point search.
+      guarded_mermin = use_three_point_mermin_search(qs_ot_env) .AND. &
+                       qs_ot_env(1)%settings%check_interpolated_energy
       IF (guarded_mermin .AND. .NOT. ieee_is_finite(qs_ot_env(1)%etotal)) THEN
          CPABORT("Nonfinite actual Mermin free energy during OT line search.")
       END IF

@@ -458,8 +458,8 @@ CONTAINS
          adiis_validation, density_full_step, diis_step, do_kpoints, energy_only, exit_inner_loop, &
          exit_outer_loop, full_bloch_changed, inner_loop_converged, &
          internal_tblite_density_full_step, internal_tblite_mixer, just_energy, &
-         ot_kp_subspace_refresh, ot_kp_subspace_refresh_pending, outer_loop_converged, &
-         tblite_native_mixer, u_changed
+         ot_count_full_gradients, ot_kp_subspace_refresh, ot_kp_subspace_refresh_pending, &
+         outer_loop_converged, tblite_native_mixer, u_changed
       REAL(dp), POINTER                                  :: subspace_density(:, :), &
                                                             subspace_fock(:, :)
       REAL(KIND=dp)                                      :: adiis_raw_delta, adiis_step_delta, t1, t2
@@ -605,6 +605,10 @@ CONTAINS
                             kp_ot_entry_reason=kp_ot_entry_reason)
          kp_ot_entry_reason = kp_ot_entry_reuse
          scf_env%adiis_shift = scf_control%diagonalization%adiis_shift
+         ot_count_full_gradients = .FALSE.
+         IF (scf_env%method == ot_method_nr .AND. ASSOCIATED(scf_env%qs_ot_env)) THEN
+            ot_count_full_gradients = scf_env%qs_ot_env(1)%settings%count_full_gradients
+         END IF
 
          CALL qs_scf_set_loop_flags(scf_env, diis_step, &
                                     energy_only, just_energy, exit_inner_loop)
@@ -628,6 +632,9 @@ CONTAINS
 
             CALL timeset(routineN//"_inner_loop", handle2)
 
+            ! By default the step counter follows the type of the preceding build.
+            IF (.NOT. just_energy .AND. .NOT. ot_count_full_gradients) &
+               scf_env%iter_count = scf_env%iter_count + 1
             iter_count = iter_count + 1
             CALL cp_iterate(logger%iter_info, last=.FALSE., iter_nr=iter_count)
 
@@ -635,9 +642,11 @@ CONTAINS
 
             total_steps = total_steps + 1
             just_energy = energy_only
-            ! Count the current KS build, not the preceding line-search build. The smeared
-            ! minimum and convergence gates require full-gradient evaluations.
-            IF (.NOT. just_energy) scf_env%iter_count = scf_env%iter_count + 1
+            ! With COUNT_FULL_GRADIENTS, count the current KS build, not the preceding
+            ! line-search build: the smeared minimum and the convergence gates then require
+            ! full-gradient evaluations.
+            IF (.NOT. just_energy .AND. ot_count_full_gradients) &
+               scf_env%iter_count = scf_env%iter_count + 1
 
             CALL qs_scf_full_bloch_initialize(qs_env, scf_env, full_bloch_changed)
             IF (full_bloch_changed) THEN
@@ -805,8 +814,13 @@ CONTAINS
 
             IF (ot_kp_subspace_refresh) THEN
                IF (output_unit > 0) THEN
-                  WRITE (UNIT=output_unit, FMT="(T2,A)") &
-                     "K-point OT: rebasing reference chart while preserving the current electronic state."
+                  IF (scf_env%qs_ot_env(1)%settings%refresh_keep_state) THEN
+                     WRITE (UNIT=output_unit, FMT="(T2,A)") &
+                        "K-point OT: rebasing reference chart while preserving the current electronic state."
+                  ELSE
+                     WRITE (UNIT=output_unit, FMT="(T2,A)") &
+                        "K-point OT: rebuilding physical virtual subspace by full KS diagonalization."
+                  END IF
                END IF
                CALL qs_kpoint_state_commit(qs_env, update_occupations=.FALSE.)
                IF (scf_env%qs_ot_env(1)%settings%diagnostics_state) THEN
@@ -1611,10 +1625,14 @@ CONTAINS
                   CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks_kp)
                   CPASSERT(ASSOCIATED(matrix_ks_kp))
 
-                  ! A density-only initial guess needs a full orbital space. A chart refresh
-                  ! already has current C, occupations and auxiliary labels: replacing them by
-                  ! eigenstates of H[P] changes P/F and is not a state-preserving retraction.
-                  IF (entry_reason == kp_ot_entry_initial .AND. .NOT. kpoint_mos_initialized) THEN
+                  ! Mermin initialization and deliberate REF refreshes require a full orbital
+                  ! space, so use the physical Hamiltonian replacement for those cases only.
+                  ! With REFRESH_KEEP_STATE a refresh keeps the current C, occupations and
+                  ! auxiliary labels: replacing them by eigenstates of H[P] changes P and F and
+                  ! is not a state-preserving retraction.
+                  IF ((entry_reason == kp_ot_entry_initial .AND. .NOT. kpoint_mos_initialized) .OR. &
+                      (entry_reason == kp_ot_entry_refresh .AND. &
+                       .NOT. scf_env%qs_ot_env(1)%settings%refresh_keep_state)) THEN
                      kp_diis_step = .FALSE.
                      CALL do_general_diag_kp(matrix_ks_kp, matrix_s_kp, kpoints, scf_env, &
                                              scf_control, .FALSE., kp_diis_step)
