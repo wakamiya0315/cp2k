@@ -284,7 +284,8 @@ CONTAINS
       COMPLEX(KIND=dp), DIMENSION(k, k, 2)               :: actual_a, base_a, da
       COMPLEX(KIND=dp), DIMENSION(n, n)                  :: actual_p, expected_p
       INTEGER                                            :: channel, component, sample, scenario
-      REAL(KIND=dp)                                      :: actual_kts, expected_kts, position
+      REAL(KIND=dp)                                      :: actual_kts, actual_state_f, expected_kts, &
+                                                            expected_state_f, position
       REAL(KIND=dp), DIMENSION(4)                       :: actual_f, actual_labels, base_labels, &
                                                             de, expected_f
       REAL(KIND=dp), DIMENSION(4), PARAMETER             :: energy_samples = &
@@ -334,16 +335,17 @@ CONTAINS
          CALL put_complex_pair(rotation_direction(1, channel), rotation_direction(2, channel), da(:, :, channel))
       END DO
 
-      DO scenario = 1, 2
+      DO scenario = 1, 3
          search(1)%line_search_count = 0
          search(1)%ds_min = 0.15_dp
          DO channel = 1, 2
+            search(channel)%settings%occupation_preconditioner = scenario /= 3
             CALL put_complex_pair(coordinate(1, channel), coordinate(2, channel), base_x(:, :, channel))
             CALL put_complex_pair(rotation(1, channel), rotation(2, channel), base_a(:, :, channel))
             search(channel)%ener_x = base_labels((channel - 1)*k + 1:channel*k)
          END DO
-         DO sample = 1, 4
-            IF (scenario == 1) THEN
+         DO sample = 1, MERGE(3, 4, scenario == 3)
+            IF (scenario /= 2) THEN
                ! The actual fourth-point F is above two already evaluated lower samples.
                search(1)%etotal = energy_samples(sample)
             ELSE
@@ -352,18 +354,25 @@ CONTAINS
             END IF
             CALL do_line_search_3pnt(search)
             IF (sample == 3) THEN
-               IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done) nfail = nfail + 1
+               IF (scenario == 3) THEN
+                  ! The conventional three-point path keeps its original gradient request.
+                  IF (search(1)%energy_only .OR. .NOT. search(1)%line_search_might_be_done) nfail = nfail + 1
+               ELSE
+                  IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done) nfail = nfail + 1
+               END IF
             END IF
          END DO
          IF (scenario == 1) THEN
             position = search(1)%ot_pos(3)
             IF (ABS(search(1)%ot_pos(5) - position) > 1.0E-14_dp) nfail = nfail + 1
-         ELSE
+         ELSE IF (scenario == 2) THEN
             position = 0.03_dp
             IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done .OR. &
                 ABS(search(1)%ot_pos(5) - position) > 1.0E-14_dp) nfail = nfail + 1
             search(1)%etotal = -2.001_dp
             CALL do_line_search_3pnt(search)
+         ELSE
+            position = search(1)%ot_pos(4)
          END IF
          IF (search(1)%energy_only .OR. .NOT. search(1)%line_search_might_be_done) nfail = nfail + 1
          DO channel = 1, 2
@@ -377,11 +386,17 @@ CONTAINS
          CALL mermin_test_state(actual_x, actual_a, actual_labels, actual_c, actual_f, actual_p, actual_kts)
          CALL mermin_test_state(base_x + position*dx, base_a + position*da, base_labels + position*de, &
                                  expected_c, expected_f, expected_p, expected_kts)
+         ! Recompute a nonlinear density functional plus entropy at the restored state.
+         actual_state_f = REAL(actual_p(1, 1) + 2.0_dp*actual_p(2, 2) + 3.0_dp*actual_p(3, 3) + &
+                               0.25_dp*SUM(CONJG(actual_p)*actual_p), dp) + actual_kts
+         expected_state_f = REAL(expected_p(1, 1) + 2.0_dp*expected_p(2, 2) + 3.0_dp*expected_p(3, 3) + &
+                                 0.25_dp*SUM(CONJG(expected_p)*expected_p), dp) + expected_kts
          IF (MAXVAL(ABS(actual_c - expected_c)) > 1.0E-12_dp .OR. &
              MAXVAL(ABS(actual_f - expected_f)) > 1.0E-12_dp .OR. &
              ABS(DOT_PRODUCT([0.4_dp, 0.4_dp, 0.6_dp, 0.6_dp], actual_f) - 1.7_dp) > 1.0E-12_dp .OR. &
              MAXVAL(ABS(actual_p - expected_p)) > 1.0E-12_dp .OR. &
-             ABS(actual_kts - expected_kts) > 1.0E-13_dp) nfail = nfail + 1
+             ABS(actual_kts - expected_kts) > 1.0E-13_dp .OR. &
+             ABS(actual_state_f - expected_state_f) > 1.0E-12_dp) nfail = nfail + 1
       END DO
 
       DO channel = 1, 2
