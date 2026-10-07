@@ -70,11 +70,11 @@ PROGRAM qs_ot_complex_ref_unittest
         qs_ot_generate_rotation, qs_ot_get_derivative_complex, qs_ot_get_derivative_ref_complex, &
         qs_ot_get_orbitals_ref_complex, qs_ot_get_p_complex, qs_ot_projected_response_update, &
         qs_ot_rot_mat_derivative, qs_ot_symmetric_abs_solve, qs_ot_symmetric_sr1_update
+   USE qs_ot_minimizer,                 ONLY: do_line_search_3pnt
    USE qs_ot_types,                     ONLY: qs_ot_kpoint_preconditioner_scale,&
                                               qs_ot_kpoint_preconditioner_solver_supported,&
                                               qs_ot_kpoint_preconditioner_supported,&
                                               qs_ot_type
-   USE qs_ot_minimizer,                 ONLY: do_line_search_3pnt
    USE reference_manager,               ONLY: remove_all_references
 
    IMPLICIT NONE
@@ -277,7 +277,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE test_mermin_line_search_rollback(dist_nk, dist_kk, row_n, row_k, col_k, nfail)
       TYPE(dbcsr_distribution_type), INTENT(IN)          :: dist_nk, dist_kk
-      INTEGER, DIMENSION(:), INTENT(IN)                  :: row_n, row_k, col_k
+      INTEGER, DIMENSION(:), POINTER, INTENT(INOUT)      :: row_n, row_k, col_k
       INTEGER, INTENT(INOUT)                             :: nfail
 
       COMPLEX(KIND=dp), DIMENSION(n, k, 2)               :: actual_c, actual_x, base_x, dx, expected_c
