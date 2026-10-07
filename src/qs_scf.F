@@ -3691,7 +3691,7 @@ CONTAINS
 
       store => scf_env%mixing_store
       IF (store%dm_trial_free_diag_level == 0) RETURN
-      IF (store%dm_trial_free_diag_level == 1) THEN
+      IF (store%dm_trial_free_diag_level == 1 .OR. store%dm_trial_free_diag_level == 3) THEN
          nh = 2; h(1:2) = [1.0E-3_dp, 5.0E-4_dp]
       ELSE
          nh = 6; h = [8.0E-3_dp, 4.0E-3_dp, 2.0E-3_dp, 1.0E-3_dp, 5.0E-4_dp, 2.5E-4_dp]
@@ -3733,8 +3733,11 @@ CONTAINS
          IF (iw > 0) WRITE (iw, '(A,I4,4ES26.17E3)') &
             "F_DIAG_ADJOINT| base,real_KS,Bloch_symmetry_KS,Bloch_symmetry_core,Bloch_symmetry_kinetic ", &
             base, real_derivative, adjoint_derivative
-         IF (ABS(real_derivative - derivative(1)) > 1.0E-10_dp) &
-            CALL cp_abort(__LOCATION__, "F diagnostic real/Bloch contraction mismatch")
+         IF (iw > 0) WRITE (iw, '(A)') "F_DIAG_REPRESENTATION| Hermitian-density symmetry adjoint"
+         IF (ABS(real_derivative - adjoint_derivative(1)) > 1.0E-10_dp) &
+            CALL cp_abort(__LOCATION__, "F diagnostic physical-adjoint contraction mismatch")
+         IF (store%dm_trial_free_diag_level == 3) &
+            CALL cp_abort(__LOCATION__, "F input-only diagnostics complete; no energy reference")
          DO pass = 1, 2
             CALL evaluate_sample(lambda, pass, 0, base)
             DO ih = 1, nh

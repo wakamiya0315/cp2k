@@ -1077,9 +1077,11 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAGNOSTICS", &
                           description="First-step repeated same-density probes, component energies and Bloch contractions. "// &
                           "PILOT uses original forward points and midpoint central differences; SERIES adds six h values. "// &
-                          "Does not relax F/physical/SCF gates. Requires FREE_VALIDATE and a new private export prefix.", &
-                          default_i_val=0, enum_c_vals=s2a("NONE", "PILOT", "SERIES"), &
-                          enum_desc=s2a("Disabled", "Registered pilot", "Registered series"), enum_i_vals=[0, 1, 2])
+                          "INPUT_ONLY stops after one same-input snapshot. Does not relax F/physical/SCF gates. "// &
+                          "Requires FREE_VALIDATE and a new private export prefix.", &
+                          default_i_val=0, enum_c_vals=s2a("NONE", "PILOT", "SERIES", "INPUT_ONLY"), &
+                          enum_desc=s2a("Disabled", "Registered pilot", "Registered series", "Input-only proof"), &
+                          enum_i_vals=[0, 1, 2, 3])
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAG_FILE", &

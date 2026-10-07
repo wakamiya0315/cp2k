@@ -4982,8 +4982,9 @@ CONTAINS
       REAL(dp), INTENT(OUT)                              :: derivative(3)
       CHARACTER(LEN=*), INTENT(IN)                       :: filename
 
-      CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_ADJ_V1"
-      COMPLEX(dp), ALLOCATABLE                           :: basis_map(:, :), gradient(:, :, :), work(:, :)
+      CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_ADJ_V2"
+      COMPLEX(dp), ALLOCATABLE                           :: basis_map(:, :), gradient(:, :, :), &
+                                                            physical_gradient(:, :, :), work(:, :)
       COMPLEX(dp)                                        :: phase
       INTEGER                                            :: atom, col, ENTRY, ik, ir, ira, is, ispin, &
                                                             jr, nao, natom, nkp, nspin, nstar, row, slot, unit
@@ -5008,7 +5009,8 @@ CONTAINS
       CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
       CALL dbcsr_get_info(overlap(1, 1)%matrix, row_blk_offset=offsets)
       nao = SIZE(initial, 1); nspin = SIZE(initial, 3); natom = SIZE(kpoints%atype)
-      ALLOCATE (basis_map(nao, nao), gradient(nao, nao, nspin + 2), work(nao, nao), &
+      ALLOCATE (basis_map(nao, nao), gradient(nao, nao, nspin + 2), &
+                physical_gradient(nao, nao, nspin + 2), work(nao, nao), &
                 mask(nao, nao), block_size(natom))
       DO atom = 1, natom - 1
          block_size(atom) = offsets(atom + 1) - offsets(atom)
@@ -5025,7 +5027,7 @@ CONTAINS
       END DO
       CALL cp_cfm_create(matrix, fmstruct)
       OPEN (NEWUNIT=unit, FILE=filename, ACCESS="STREAM", FORM="UNFORMATTED", STATUS="NEW", ACTION="WRITE")
-      WRITE (unit) magic, 1, nao, nspin, nkp
+      WRITE (unit) magic, 2, nao, nspin, nkp
       WRITE (unit) weights, xkp
       derivative = 0.0_dp
       DO ik = 1, nkp
@@ -5080,13 +5082,19 @@ CONTAINS
             END DO
          END DO
          WRITE (unit) gradient
+         ! The density domain is Hermitian. Keep the raw covector as diagnostic history.
+         DO slot = 1, nspin + 2
+            physical_gradient(:, :, slot) = 0.5_dp*(gradient(:, :, slot) + &
+                                                    CONJG(TRANSPOSE(gradient(:, :, slot))))
+         END DO
+         WRITE (unit) physical_gradient
          DO ispin = 1, nspin
             derivative(1) = derivative(1) + weights(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
-                                                                       initial(:, :, ispin, ik))*gradient(:, :, ispin + 2)), dp)
+                                                                  initial(:, :, ispin, ik))*physical_gradient(:, :, ispin + 2)), dp)
             derivative(2) = derivative(2) + weights(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
-                                                                       initial(:, :, ispin, ik))*gradient(:, :, 1)), dp)
+                                                                       initial(:, :, ispin, ik))*physical_gradient(:, :, 1)), dp)
             derivative(3) = derivative(3) + weights(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
-                                                                       initial(:, :, ispin, ik))*gradient(:, :, 2)), dp)
+                                                                       initial(:, :, ispin, ik))*physical_gradient(:, :, 2)), dp)
          END DO
       END DO
       WRITE (unit) SIZE(core, 1), SIZE(core, 2)
@@ -5095,7 +5103,7 @@ CONTAINS
       CALL free_diag_write_sparse_set(unit, kinetic, 2)
       CLOSE (unit)
       CALL cp_cfm_release(matrix); CALL kp_transform_plan_release(plan)
-      DEALLOCATE (basis_map, gradient, work, mask, block_size)
+      DEALLOCATE (basis_map, gradient, physical_gradient, work, mask, block_size)
    END SUBROUTINE qs_scf_free_symmetry_snapshot
 
 END MODULE qs_scf_diagonalization
