@@ -1202,7 +1202,8 @@ CONTAINS
                            END IF
                         END IF
                         IF (atom_composite_reference .AND. nlcc) THEN
-                           nlcc_spin_factor = MERGE(1.0_dp, 0.5_dp, lsd)
+                           ! The model always has two spin channels sharing an unpolarized core.
+                           nlcc_spin_factor = 0.5_dp
                            ! The cores of all atoms and of their periodic images within reach.
                            CALL nlcc_image_range(nlcc_distance, grid_atom%rad(ir), nlcc_reach, &
                                                  nlcc_first, nlcc_last)
@@ -1661,7 +1662,7 @@ CONTAINS
                      composite_moving_smooth_force(:, iatom) = &
                         composite_moving_smooth_force(:, iatom) + spatial_derivative
                      IF (nlcc) THEN
-                        nlcc_spin_factor = MERGE(1.0_dp, 0.5_dp, lsd)
+                        nlcc_spin_factor = 0.5_dp
                         nlcc_point_radius = SQRT(SUM((composite_grid_coords(:, composite_row) - &
                                                       particle_set(iatom)%r)**2))
                         CALL nlcc_image_range(nlcc_distance, nlcc_point_radius, nlcc_reach, &
