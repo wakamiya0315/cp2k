@@ -878,7 +878,7 @@ CONTAINS
             IF (ot_kp_subspace_refresh) THEN
                IF (output_unit > 0) THEN
                   WRITE (UNIT=output_unit, FMT="(T2,A)") &
-                     "K-point OT: rebuilding physical virtual subspace by full KS diagonalization."
+                     "K-point OT: rebasing reference chart while preserving the current electronic state."
                END IF
                CALL qs_kpoint_state_commit(qs_env, update_occupations=.FALSE.)
                IF (ASSOCIATED(scf_env%qs_ot_env)) THEN
@@ -1682,10 +1682,10 @@ CONTAINS
                   CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks_kp)
                   CPASSERT(ASSOCIATED(matrix_ks_kp))
 
-                  ! Mermin initialization and deliberate REF refreshes require a full orbital
-                  ! space, so use the physical Hamiltonian replacement for those cases only.
-                  IF ((entry_reason == kp_ot_entry_initial .AND. .NOT. kpoint_mos_initialized) .OR. &
-                      entry_reason == kp_ot_entry_refresh) THEN
+                  ! A density-only initial guess needs a full orbital space. A chart refresh
+                  ! already has current C, occupations and auxiliary labels: replacing them by
+                  ! eigenstates of H[P] changes P/F and is not a state-preserving retraction.
+                  IF (entry_reason == kp_ot_entry_initial .AND. .NOT. kpoint_mos_initialized) THEN
                      kp_diis_step = .FALSE.
                      CALL do_general_diag_kp(matrix_ks_kp, matrix_s_kp, kpoints, scf_env, &
                                              scf_control, .FALSE., kp_diis_step)
