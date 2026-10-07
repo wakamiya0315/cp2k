@@ -207,6 +207,7 @@ MODULE qs_scf
                                               qs_rho_type
    USE qs_scf_diagonalization,          ONLY: do_general_diag_kp,&
                                               qs_scf_bloch_entropy,&
+                                              qs_scf_free_operator_snapshot,&
                                               qs_scf_full_bloch_initialize,&
                                               qs_scf_full_bloch_save,&
                                               qs_scf_get_ot_kpoint_operator,&
@@ -3665,6 +3666,118 @@ CONTAINS
          WRITE (iw, '(T2,A,3ES24.14E3)') "SCF_FREE_ENERGY| validation same-P EKS,F,KS errors ", eks_error, f_error, ks_error
       END IF
       CALL dbcsr_deallocate_matrix_set(reference_ks); DEALLOCATE (candidate_k)
+      IF (scf_env%mixing_store%dm_trial_free_diag_level > 0) &
+         CALL qs_scf_free_diagnostics(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
    END SUBROUTINE qs_scf_free_validate
+
+! **************************************************************************************************
+!> \brief Registered repeated/central probes without changing the F acceptance or SCF criterion.
+   SUBROUTINE qs_scf_free_diagnostics(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
+      TYPE(qs_environment_type), POINTER :: qs_env
+      TYPE(qs_scf_env_type), POINTER :: scf_env
+      TYPE(scf_control_type), POINTER :: control
+      INTEGER, INTENT(IN) :: iw
+      TYPE(dbcsr_p_type), POINTER :: initial(:, :), proposal(:, :)
+      COMPLEX(dp), INTENT(IN) :: initial_k(:, :, :, :), proposal_k(:, :, :, :)
+
+      INTEGER :: pass, ih, nh, SEQUENCE, sample, ic, ispin, base, sign_index
+      REAL(dp) :: lambda, h(6), derivative(3), real_derivative, dot, f, eks
+      LOGICAL :: valid
+      COMPLEX(dp), ALLOCATABLE :: candidate(:, :, :, :)
+      TYPE(dbcsr_p_type), POINTER :: ks(:, :)
+      TYPE(dbcsr_type) :: delta
+      TYPE(mixing_storage_type), POINTER :: store
+
+      store => scf_env%mixing_store
+      IF (store%dm_trial_free_diag_level == 0) RETURN
+      IF (store%dm_trial_free_diag_level == 1) THEN
+         nh = 2; h(1:2) = [1.0E-3_dp, 5.0E-4_dp]
+      ELSE
+         nh = 6; h = [8.0E-3_dp, 4.0E-3_dp, 2.0E-3_dp, 1.0E-3_dp, 5.0E-4_dp, 2.5E-4_dp]
+      END IF
+      sample = 0
+      ! Both bases belong to the original physical segment. Negative endpoint extrapolation is excluded.
+      DO base = 0, 1
+         lambda = 0.5_dp*REAL(base, dp)
+         CALL evaluate_sample(lambda, 0, 0, base)
+         CALL qs_scf_free_operator_snapshot(qs_env, scf_env, initial_k, proposal_k, lambda, derivative, &
+                                            TRIM(store%dm_trial_free_diag_file)//MERGE(".midpoint.bin", ".input000.bin", base == 1))
+         real_derivative = 0.0_dp
+         CALL get_qs_env(qs_env, matrix_ks_kp=ks)
+         DO ic = 1, SIZE(initial, 2)
+            DO ispin = 1, SIZE(initial, 1)
+               CALL dbcsr_create(delta, template=initial(ispin, ic)%matrix)
+               CALL dbcsr_copy(delta, proposal(ispin, ic)%matrix)
+               CALL dbcsr_add(delta, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               CALL dbcsr_dot(delta, ks(ispin, ic)%matrix, dot)
+               real_derivative = real_derivative + dot
+               CALL dbcsr_release(delta)
+            END DO
+         END DO
+         IF (iw > 0) WRITE (iw, '(A,I4,4ES26.17E3)') &
+            "F_DIAG_OPERATOR| base,real_KS,Bloch_KS,Bloch_core,Bloch_kinetic ", base, real_derivative, derivative
+         IF (ABS(real_derivative - derivative(1)) > 1.0E-10_dp) &
+            CALL cp_abort(__LOCATION__, "F diagnostic real/Bloch contraction mismatch")
+         DO pass = 1, 2
+            CALL evaluate_sample(lambda, pass, 0, base)
+            DO ih = 1, nh
+               SEQUENCE = MERGE(ih, nh + 1 - ih, pass == 1)
+               IF (base == 0) THEN
+                  CALL evaluate_sample(h(SEQUENCE), pass, SEQUENCE, base)
+               ELSE
+                  DO sign_index = -1, 1, 2
+                     CALL evaluate_sample(0.5_dp + REAL(sign_index, dp)*h(SEQUENCE), pass, &
+                                          sign_index*SEQUENCE, base)
+                  END DO
+               END IF
+            END DO
+            CALL evaluate_sample(0.5_dp*REAL(base, dp), pass, 0, base)
+         END DO
+      END DO
+      CALL evaluate_sample(0.0_dp, 3, 0, 0)
+      IF (ALLOCATED(candidate)) DEALLOCATE (candidate)
+
+   CONTAINS
+
+      SUBROUTINE evaluate_sample(fraction, repetition, index, origin)
+      REAL(dp), INTENT(IN)                               :: fraction
+      INTEGER, INTENT(IN)                                :: repetition, index, origin
+
+      REAL(dp)                                           :: other, values(11)
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+         sample = sample + 1
+         IF (iw > 0) WRITE (iw, '(A,4I6,ES26.17E3)') &
+            "F_DIAG_BEGIN| sample,base,pass,index,lambda ", sample, origin, repetition, index, fraction
+         candidate = initial_k + fraction*(proposal_k - initial_k)
+         DO ic = 1, SIZE(initial, 2)
+            DO ispin = 1, SIZE(initial, 1)
+               CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+               IF (fraction /= 0.0_dp) &
+                  CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, proposal(ispin, ic)%matrix, &
+                                 1.0_dp - fraction, fraction)
+            END DO
+         END DO
+         CALL qs_scf_free_evaluate(qs_env, scf_env, control, candidate, f, eks, valid)
+         IF (.NOT. valid) CALL cp_abort(__LOCATION__, &
+                                        "Invalid F diagnostic ensemble/state; no further probes")
+         CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control)
+         other = energy%gcp + energy%qmmm_el + energy%mulliken + SUM(energy%ddapc_restraint) + &
+                 energy%s2_restraint + energy%dft_plus_u + energy%efield + energy%efield_core + &
+                 energy%ee + energy%ee_core + energy%exc_aux_fit + energy%image_charge + &
+                 energy%sccs_pol + energy%cdft + energy%exc1_aux_fit
+         IF (dft_control%apply_embed_pot) other = other + energy%embed_corr
+         CPASSERT(ABS(eks - (energy%core + energy%core_overlap + energy%core_self + energy%core_cneo + &
+                             energy%hartree + energy%hartree_1c + energy%exc + energy%exc1 + energy%ex + &
+                             energy%dispersion + other)) <= 1.0E-10_dp)
+         values = [energy%core, energy%core_overlap + energy%core_self + energy%core_cneo, &
+                   energy%hartree, energy%hartree_1c, energy%exc, energy%exc1, energy%ex, &
+                   energy%dispersion, other, energy%kinetic, energy%kTS]
+         IF (iw > 0) WRITE (iw, '(A,I6,ES26.17E3,3ES26.17E3,11ES26.17E3)') &
+            "F_DIAG_SAMPLE| sample,lambda,F,EKS,kTS,core,constants,H,H1c,XC,XC1,ex,D3,other,kinetic,kTS-copy ", &
+            sample, fraction, f, eks, energy%kTS, values
+      END SUBROUTINE evaluate_sample
+   END SUBROUTINE qs_scf_free_diagnostics
 
 END MODULE qs_scf

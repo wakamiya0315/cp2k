@@ -195,6 +195,8 @@ MODULE qs_scf_diagonalization
              general_eigenproblem, diag_kp_smat, diag_kp_basic, &
              qs_scf_get_ot_kpoint_operator, qs_scf_pulay_trial_check
 
+   PUBLIC :: qs_scf_free_operator_snapshot
+
 CONTAINS
 
 ! **************************************************************************************************
@@ -4763,5 +4765,71 @@ CONTAINS
                   work(1), lwork, rwork(1), lrwork, iwork(1), liwork, info)
       DEALLOCATE (work, rwork, iwork)
    END SUBROUTINE trial_metric_heevd
+
+! **************************************************************************************************
+!> \brief Independent weighted Bloch contractions; private full-state export for external checks.
+   SUBROUTINE qs_scf_free_operator_snapshot(qs_env, scf_env, initial, proposal, lambda, derivative, filename)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      COMPLEX(dp), INTENT(IN)                            :: initial(:, :, :, :), proposal(:, :, :, :)
+      REAL(dp), INTENT(IN)                               :: lambda
+      REAL(dp), INTENT(OUT)                              :: derivative(3)
+      CHARACTER(LEN=*), INTENT(IN)                       :: filename
+
+      CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_STATE_V1"
+
+      INTEGER                                            :: ik, ispin, nao, nkp, nspin, unit
+      INTEGER, POINTER                                   :: cell_to_index(:, :, :)
+      REAL(dp), POINTER                                  :: wkp(:), xkp(:, :)
+      TYPE(cp_cfm_type)                                  :: matrix
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(dbcsr_p_type), POINTER                        :: core(:, :), kinetic(:, :), ks(:, :), &
+                                                            overlap(:, :)
+      TYPE(kp_transform_plan_type)                       :: plan
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+      TYPE(scf_control_type), POINTER                    :: control
+
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_ks_kp=ks, matrix_h_kp=core, &
+                      kinetic_kp=kinetic, matrix_s_kp=overlap, scf_control=control)
+      CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, &
+                           cell_to_index=cell_to_index, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      nao = SIZE(initial, 1); nspin = SIZE(initial, 3)
+      CPASSERT(nkp == SIZE(initial, 4))
+      CPASSERT(ASSOCIATED(kinetic))
+      CALL cp_cfm_create(matrix, fmstruct)
+      CALL kp_transform_plan_create(plan, sab_nl, cell_to_index, SIZE(overlap, 2), overlap(1, 1)%matrix)
+      derivative = 0.0_dp
+      OPEN (NEWUNIT=unit, FILE=filename, ACCESS="STREAM", FORM="UNFORMATTED", STATUS="NEW", ACTION="WRITE")
+      WRITE (unit) magic, 1, nao, nspin, nkp
+      WRITE (unit) lambda, control%smear%electronic_temperature, control%eps_eigval, &
+         scf_env%mixing_store%dm_trial_occ_tol
+      WRITE (unit) wkp, initial, proposal
+      DO ik = 1, nkp
+         CALL kp_build_cfm(overlap, 1, xkp(:, ik), plan, matrix)
+         WRITE (unit) matrix%local_data(1:nao, 1:nao)
+         CALL kp_build_cfm(core, 1, xkp(:, ik), plan, matrix)
+         WRITE (unit) matrix%local_data(1:nao, 1:nao)
+         DO ispin = 1, nspin
+            derivative(2) = derivative(2) + wkp(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                   initial(:, :, ispin, ik))*matrix%local_data(1:nao, 1:nao)), dp)
+         END DO
+         CALL kp_build_cfm(kinetic, 1, xkp(:, ik), plan, matrix)
+         WRITE (unit) matrix%local_data(1:nao, 1:nao)
+         DO ispin = 1, nspin
+            derivative(3) = derivative(3) + wkp(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                   initial(:, :, ispin, ik))*matrix%local_data(1:nao, 1:nao)), dp)
+         END DO
+         DO ispin = 1, nspin
+            CALL kp_build_cfm(ks, ispin, xkp(:, ik), plan, matrix)
+            WRITE (unit) matrix%local_data(1:nao, 1:nao)
+            derivative(1) = derivative(1) + wkp(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                   initial(:, :, ispin, ik))*matrix%local_data(1:nao, 1:nao)), dp)
+         END DO
+      END DO
+      CLOSE (unit)
+      CALL cp_cfm_release(matrix); CALL kp_transform_plan_release(plan)
+   END SUBROUTINE qs_scf_free_operator_snapshot
 
 END MODULE qs_scf_diagonalization

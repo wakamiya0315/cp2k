@@ -122,6 +122,8 @@ MODULE qs_density_mixing_types
       LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
       LOGICAL :: dm_trial_free_energy = .FALSE., dm_trial_free_validate = .FALSE.
       INTEGER :: dm_trial_free_backtracks = 12, dm_trial_free_evaluations = 0
+      INTEGER :: dm_trial_free_diag_level = 0
+      CHARACTER(LEN=default_path_length) :: dm_trial_free_diag_file = ""
       REAL(KIND=dp) :: dm_trial_f_input = 0.0_dp, dm_trial_eks_input = 0.0_dp, dm_trial_raw_kts = 0.0_dp
       REAL(KIND=dp) :: dm_trial_occ_tol = 1.0E-6_dp, dm_trial_charge_tol = 1.0E-6_dp, dm_trial_step_limit = 0.0_dp
       ! Full Bloch companion: the same affine Pulay candidate, before real-space truncation.
@@ -256,6 +258,15 @@ CONTAINS
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_ENERGY", l_val=mixing_store%dm_trial_free_energy)
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_VALIDATE", l_val=mixing_store%dm_trial_free_validate)
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_BACKTRACKS", i_val=mixing_store%dm_trial_free_backtracks)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_DIAGNOSTICS", i_val=mixing_store%dm_trial_free_diag_level)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_DIAG_FILE", c_val=mixing_store%dm_trial_free_diag_file)
+      IF (mixing_store%dm_trial_free_diag_level > 0) THEN
+         IF (.NOT. mixing_store%dm_trial_free_validate .OR. &
+             LEN_TRIM(mixing_store%dm_trial_free_diag_file) == 0) &
+            CALL cp_abort(__LOCATION__, &
+                          "F diagnostics require FREE_VALIDATE and a new private DIAG_FILE prefix")
+      END IF
+
       IF (mixing_store%dm_trial_free_energy) mixing_store%dm_trial_reject = .TRUE.
       IF (mixing_store%dm_trial_free_validate .AND. .NOT. mixing_store%dm_trial_free_energy) &
          CALL cp_abort(__LOCATION__, &
@@ -1060,6 +1071,20 @@ CONTAINS
                           description="On the first step, repeat the input energy/KS state and compare "// &
                           "the KS directional derivative with two forward energy differences.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAGNOSTICS", &
+                          description="First-step repeated same-density probes, component energies and Bloch contractions. "// &
+                          "PILOT uses original forward points and midpoint central differences; SERIES adds six h values. "// &
+                          "Does not relax F/physical/SCF gates. Requires FREE_VALIDATE and a new private export prefix.", &
+                          default_i_val=0, enum_c_vals=s2a("NONE", "PILOT", "SERIES"), &
+                          enum_desc=s2a("Disabled", "Registered pilot", "Registered series"), enum_i_vals=[0, 1, 2])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAG_FILE", &
+                          description="Private new stream export prefix for independent P/S/KS/entropy checks.", &
+                          type_of_var=lchar_t, default_lc_val="")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
