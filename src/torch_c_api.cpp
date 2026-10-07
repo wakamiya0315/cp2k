@@ -458,6 +458,7 @@ void torch_c_skala_feature_begin() {
   const char *path = std::getenv("CP2K_SKALA_FEATURE_DUMP");
   skala_capture_enabled = path != nullptr && path[0] != '\0';
   if (skala_capture_enabled) {
+    std::filesystem::create_directories(path);
     // A cached KS update may make no model call. Keep its actual input snapshot
     // until the first forward of a new evaluation replaces it.
     skala_capture_reset_pending = true;
