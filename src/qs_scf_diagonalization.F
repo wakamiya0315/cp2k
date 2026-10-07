@@ -13,157 +13,165 @@
 !>      05.2009
 ! **************************************************************************************************
 MODULE qs_scf_diagonalization
-   USE cp_array_utils,                  ONLY: cp_1d_r_p_type
-   USE cp_blacs_env,                    ONLY: cp_blacs_env_type
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_column_scale,&
-                                              cp_cfm_scale_and_add,&
-                                              cp_cfm_scale_and_add_fm
-   USE cp_cfm_diag,                     ONLY: cp_cfm_geeig,&
-                                              cp_cfm_geeig_canon,&
-                                              cp_cfm_geeig_canon_local,&
-                                              cp_cfm_geeig_local,&
-                                              cp_cfm_heevd
-   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
-                                              cp_cfm_release,&
-                                              cp_cfm_set_all,&
-                                              cp_cfm_to_cfm,&
-                                              cp_cfm_to_fm,&
-                                              cp_cfm_type
-   USE cp_control_types,                ONLY: dft_control_type,&
-                                              hairy_probes_type
-   USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
-        dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release_p, dbcsr_set, &
-        dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, dbcsr_type_symmetric
-   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
-                                              copy_fm_to_dbcsr,&
-                                              copy_fm_to_dbcsr_bc,&
-                                              cp_dbcsr_sm_fm_multiply,&
-                                              dbcsr_allocate_matrix_set
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
-                                              cp_fm_scale_and_add,&
-                                              cp_fm_symm,&
-                                              cp_fm_uplo_to_full
-   USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_reduce,&
-                                              cp_fm_cholesky_restore
-   USE cp_fm_diag,                      ONLY: FM_DIAG_TYPE_CUSOLVER,&
-                                              FM_DIAG_TYPE_DLAF,&
-                                              choose_eigv_solver,&
-                                              cp_fm_geeig,&
-                                              cp_fm_geeig_canon,&
-                                              diag_check_requested,&
-                                              diag_type,&
-                                              direct_generalized_diagonalization
-   USE cp_fm_pool_types,                ONLY: cp_fm_pool_p_type,&
-                                              fm_pool_create_fm,&
-                                              fm_pool_get_el_struct,&
-                                              fm_pool_give_back_fm
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
-                                              cp_fm_struct_release,&
-                                              cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: &
-        copy_info_type, cp_fm_add_to_element, cp_fm_cleanup_copy_general, cp_fm_create, &
-        cp_fm_finish_copy_general, cp_fm_get_info, cp_fm_release, cp_fm_set_all, &
-        cp_fm_start_copy_general, cp_fm_to_fm, cp_fm_type
-   USE cp_log_handling,                 ONLY: cp_get_default_logger,&
-                                              cp_logger_get_default_unit_nr,&
-                                              cp_logger_type
-   USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
-                                              cp_print_key_unit_nr,&
-                                              debug_print_level
-   USE ieee_arithmetic,                 ONLY: ieee_is_finite
-   USE input_constants,                 ONLY: &
-        cholesky_dbcsr, cholesky_inverse, cholesky_off, cholesky_reduce, cholesky_restore, &
-        core_guess, diag_update_method_adiis, general_roks, high_spin_roks, ot_precond_full_all, &
-        ot_precond_full_kinetic, ot_precond_full_single_inverse, ot_precond_none, &
-        ot_precond_s_inverse, restart_guess
-   USE input_cp2k_kpoints,              ONLY: lattice_fft_auto,&
-                                              lattice_fft_off,&
-                                              lattice_fft_on
-   USE input_section_types,             ONLY: section_vals_get_subs_vals,&
-                                              section_vals_type
-   USE kinds,                           ONLY: dp,&
-                                              int_8
-   USE kpoint_methods,                  ONLY: &
-        kp_transform_plan_create, kp_transform_plan_release, kp_transform_plan_type, &
-        kpoint_density_matrices, kpoint_density_transform, kpoint_set_mo_occupation, &
-        rskp_grid_type, rskp_transform, rskp_transform_grid_extract, rskp_transform_grid_prepare, &
-        rskp_transform_grid_release
-   USE kpoint_types,                    ONLY: get_kpoint_info,&
-                                              kpoint_env_type,&
-                                              kpoint_type
-   USE machine,                         ONLY: m_flush,&
-                                              m_walltime
-   USE mathconstants,                   ONLY: gaussi,&
-                                              twopi,&
-                                              z_one,&
-                                              z_zero
-   USE message_passing,                 ONLY: mp_para_env_type
-   USE parallel_gemm_api,               ONLY: parallel_gemm
-   USE preconditioner,                  ONLY: dbcsr_pair_to_cfm,&
-                                              make_preconditioner_complex_full_kinetic,&
-                                              make_preconditioner_complex_full_s_inverse,&
-                                              prepare_preconditioner,&
-                                              restart_preconditioner
-   USE preconditioner_makes,            ONLY: make_complex_full_all,&
-                                              make_complex_full_single_inverse
-   USE preconditioner_types,            ONLY: destroy_preconditioner,&
-                                              init_preconditioner
-   USE qs_density_matrices,             ONLY: calculate_density_matrix
-   USE qs_density_mixing_types,         ONLY: direct_mixing_nr,&
-                                              gspace_mixing_nr
-   USE qs_diis,                         ONLY: qs_diis_b_calc_err_kp,&
-                                              qs_diis_b_check_i_alloc_kp,&
-                                              qs_diis_b_clear,&
-                                              qs_diis_b_clear_kp,&
-                                              qs_diis_b_info_kp,&
-                                              qs_diis_b_step,&
-                                              qs_diis_b_step_kp
-   USE qs_energy_types,                 ONLY: qs_energy_type
-   USE qs_environment_types,            ONLY: get_qs_env,&
-                                              qs_environment_type
-   USE qs_gspace_mixing,                ONLY: gspace_mixing
-   USE qs_kpoint_operators,             ONLY: &
-        kpoint_operator_cfm_to_mo, kpoint_operator_context_create, &
-        kpoint_operator_context_release, kpoint_operator_context_type, kpoint_operator_finish, &
-        kpoint_operator_get, kpoint_operator_start, kpoint_slot_ks, kpoint_slot_s, kpoint_slot_t, &
-        kpoint_spin_free
-   USE qs_ks_methods,                   ONLY: qs_ks_update_qs_env
-   USE qs_ks_types,                     ONLY: qs_ks_did_change,&
-                                              qs_ks_env_type
-   USE qs_matrix_pools,                 ONLY: mpools_get,&
-                                              qs_matrix_pools_type
-   USE qs_mixing_utils,                 ONLY: charge_mixing_init,&
-                                              mixing_allocate,&
-                                              mixing_init,&
-                                              self_consistency_check
-   USE qs_mo_methods,                   ONLY: calculate_subspace_eigenvalues
-   USE qs_mo_occupation,                ONLY: set_mo_occupation
-   USE qs_mo_types,                     ONLY: get_mo_set,&
-                                              mo_set_type
-   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
-   USE qs_ot_eigensolver,               ONLY: ot_eigensolver,&
-                                              ot_eigensolver_complex
-   USE qs_rho_atom_types,               ONLY: rho_atom_type
-   USE qs_rho_methods,                  ONLY: qs_rho_update_rho
-   USE qs_rho_types,                    ONLY: qs_rho_get,&
-                                              qs_rho_type
-   USE qs_scf_block_davidson,           ONLY: generate_extended_space,&
-                                              generate_extended_space_c,&
-                                              generate_extended_space_sparse
-   USE qs_scf_lanczos,                  ONLY: lanczos_refinement,&
-                                              lanczos_refinement_2v
-   USE qs_scf_methods,                  ONLY: combine_ks_matrices,&
-                                              eigensolver,&
-                                              eigensolver_dbcsr,&
-                                              eigensolver_generalized,&
-                                              eigensolver_simple,&
-                                              eigensolver_symm,&
-                                              scf_env_density_mixing
-   USE qs_scf_types,                    ONLY: qs_scf_env_type,&
-                                              subspace_env_type
-   USE scf_control_types,               ONLY: scf_control_type
+   USE cp_array_utils, ONLY: cp_1d_r_p_type
+   USE cp_blacs_env, ONLY: cp_blacs_env_type
+   USE cp_cfm_basic_linalg, ONLY: cp_cfm_column_scale, &
+                                  cp_cfm_scale_and_add, &
+                                  cp_cfm_scale_and_add_fm
+   USE cp_cfm_diag, ONLY: cp_cfm_geeig, &
+                          cp_cfm_geeig_canon, &
+                          cp_cfm_geeig_canon_local, &
+                          cp_cfm_geeig_local, &
+                          cp_cfm_heevd
+   USE cp_cfm_types, ONLY: cp_cfm_create, &
+                           cp_cfm_release, &
+                           cp_cfm_set_all, &
+                           cp_cfm_to_cfm, &
+                           cp_cfm_to_fm, &
+                           cp_cfm_type
+   USE cp_control_types, ONLY: dft_control_type, &
+                               hairy_probes_type
+   USE cp_dbcsr_api, ONLY: &
+      dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
+      dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
+      dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, &
+      dbcsr_type_symmetric
+   USE cp_dbcsr_contrib, ONLY: dbcsr_dot, dbcsr_maxabs
+   USE cp_dbcsr_cp2k_link, ONLY: cp_dbcsr_alloc_block_from_nbl
+   USE cp_dbcsr_operations, ONLY: copy_dbcsr_to_fm, &
+                                  copy_fm_to_dbcsr, &
+                                  copy_fm_to_dbcsr_bc, &
+                                  cp_dbcsr_sm_fm_multiply, &
+                                  dbcsr_allocate_matrix_set
+   USE cp_fm_basic_linalg, ONLY: cp_fm_column_scale, &
+                                 cp_fm_scale_and_add, &
+                                 cp_fm_symm, &
+                                 cp_fm_uplo_to_full
+   USE cp_fm_cholesky, ONLY: cp_fm_cholesky_reduce, &
+                             cp_fm_cholesky_restore
+   USE cp_fm_diag, ONLY: FM_DIAG_TYPE_CUSOLVER, &
+                         FM_DIAG_TYPE_DLAF, &
+                         choose_eigv_solver, &
+                         cp_fm_geeig, &
+                         cp_fm_geeig_canon, &
+                         diag_check_requested, &
+                         diag_type, &
+                         direct_generalized_diagonalization
+   USE cp_fm_pool_types, ONLY: cp_fm_pool_p_type, &
+                               fm_pool_create_fm, &
+                               fm_pool_get_el_struct, &
+                               fm_pool_give_back_fm
+   USE cp_fm_struct, ONLY: cp_fm_struct_create, &
+                           cp_fm_struct_release, &
+                           cp_fm_struct_type
+   USE cp_fm_types, ONLY: &
+      copy_info_type, cp_fm_add_to_element, cp_fm_cleanup_copy_general, cp_fm_create, &
+      cp_fm_finish_copy_general, cp_fm_get_info, cp_fm_release, cp_fm_set_all, &
+      cp_fm_start_copy_general, cp_fm_to_fm, cp_fm_type
+   USE cp_log_handling, ONLY: cp_get_default_logger, &
+                              cp_logger_get_default_unit_nr, &
+                              cp_logger_type
+   USE cp_output_handling, ONLY: cp_print_key_finished_output, &
+                                 cp_print_key_unit_nr, &
+                                 debug_print_level
+   USE ieee_arithmetic, ONLY: ieee_is_finite
+#if defined(__HAS_IEEE_EXCEPTIONS)
+   USE ieee_exceptions, ONLY: ieee_status_type, ieee_get_status, ieee_set_status, &
+                              ieee_set_halting_mode, IEEE_ALL
+#endif
+   USE input_constants, ONLY: &
+      cholesky_dbcsr, cholesky_inverse, cholesky_off, cholesky_reduce, cholesky_restore, &
+      atomic_guess, core_guess, diag_update_method_adiis, general_roks, high_spin_roks, ot_precond_full_all, &
+      ot_precond_full_kinetic, ot_precond_full_single_inverse, ot_precond_none, &
+      ot_precond_s_inverse, restart_guess
+   USE input_cp2k_kpoints, ONLY: lattice_fft_auto, &
+                                 lattice_fft_off, &
+                                 lattice_fft_on
+   USE input_section_types, ONLY: section_vals_get_subs_vals, &
+                                  section_vals_type
+   USE kinds, ONLY: dp, &
+                    int_8
+   USE kpoint_methods, ONLY: &
+      kp_transform_plan_create, kp_transform_plan_release, kp_transform_plan_type, &
+      kpoint_density_matrices, kpoint_density_transform, kpoint_set_mo_occupation, &
+      rskp_grid_type, rskp_transform, rskp_transform_grid_extract, rskp_transform_grid_prepare, &
+      rskp_transform_grid_release
+   USE kpoint_types, ONLY: get_kpoint_info, &
+                           kpoint_env_type, &
+                           kpoint_type
+   USE machine, ONLY: m_flush, &
+                      m_walltime
+   USE mathconstants, ONLY: gaussi, &
+                            twopi, &
+                            z_one, &
+                            z_zero
+   USE message_passing, ONLY: mp_para_env_type
+   USE parallel_gemm_api, ONLY: parallel_gemm
+   USE preconditioner, ONLY: dbcsr_pair_to_cfm, &
+                             make_preconditioner_complex_full_kinetic, &
+                             make_preconditioner_complex_full_s_inverse, &
+                             prepare_preconditioner, &
+                             restart_preconditioner
+   USE preconditioner_makes, ONLY: make_complex_full_all, &
+                                   make_complex_full_single_inverse
+   USE preconditioner_types, ONLY: destroy_preconditioner, &
+                                   init_preconditioner
+   USE qs_density_matrices, ONLY: calculate_density_matrix
+   USE qs_density_mixing_types, ONLY: direct_mixing_nr, &
+                                      dm_pulay_storage_release, &
+                                      gspace_mixing_nr, &
+                                      mixing_storage_type
+   USE qs_diis, ONLY: qs_diis_b_calc_err_kp, &
+                      qs_diis_b_check_i_alloc_kp, &
+                      qs_diis_b_clear, &
+                      qs_diis_b_clear_kp, &
+                      qs_diis_b_info_kp, &
+                      qs_diis_b_step, &
+                      qs_diis_b_step_kp
+   USE qs_energy_types, ONLY: qs_energy_type
+   USE qs_environment_types, ONLY: get_qs_env, &
+                                   qs_environment_type
+   USE qs_gspace_mixing, ONLY: gspace_mixing
+   USE qs_kpoint_operators, ONLY: &
+      kpoint_operator_cfm_to_mo, kpoint_operator_context_create, &
+      kpoint_operator_context_release, kpoint_operator_context_type, kpoint_operator_finish, &
+      kpoint_operator_get, kpoint_operator_start, kpoint_slot_ks, kpoint_slot_s, kpoint_slot_t, &
+      kpoint_spin_free
+   USE qs_ks_methods, ONLY: qs_ks_update_qs_env
+   USE qs_ks_types, ONLY: qs_ks_did_change, &
+                          qs_ks_env_type
+   USE qs_matrix_pools, ONLY: mpools_get, &
+                              qs_matrix_pools_type
+   USE qs_mixing_utils, ONLY: charge_mixing_init, &
+                              mixing_allocate, &
+                              mixing_init, &
+                              self_consistency_check
+   USE qs_mo_methods, ONLY: calculate_subspace_eigenvalues
+   USE qs_mo_occupation, ONLY: set_mo_occupation
+   USE qs_mo_types, ONLY: get_mo_set, &
+                          mo_set_type
+   USE qs_neighbor_list_types, ONLY: neighbor_list_set_p_type
+   USE qs_ot_eigensolver, ONLY: ot_eigensolver, &
+                                ot_eigensolver_complex
+   USE qs_rho_atom_types, ONLY: rho_atom_type
+   USE qs_rho_methods, ONLY: qs_rho_update_rho
+   USE qs_rho_types, ONLY: qs_rho_get, &
+                           qs_rho_type
+   USE qs_scf_block_davidson, ONLY: generate_extended_space, &
+                                    generate_extended_space_c, &
+                                    generate_extended_space_sparse
+   USE qs_scf_lanczos, ONLY: lanczos_refinement, &
+                             lanczos_refinement_2v
+   USE qs_scf_methods, ONLY: combine_ks_matrices, &
+                             eigensolver, &
+                             eigensolver_dbcsr, &
+                             eigensolver_generalized, &
+                             eigensolver_simple, &
+                             eigensolver_symm, &
+                             scf_env_density_mixing
+   USE qs_scf_types, ONLY: qs_scf_env_type, &
+                           subspace_env_type
+   USE scf_control_types, ONLY: scf_control_type
 
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, &
 !$                    omp_get_thread_num
@@ -179,12 +187,13 @@ MODULE qs_scf_diagonalization
       TYPE(cp_cfm_type) :: cksmat, cmos, csmat, csmat_base, cwork
    END TYPE kp_diag_omp_workspace_type
 
+   PUBLIC :: qs_scf_full_bloch_initialize, qs_scf_full_bloch_save
    PUBLIC :: do_general_diag, do_general_diag_kp, do_roks_diag, &
              do_special_diag, do_ot_diag, do_ot_diag_kp, do_block_davidson_diag, &
              do_block_davidson_diag_kp, &
              do_block_krylov_diag, do_scf_diag_subspace, diag_subspace_allocate, &
              general_eigenproblem, diag_kp_smat, diag_kp_basic, &
-             qs_scf_get_ot_kpoint_operator
+             qs_scf_get_ot_kpoint_operator, qs_scf_pulay_trial_check
 
 CONTAINS
 
@@ -3802,5 +3811,857 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE diag_kp_smat
+
+! **************************************************************************************************
+!> \brief Diagnose and optionally reject a Pulay density candidate before any fields use it.
+!>        Dense occupation checks currently require a single MPI rank. Default-off calls return
+!>        before allocating or evaluating matrices. The raw map residual remains the convergence test.
+!> \param qs_env ...
+!> \param scf_env ...
+!> \param scf_control ...
+!> \param iw ...
+   SUBROUTINE qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, iw, density_full_step)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: scf_control
+      INTEGER, INTENT(IN)                                :: iw
+      LOGICAL, INTENT(INOUT)                             :: density_full_step
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: coeff(:, :), gram(:, :), &
+                                                            mixed_k(:, :, :, :), raw_k(:, :, :, :)
+      INTEGER                                            :: ic, ik, im, ispin, nao, nelectron_total, &
+                                                            nkp, nmo, nspin, opposite
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      LOGICAL                                            :: bad, do_kpoints, finite_trial, &
+                                                            full_step, have_bloch_candidate, &
+                                                            rejected, spectral_ok
+      REAL(KIND=dp) :: alpha, charge_target, dot, extrap_norm2, fallback_alpha, hermitian_error, &
+         linear_norm2, maxocc, normalized_trace, occmax, occmin, ortho_error, ratio_step, rnorm2, &
+         roundtrip_error, snorm2
+      REAL(KIND=dp), ALLOCATABLE                         :: counts(:, :), kcounts(:, :), rcounts(:)
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
+      REAL(KIND=dp), POINTER                             :: wkp(:)
+      TYPE(cp_cfm_type)                                  :: pk, raw, sk
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(cp_fm_type)                                   :: monitor_work
+      TYPE(cp_fm_type), POINTER                          :: coeff_im, coeff_re, fmwork
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s, pin, trial
+      TYPE(dbcsr_type)                                   :: linear, residual, step
+      TYPE(kp_transform_plan_type)                       :: pplan, splan
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_nl
+      TYPE(qs_rho_type), POINTER                         :: rho
+
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (.NOT. store%dm_trial_diagnostics) RETURN
+      CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, matrix_s_kp=matrix_s, &
+                      do_kpoints=do_kpoints, para_env=para_env, nelectron_total=nelectron_total)
+      IF (para_env%num_pe /= 1) CALL cp_abort(__LOCATION__, &
+                                              "PULAY_P trial diagnostics currently require one MPI rank")
+      CALL qs_rho_get(rho, rho_ao_kp=pin)
+      trial => scf_env%p_mix_new
+      nspin = SIZE(trial, 1)
+      full_step = store%dm_pulay_ncall == 0
+      ALLOCATE (counts(nspin, 3), rcounts(nspin), kcounts(nspin, 2))
+      kcounts = 0.0_dp
+      counts = 0.0_dp
+      rcounts = 0.0_dp
+      rnorm2 = 0.0_dp
+      snorm2 = 0.0_dp
+      linear_norm2 = 0.0_dp
+      extrap_norm2 = 0.0_dp
+      finite_trial = .TRUE.
+      alpha = store%alpha
+      DO ic = 1, SIZE(trial, 2)
+         DO ispin = 1, nspin
+            CALL dbcsr_create(residual, template=pin(ispin, ic)%matrix)
+            CALL dbcsr_create(step, template=pin(ispin, ic)%matrix)
+            CALL dbcsr_create(linear, template=pin(ispin, ic)%matrix)
+            IF (full_step) THEN
+               CALL dbcsr_copy(residual, trial(ispin, ic)%matrix)
+               CALL dbcsr_add(residual, pin(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            ELSE
+               CALL dbcsr_copy(residual, store%dm_pulay_res_last(ispin, ic)%matrix)
+            END IF
+            CALL dbcsr_dot(residual, residual, dot)
+            rnorm2 = rnorm2 + dot
+            CALL dbcsr_dot(residual, matrix_s(1, ic)%matrix, dot)
+            rcounts(ispin) = rcounts(ispin) + dot
+            CALL dbcsr_copy(step, trial(ispin, ic)%matrix)
+            CALL dbcsr_add(step, pin(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            CALL dbcsr_dot(step, step, dot)
+            snorm2 = snorm2 + dot
+            CALL dbcsr_copy(linear, residual)
+            IF (nspin == 2 .AND. .NOT. full_step) THEN
+               opposite = 3 - ispin
+               CALL dbcsr_add(linear, store%dm_pulay_res_last(opposite, ic)%matrix, &
+                              0.5_dp*(alpha + store%alpha_mag), 0.5_dp*(alpha - store%alpha_mag))
+            ELSE
+               CALL dbcsr_scale(linear, MERGE(1.0_dp, alpha, full_step))
+            END IF
+            CALL dbcsr_dot(linear, linear, dot)
+            linear_norm2 = linear_norm2 + dot
+            CALL dbcsr_add(step, linear, 1.0_dp, -1.0_dp)
+            CALL dbcsr_dot(step, step, dot)
+            extrap_norm2 = extrap_norm2 + dot
+            CALL dbcsr_dot(pin(ispin, ic)%matrix, matrix_s(1, ic)%matrix, dot)
+            counts(ispin, 1) = counts(ispin, 1) + dot
+            CALL dbcsr_dot(trial(ispin, ic)%matrix, matrix_s(1, ic)%matrix, dot)
+            counts(ispin, 3) = counts(ispin, 3) + dot
+            CALL dbcsr_release(residual)
+            CALL dbcsr_release(step)
+            CALL dbcsr_release(linear)
+         END DO
+      END DO
+      counts(:, 2) = counts(:, 1) + rcounts
+      finite_trial = ALL(ieee_is_finite(counts)) .AND. ieee_is_finite(snorm2)
+      IF (.NOT. finite_trial .AND. iw > 0) &
+         WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| NONFINITE density candidate, step ", scf_env%iter_count
+      charge_target = REAL(nelectron_total, KIND=dp)
+      IF (iw > 0) THEN
+         WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| step ", scf_env%iter_count
+         DO ispin = 1, nspin
+            WRITE (iw, '(T2,A,I2,3ES22.12E3)') "SCF_TRIAL| spin,input,output,trial Tr(PS) ", ispin, counts(ispin, :)
+         END DO
+         ratio_step = SQRT(snorm2/MAX(rnorm2, TINY(1.0_dp)))
+         WRITE (iw, '(T2,A,5ES22.12E3)') "SCF_TRIAL| norms R,step,linear,extrapolation,step/R ", &
+            SQRT(rnorm2), SQRT(snorm2), SQRT(linear_norm2), SQRT(extrap_norm2), ratio_step
+      END IF
+      bad = .NOT. finite_trial .OR. &
+            ABS(SUM(counts(:, 3)) - charge_target) > store%dm_trial_charge_tol
+      maxocc = MERGE(2.0_dp, 1.0_dp, nspin == 1)
+      fmwork => scf_env%scf_work1(1)
+      CALL cp_fm_get_info(fmwork, matrix_struct=fmstruct)
+      CALL cp_fm_create(monitor_work, fmstruct)
+      CALL cp_cfm_create(pk, fmstruct)
+      CALL cp_cfm_create(sk, fmstruct)
+      CALL cp_cfm_create(raw, fmstruct)
+      nao = pk%matrix_struct%nrow_global
+      IF (nao /= pk%matrix_struct%ncol_global) &
+         CALL cp_abort(__LOCATION__, &
+                       "Pulay occupation diagnostics require a square AO matrix")
+      IF (iw > 0 .AND. scf_env%iter_count == 1) WRITE (iw, '(T2,A,3I8)') &
+         "SCF_TRIAL| AO dimension,stored rows,stored columns ", nao, SIZE(pk%local_data, 1), SIZE(pk%local_data, 2)
+      nkp = 1
+      have_bloch_candidate = .TRUE.
+      IF (do_kpoints) THEN
+         CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
+         ALLOCATE (raw_k(nao, nao, nspin, nkp), mixed_k(nao, nao, nspin, nkp))
+         DO ik = 1, nkp
+            kp => kpoints%kp_env(ik)%kpoint_env
+            DO ispin = 1, nspin
+               raw_k(:, :, ispin, ik) = CMPLX(kp%pmat(1, ispin)%local_data(1:nao, 1:nao), 0.0_dp, KIND=dp)
+               IF (SIZE(kp%pmat, 1) == 2) raw_k(:, :, ispin, ik) = &
+                  CMPLX(REAL(raw_k(:, :, ispin, ik), KIND=dp), &
+                        kp%pmat(2, ispin)%local_data(1:nao, 1:nao), KIND=dp)
+            END DO
+         END DO
+         have_bloch_candidate = scf_control%density_guess == atomic_guess .OR. &
+                                ALLOCATED(store%dm_trial_k_input)
+         IF (.NOT. have_bloch_candidate) THEN
+            IF (scf_env%iter_count == 1 .AND. iw > 0) WRITE (iw, '(T2,A)') &
+               "SCF_TRIAL| trial spectrum unavailable: density-only restart has no full initial Bloch state"
+            IF (store%dm_trial_reject .OR. store%dm_trial_step_limit > 0.0_dp) &
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch safeguards require a certified full initial density")
+         END IF
+         IF (have_bloch_candidate .AND. .NOT. ALLOCATED(store%dm_trial_k_input)) THEN
+            ! ATOMIC initializes only the central image. Its constant Bloch lift is certified
+            ! by the forward transform below; restart guesses need a separate full-state hook.
+            ALLOCATE (store%dm_trial_k_input(nao, nao, nspin, nkp), &
+                      store%dm_trial_k_last(nao, nao, nspin, nkp), &
+                      store%dm_trial_k_reslast(nao, nao, nspin, nkp), &
+                      store%dm_trial_k_dp(nao, nao, nspin, nkp, MAX(store%nbuffer, 1)), &
+                      store%dm_trial_k_dres(nao, nao, nspin, nkp, MAX(store%nbuffer, 1)))
+            DO ispin = 1, nspin
+               CALL copy_dbcsr_to_fm(pin(ispin, 1)%matrix, monitor_work)
+               CALL cp_fm_uplo_to_full(monitor_work, monitor_work)
+               DO ik = 1, nkp
+                  store%dm_trial_k_input(:, :, ispin, ik) = CMPLX(monitor_work%local_data(1:nao, 1:nao), &
+                                                                  0.0_dp, KIND=dp)
+               END DO
+            END DO
+            store%dm_trial_k_last = store%dm_trial_k_input
+            store%dm_trial_k_reslast = z_zero
+         END IF
+         IF (have_bloch_candidate) THEN
+            CALL trial_bloch_mix(store, raw_k, mixed_k, full_step)
+            CALL trial_bloch_roundtrip(qs_env, scf_env, trial, mixed_k, roundtrip_error)
+            IF (iw > 0) WRITE (iw, '(T2,A,ES22.12E3)') "SCF_TRIAL| full Bloch to real candidate max error ", roundtrip_error
+            IF (roundtrip_error > 1.0E-8_dp) &
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch companion does not represent the actual real-space candidate")
+         END IF
+         CALL kp_transform_plan_create(pplan, sab_nl, cell_to_index, SIZE(trial, 2), trial(1, 1)%matrix)
+         CALL kp_transform_plan_create(splan, sab_nl, cell_to_index, SIZE(matrix_s, 2), matrix_s(1, 1)%matrix)
+      END IF
+      DO ik = 1, nkp
+         IF (do_kpoints) THEN
+            CALL kp_build_cfm(matrix_s, 1, xkp(:, ik), splan, sk)
+         ELSE
+            CALL copy_dbcsr_to_fm(matrix_s(1, 1)%matrix, monitor_work)
+            CALL cp_cfm_scale_and_add_fm(z_zero, sk, z_one, monitor_work)
+         END IF
+         DO ispin = 1, nspin
+            IF (have_bloch_candidate) THEN
+               IF (do_kpoints) THEN
+                  pk%local_data = z_zero
+                  pk%local_data(1:nao, 1:nao) = mixed_k(:, :, ispin, ik)
+               ELSE
+                  CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
+                  CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+               END IF
+               CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
+                                            scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                            occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
+               IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12E3,L3)') &
+                  "SCF_TRIAL| k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
+                  occmin, occmax, normalized_trace, hermitian_error, spectral_ok
+               IF (do_kpoints) kcounts(ispin, 1) = kcounts(ispin, 1) + wkp(ik)*normalized_trace
+               bad = bad .OR. .NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
+                     occmax > 1.0_dp + store%dm_trial_occ_tol
+            END IF
+            ! Certify the overlap against the actual diagonalization orbitals, independent of
+            ! the density reconstruction, before interpreting raw-output occupation noise.
+            IF (do_kpoints .AND. scf_env%iter_count == 1) THEN
+               kp => kpoints%kp_env(ik)%kpoint_env
+               CALL get_mo_set(kp%mos(1, ispin), mo_coeff=coeff_re, nmo=nmo)
+               coeff = CMPLX(coeff_re%local_data(1:nao, 1:nmo), 0.0_dp, KIND=dp)
+               IF (SIZE(kp%mos, 1) == 2) THEN
+                  CALL get_mo_set(kp%mos(2, ispin), mo_coeff=coeff_im)
+                  coeff = CMPLX(REAL(coeff, KIND=dp), coeff_im%local_data(1:nao, 1:nmo), KIND=dp)
+               END IF
+               gram = MATMUL(CONJG(TRANSPOSE(coeff)), MATMUL(sk%local_data(1:nao, 1:nao), coeff))
+               DO im = 1, nmo
+                  gram(im, im) = gram(im, im) - z_one
+               END DO
+               ortho_error = MAXVAL(ABS(gram))
+               IF (iw > 0) WRITE (iw, '(T2,A,2I6,ES22.12E3)') &
+                  "SCF_TRIAL| raw MO metric k,spin,max identity error ", ik, ispin, ortho_error
+               IF (ortho_error > 1.0E-6_dp) &
+                  CALL cp_abort(__LOCATION__, &
+                                "Diagnostic overlap differs from the diagonalization metric")
+               DEALLOCATE (coeff, gram)
+            END IF
+            ! The untruncated diagonalization density is the physical numerical-noise control.
+            IF (do_kpoints) THEN
+               pk%local_data = z_zero
+               pk%local_data(1:nao, 1:nao) = raw_k(:, :, ispin, ik)
+            ELSE IF (.NOT. full_step) THEN
+               CALL copy_dbcsr_to_fm(pin(ispin, 1)%matrix, monitor_work)
+               CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+               CALL copy_dbcsr_to_fm(store%dm_pulay_res_last(ispin, 1)%matrix, monitor_work)
+               CALL cp_cfm_scale_and_add_fm(z_zero, raw, z_one, monitor_work)
+               pk%local_data = pk%local_data + raw%local_data
+            END IF
+            CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
+                                         scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                         occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
+            IF (iw > 0) WRITE (iw, '(T2,A,2I6,4ES22.12E3,L3)') &
+               "SCF_TRIAL| raw-output k,spin,min,max,trace,hermiticity,finite ", ik, ispin, &
+               occmin, occmax, normalized_trace, hermitian_error, spectral_ok
+            IF (do_kpoints) kcounts(ispin, 2) = kcounts(ispin, 2) + wkp(ik)*normalized_trace
+
+         END DO
+      END DO
+      IF (do_kpoints) THEN
+         DO ispin = 1, nspin
+            IF (have_bloch_candidate) THEN
+               IF (iw > 0) WRITE (iw, '(T2,A,I3,4ES22.12E3)') &
+                  "SCF_TRIAL| spin,Bloch trial,real trial,Bloch raw,real raw count ", &
+                  ispin, kcounts(ispin, 1), counts(ispin, 3), kcounts(ispin, 2), counts(ispin, 2)
+            ELSE
+               IF (iw > 0) WRITE (iw, '(T2,A,I3,2ES22.12E3)') &
+                  "SCF_TRIAL| spin,Bloch raw,real raw count ", ispin, kcounts(ispin, 2), counts(ispin, 2)
+            END IF
+         END DO
+         IF (MAXVAL(ABS(kcounts(:, 2) - counts(:, 2))) > store%dm_trial_charge_tol) &
+            CALL cp_abort(__LOCATION__, &
+                          "Raw Bloch and real-space electron traces disagree")
+         IF (have_bloch_candidate) THEN
+            IF (MAXVAL(ABS(kcounts(:, 1) - counts(:, 3))) > store%dm_trial_charge_tol) &
+               CALL cp_abort(__LOCATION__, &
+                             "Trial Bloch and real-space electron traces disagree")
+         END IF
+      END IF
+      rejected = store%dm_trial_reject .AND. bad
+      IF (store%dm_trial_step_limit > 0.0_dp) THEN
+         rejected = rejected .OR. .NOT. ieee_is_finite(snorm2) .OR. &
+                    snorm2 > store%dm_trial_step_limit**2*rnorm2
+      END IF
+      IF (rejected) THEN
+         IF (.NOT. ALL(ieee_is_finite(counts(:, 1:2))) .OR. &
+             .NOT. ieee_is_finite(rnorm2)) &
+            CALL cp_abort(__LOCATION__, &
+                          "Pulay trial fallback has no finite physical endpoints; first failure is the raw map")
+         fallback_alpha = alpha
+         IF (store%dm_trial_step_limit > 0.0_dp) fallback_alpha = MIN(alpha, store%dm_trial_step_limit)
+         IF (full_step) THEN
+            ! Keep the raw output even when a skipped-mixing/full step is shortened.
+            ! Finalization can then recover P_out without accepting the shortened input as a zero residual.
+            CALL dm_pulay_storage_release(store)
+            ALLOCATE (store%dm_pulay_p_last(nspin, SIZE(trial, 2)), &
+                      store%dm_pulay_res_last(nspin, SIZE(trial, 2)))
+            DO ic = 1, SIZE(trial, 2)
+               DO ispin = 1, nspin
+                  ALLOCATE (store%dm_pulay_p_last(ispin, ic)%matrix, store%dm_pulay_res_last(ispin, ic)%matrix)
+                  CALL dbcsr_create(store%dm_pulay_p_last(ispin, ic)%matrix, template=pin(ispin, ic)%matrix)
+                  CALL dbcsr_create(store%dm_pulay_res_last(ispin, ic)%matrix, template=pin(ispin, ic)%matrix)
+                  CALL dbcsr_copy(store%dm_pulay_p_last(ispin, ic)%matrix, pin(ispin, ic)%matrix)
+                  CALL dbcsr_copy(store%dm_pulay_res_last(ispin, ic)%matrix, trial(ispin, ic)%matrix)
+                  CALL dbcsr_add(store%dm_pulay_res_last(ispin, ic)%matrix, pin(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               END DO
+            END DO
+         END IF
+         density_full_step = .FALSE.
+         DO ic = 1, SIZE(trial, 2)
+            DO ispin = 1, nspin
+               CALL dbcsr_copy(trial(ispin, ic)%matrix, pin(ispin, ic)%matrix)
+               CALL dbcsr_add(trial(ispin, ic)%matrix, store%dm_pulay_res_last(ispin, ic)%matrix, &
+                              1.0_dp, fallback_alpha)
+            END DO
+         END DO
+         IF (do_kpoints) THEN
+            mixed_k = store%dm_trial_k_input + fallback_alpha*(raw_k - store%dm_trial_k_input)
+            CALL trial_bloch_roundtrip(qs_env, scf_env, trial, mixed_k, roundtrip_error)
+            IF (roundtrip_error > 1.0E-8_dp) &
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch fallback does not represent the real-space fallback")
+         END IF
+         ! Certify the convex fallback in the same metric before fields can consume it.
+         DO ik = 1, nkp
+            IF (do_kpoints) THEN
+               CALL kp_build_cfm(matrix_s, 1, xkp(:, ik), splan, sk)
+            ELSE
+               CALL copy_dbcsr_to_fm(matrix_s(1, 1)%matrix, monitor_work)
+               CALL cp_cfm_scale_and_add_fm(z_zero, sk, z_one, monitor_work)
+            END IF
+            DO ispin = 1, nspin
+               IF (do_kpoints) THEN
+                  pk%local_data = z_zero
+                  pk%local_data(1:nao, 1:nao) = mixed_k(:, :, ispin, ik)
+               ELSE
+                  CALL copy_dbcsr_to_fm(trial(ispin, 1)%matrix, monitor_work)
+                  CALL cp_cfm_scale_and_add_fm(z_zero, pk, z_one, monitor_work)
+               END IF
+               CALL trial_occupation_bounds(pk%local_data(1:nao, 1:nao), sk%local_data(1:nao, 1:nao), &
+                                            scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                            occmin, occmax, normalized_trace, hermitian_error, spectral_ok)
+               IF (iw > 0) WRITE (iw, '(T2,A,2I6,2ES22.12E3,L3)') &
+                  "SCF_TRIAL| fallback k,spin,min,max,finite ", ik, ispin, occmin, occmax, spectral_ok
+               IF (.NOT. spectral_ok .OR. occmin < -store%dm_trial_occ_tol .OR. &
+                   occmax > 1.0_dp + store%dm_trial_occ_tol) CALL cp_abort(__LOCATION__, &
+                                             "Linear Pulay fallback is outside the physical occupation domain; check the endpoints")
+            END DO
+         END DO
+         counts(:, 3) = 0.0_dp
+         DO ic = 1, SIZE(trial, 2)
+            DO ispin = 1, nspin
+               CALL dbcsr_dot(trial(ispin, ic)%matrix, matrix_s(1, ic)%matrix, dot)
+               counts(ispin, 3) = counts(ispin, 3) + dot
+            END DO
+         END DO
+         IF (ABS(SUM(counts(:, 3)) - charge_target) > store%dm_trial_charge_tol) &
+            CALL cp_abort(__LOCATION__, &
+                          "Linear Pulay fallback has the wrong electron count")
+         store%dm_pulay_ncall = 0
+         store%dm_trial_fallback = .TRUE.
+         IF (iw > 0) WRITE (iw, '(T2,A,I6,ES22.12E3,L3)') &
+            "SCF_TRIAL| rejected,common-linear-alpha,invalid-domain ", scf_env%iter_count, fallback_alpha, bad
+      END IF
+      IF (do_kpoints) THEN
+         IF (have_bloch_candidate) store%dm_trial_k_input = mixed_k
+         DEALLOCATE (raw_k, mixed_k)
+         CALL kp_transform_plan_release(pplan)
+         CALL kp_transform_plan_release(splan)
+      END IF
+      CALL cp_cfm_release(pk)
+      CALL cp_cfm_release(sk)
+      CALL cp_cfm_release(raw)
+      CALL cp_fm_release(monitor_work)
+      DEALLOCATE (counts, rcounts, kcounts)
+   END SUBROUTINE qs_scf_pulay_trial_check
+
+! **************************************************************************************************
+!> \brief Load/save a matched full Bloch and real-space density with strict physical bindings.
+!> Default-off, one-rank stream format; paths/hashes and producer inputs are recorded externally.
+   SUBROUTINE qs_scf_full_bloch_initialize(qs_env, scf_env, changed)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      LOGICAL, INTENT(OUT)                               :: changed
+
+      TYPE(mixing_storage_type), POINTER                 :: store
+
+      changed = .FALSE.
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (LEN_TRIM(store%dm_trial_k_read) == 0 .OR. store%dm_trial_k_loaded) RETURN
+      CALL trial_bloch_checkpoint(qs_env, scf_env, .FALSE.)
+      store%dm_trial_k_loaded = .TRUE.
+      changed = .TRUE.
+   END SUBROUTINE qs_scf_full_bloch_initialize
+
+! **************************************************************************************************
+!> \brief A checkpoint is never written from a one-step or unconverged smeared restart.
+   SUBROUTINE qs_scf_full_bloch_save(qs_env, scf_env, converged)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      LOGICAL, INTENT(IN)                                :: converged
+
+      TYPE(mixing_storage_type), POINTER                 :: store
+
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (LEN_TRIM(store%dm_trial_k_write) == 0) RETURN
+      IF (.NOT. converged .OR. scf_env%iter_count < 2) &
+         CALL cp_abort(__LOCATION__, &
+                       "Full Bloch checkpoint needs a converged state with at least two SCF steps")
+      CALL trial_bloch_checkpoint(qs_env, scf_env, .TRUE.)
+   END SUBROUTINE qs_scf_full_bloch_save
+
+! **************************************************************************************************
+!> \brief V1 stream contains P(k), its real-space image, S(k), k mesh and image-index map.
+   SUBROUTINE trial_bloch_checkpoint(qs_env, scf_env, writing)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      LOGICAL, INTENT(IN)                                :: writing
+
+      CHARACTER(LEN=1024)                                :: filename
+      CHARACTER(LEN=64)                                  :: magic
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: bloch(:, :, :, :), file_metric(:, :, :), &
+                                                            metric(:, :, :)
+      CHARACTER(LEN=64), PARAMETER :: magic_expected = 'skala2pw-full-bloch-density-v1'
+
+      INTEGER :: bounds_hi(3), bounds_lo(3), file_hi(3), file_lo(3), file_nao, file_nel, &
+         file_nimg, file_nkp, file_nspin, ic, ik, ios, ispin, iw, nao, ne_a, ne_b, nel, nimg, nkp, &
+         nspin, steps, unit
+      INTEGER, ALLOCATABLE                               :: file_map(:, :, :)
+      INTEGER, POINTER                                   :: cell_to_index(:, :, :)
+      LOGICAL                                            :: do_kpoints, spectral_ok
+      REAL(KIND=dp)                                      :: dot, fixed_target(2), herm, hi, lo, &
+                                                            maxocc, roundtrip, s_error, trace
+      REAL(KIND=dp), ALLOCATABLE                         :: counts(:, :), file_wkp(:), file_xkp(:, :)
+      REAL(KIND=dp), POINTER                             :: wkp(:), xkp(:, :)
+      TYPE(cp_cfm_type)                                  :: sk
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(cp_fm_type)                                   :: work
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_p_type), POINTER                        :: overlap(:, :), real_density(:, :)
+      TYPE(dbcsr_type), POINTER                          :: full_real
+      TYPE(kp_transform_plan_type)                       :: plan
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+      TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(scf_control_type), POINTER                    :: scf_control
+
+      store => scf_env%mixing_store
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_s_kp=overlap, rho=rho, para_env=para_env, &
+                      do_kpoints=do_kpoints, nelectron_total=nel, scf_control=scf_control)
+      IF (.NOT. do_kpoints .OR. para_env%num_pe /= 1) &
+         CALL cp_abort(__LOCATION__, &
+                       "Full Bloch checkpoints currently require k-points and one MPI rank")
+      logger => cp_get_default_logger()
+      iw = cp_logger_get_default_unit_nr(logger)
+      CALL qs_rho_get(rho, rho_ao_kp=real_density)
+      IF (.NOT. writing) real_density => scf_env%p_mix_new
+      nspin = SIZE(real_density, 1); nimg = SIZE(real_density, 2)
+      CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
+      bounds_lo = LBOUND(cell_to_index); bounds_hi = UBOUND(cell_to_index)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      nao = fmstruct%nrow_global
+      CALL cp_fm_create(work, fmstruct); CALL cp_cfm_create(sk, fmstruct)
+      CALL kp_transform_plan_create(plan, sab_nl, cell_to_index, SIZE(overlap, 2), overlap(1, 1)%matrix)
+      ALLOCATE (bloch(nao, nao, nspin, nkp), metric(nao, nao, nkp), counts(nspin, 2))
+      DO ik = 1, nkp
+         CALL kp_build_cfm(overlap, 1, xkp(:, ik), plan, sk)
+         metric(:, :, ik) = sk%local_data(1:nao, 1:nao)
+      END DO
+      filename = store%dm_trial_k_read
+      IF (writing) filename = store%dm_trial_k_write
+      IF (writing) THEN
+         DO ik = 1, nkp
+            kp => kpoints%kp_env(ik)%kpoint_env
+            DO ispin = 1, nspin
+               bloch(:, :, ispin, ik) = CMPLX(kp%pmat(1, ispin)%local_data(1:nao, 1:nao), 0.0_dp, KIND=dp)
+               IF (SIZE(kp%pmat, 1) == 2) bloch(:, :, ispin, ik) = &
+                  CMPLX(REAL(bloch(:, :, ispin, ik), KIND=dp), &
+                        kp%pmat(2, ispin)%local_data(1:nao, 1:nao), KIND=dp)
+            END DO
+         END DO
+      ELSE
+         OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='OLD', FORM='UNFORMATTED', ACCESS='STREAM', ACTION='READ', IOSTAT=ios)
+         IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                     "Cannot read the requested full Bloch checkpoint")
+         READ (unit, IOSTAT=ios) magic, file_nao, file_nkp, file_nspin, file_nimg, file_nel, steps
+         IF (ios /= 0 .OR. magic /= magic_expected) &
+            CALL cp_abort(__LOCATION__, &
+                          "Invalid full Bloch checkpoint header")
+         IF (file_nao /= nao .OR. file_nkp /= nkp .OR. file_nspin /= nspin .OR. file_nimg /= nimg .OR. file_nel /= nel) &
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch checkpoint basis, mesh, spin or electron count differs")
+         IF (steps < 2) CALL cp_abort(__LOCATION__, &
+                                      "One-step full Bloch checkpoints are not accepted")
+         READ (unit, IOSTAT=ios) file_lo, file_hi
+         IF (ios /= 0 .OR. ANY(file_lo /= bounds_lo) .OR. ANY(file_hi /= bounds_hi)) &
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch checkpoint image-map bounds differ")
+         ALLOCATE (file_map(file_lo(1):file_hi(1), file_lo(2):file_hi(2), file_lo(3):file_hi(3)))
+         ALLOCATE (file_xkp(3, nkp), file_wkp(nkp), file_metric(nao, nao, nkp))
+         READ (unit, IOSTAT=ios) file_map, file_xkp, file_wkp, file_metric, bloch
+         IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                     "Incomplete full Bloch checkpoint")
+         IF (.NOT. ALL(ieee_is_finite(REAL(file_metric))) .OR. .NOT. ALL(ieee_is_finite(AIMAG(file_metric)))) &
+            CALL cp_abort(__LOCATION__, &
+                          "Non-finite checkpoint overlap binding")
+         s_error = MAXVAL(ABS(file_metric - metric))
+         IF (ANY(file_map /= cell_to_index) .OR. MAXVAL(ABS(file_xkp - xkp)) > 1.0E-14_dp .OR. &
+             MAXVAL(ABS(file_wkp - wkp)) > 1.0E-14_dp .OR. s_error > 1.0E-12_dp) &
+            CALL cp_abort(__LOCATION__, &
+                          "Full Bloch checkpoint geometry, overlap, k mesh or image map differs")
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               work%local_data = 0.0_dp
+               READ (unit, IOSTAT=ios) work%local_data(1:nao, 1:nao)
+               IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                           "Incomplete real-space checkpoint pair")
+               IF (.NOT. ALL(ieee_is_finite(work%local_data))) &
+                  CALL cp_abort(__LOCATION__, &
+                                "Non-finite real-space checkpoint pair")
+               CALL copy_fm_to_dbcsr(work, real_density(ispin, ic)%matrix, keep_sparsity=.TRUE.)
+            END DO
+         END DO
+         CLOSE (unit)
+         DEALLOCATE (file_map, file_xkp, file_wkp, file_metric)
+         IF (iw > 0) WRITE (iw, '(T2,A,ES22.12E3)') "SCF_TRIAL| checkpoint overlap binding max error ", s_error
+      END IF
+      CALL trial_bloch_roundtrip(qs_env, scf_env, real_density, bloch, roundtrip)
+      IF (roundtrip > 1.0E-8_dp) CALL cp_abort(__LOCATION__, &
+                                               "Full Bloch and real-space checkpoint pair disagrees")
+      counts = 0.0_dp; maxocc = MERGE(2.0_dp, 1.0_dp, nspin == 1)
+      DO ik = 1, nkp
+         DO ispin = 1, nspin
+            CALL trial_occupation_bounds(bloch(:, :, ispin, ik), metric(:, :, ik), &
+                                         scf_env%cholesky_method == cholesky_off, scf_control%eps_eigval, maxocc, &
+                                         lo, hi, trace, herm, spectral_ok)
+            IF (.NOT. spectral_ok .OR. lo < -store%dm_trial_occ_tol .OR. hi > 1.0_dp + store%dm_trial_occ_tol) &
+               CALL cp_abort(__LOCATION__, &
+                             "Full Bloch checkpoint is outside the physical occupation domain")
+            counts(ispin, 1) = counts(ispin, 1) + wkp(ik)*trace
+         END DO
+      END DO
+      DO ic = 1, nimg
+         DO ispin = 1, nspin
+            CALL dbcsr_dot(real_density(ispin, ic)%matrix, overlap(1, ic)%matrix, dot)
+            counts(ispin, 2) = counts(ispin, 2) + dot
+         END DO
+      END DO
+      IF (MAXVAL(ABS(counts(:, 1) - counts(:, 2))) > store%dm_trial_charge_tol .OR. &
+          ABS(SUM(counts(:, 1)) - REAL(nel, KIND=dp)) > store%dm_trial_charge_tol) &
+         CALL cp_abort(__LOCATION__, &
+                       "Full Bloch checkpoint has inconsistent spin or total electron traces")
+      IF (nspin == 2 .AND. scf_control%smear%do_smear) THEN
+         IF (scf_control%smear%fixed_mag_mom >= 0.0_dp .OR. scf_control%smear%fixed_mag_mom == -1.0_dp) THEN
+            IF (scf_control%smear%fixed_mag_mom >= 0.0_dp) THEN
+               fixed_target(1) = 0.5_dp*(REAL(nel, KIND=dp) + scf_control%smear%fixed_mag_mom)
+               fixed_target(2) = 0.5_dp*(REAL(nel, KIND=dp) - scf_control%smear%fixed_mag_mom)
+            ELSE
+               kp => kpoints%kp_env(1)%kpoint_env
+               CALL get_mo_set(kp%mos(1, 1), nelectron=ne_a)
+               CALL get_mo_set(kp%mos(1, 2), nelectron=ne_b)
+               fixed_target = REAL([ne_a, ne_b], KIND=dp)
+            END IF
+            IF (MAXVAL(ABS(counts(:, 1) - fixed_target)) > store%dm_trial_charge_tol) &
+               CALL cp_abort(__LOCATION__, &
+                             "Checkpoint spin counts differ from the requested fixed moment")
+         END IF
+      END IF
+      IF (writing) THEN
+         OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='NEW', FORM='UNFORMATTED', ACCESS='STREAM', ACTION='WRITE', IOSTAT=ios)
+         IF (ios /= 0) CALL cp_abort(__LOCATION__, &
+                                     "Cannot create a new full Bloch checkpoint")
+         WRITE (unit) magic_expected, nao, nkp, nspin, nimg, nel, scf_env%iter_count
+         WRITE (unit) bounds_lo, bounds_hi
+         WRITE (unit) cell_to_index, xkp, wkp, metric, bloch
+         ALLOCATE (full_real)
+         CALL dbcsr_create(full_real, template=real_density(1, 1)%matrix, matrix_type=dbcsr_type_no_symmetry)
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               CALL dbcsr_desymmetrize(real_density(ispin, ic)%matrix, full_real)
+               CALL copy_dbcsr_to_fm(full_real, work)
+               WRITE (unit) work%local_data(1:nao, 1:nao)
+            END DO
+         END DO
+         CALL dbcsr_deallocate_matrix(full_real)
+         CLOSE (unit)
+      ELSE
+         IF (ALLOCATED(store%dm_trial_k_input)) DEALLOCATE (store%dm_trial_k_input, store%dm_trial_k_last, &
+                                                            store%dm_trial_k_reslast, store%dm_trial_k_dp, store%dm_trial_k_dres)
+         store%dm_trial_k_input = bloch
+         store%dm_trial_k_last = bloch
+         ALLOCATE (store%dm_trial_k_reslast(nao, nao, nspin, nkp), &
+                   store%dm_trial_k_dp(nao, nao, nspin, nkp, MAX(store%nbuffer, 1)), &
+                   store%dm_trial_k_dres(nao, nao, nspin, nkp, MAX(store%nbuffer, 1)))
+         store%dm_trial_k_reslast = z_zero; store%dm_trial_k_dp = z_zero; store%dm_trial_k_dres = z_zero
+      END IF
+      IF (iw > 0) THEN
+         WRITE (iw, '(T2,A,L3,ES22.12E3)') "SCF_TRIAL| paired checkpoint write,forward max error ", writing, roundtrip
+         DO ispin = 1, nspin
+            WRITE (iw, '(T2,A,I3,2ES22.12E3)') "SCF_TRIAL| checkpoint spin,Bloch,real count ", ispin, counts(ispin, :)
+         END DO
+      END IF
+      CALL kp_transform_plan_release(plan)
+      CALL cp_cfm_release(sk); CALL cp_fm_release(work)
+      DEALLOCATE (bloch, metric, counts)
+   END SUBROUTINE trial_bloch_checkpoint
+
+! **************************************************************************************************
+!> \brief Apply the exact real-space Pulay coefficients and normalization to full Bloch densities.
+   SUBROUTINE trial_bloch_mix(store, raw, mixed, full_step)
+      TYPE(mixing_storage_type), POINTER                 :: store
+      COMPLEX(KIND=dp), INTENT(IN)                       :: raw(:, :, :, :)
+      COMPLEX(KIND=dp), INTENT(OUT)                      :: mixed(:, :, :, :)
+      LOGICAL, INTENT(IN)                                :: full_step
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: charge(:, :, :), magnet(:, :, :), &
+                                                            residual(:, :, :, :)
+      INTEGER                                            :: ib, jb, nb
+
+      residual = raw - store%dm_trial_k_input
+      IF (store%dm_pulay_ncall <= 1) THEN
+         store%dm_trial_k_dp = z_zero
+         store%dm_trial_k_dres = z_zero
+      ELSE
+         ib = store%dm_trial_k_slot
+         IF (ib > 0 .AND. store%dm_trial_k_norm > 0.0_dp) THEN
+            store%dm_trial_k_dp(:, :, :, :, ib) = &
+               (store%dm_trial_k_input - store%dm_trial_k_last)/store%dm_trial_k_norm
+            store%dm_trial_k_dres(:, :, :, :, ib) = &
+               (residual - store%dm_trial_k_reslast)/store%dm_trial_k_norm
+         END IF
+      END IF
+      nb = 0
+      IF (ALLOCATED(store%dm_trial_k_g)) nb = SIZE(store%dm_trial_k_g)
+      IF (full_step) THEN
+         mixed = raw
+      ELSE IF (SIZE(raw, 3) == 1) THEN
+         mixed = store%dm_trial_k_input + store%alpha*residual
+         DO jb = 1, nb
+            mixed = mixed - store%dm_trial_k_g(jb)*(store%dm_trial_k_dp(:, :, :, :, jb) + &
+                                                    store%alpha*store%dm_trial_k_dres(:, :, :, :, jb))
+         END DO
+      ELSE
+         charge = store%alpha*(residual(:, :, 1, :) + residual(:, :, 2, :))
+         magnet = store%alpha_mag*(residual(:, :, 1, :) - residual(:, :, 2, :))
+         DO jb = 1, nb
+            charge = charge - store%dm_trial_k_g(jb)*(store%dm_trial_k_dp(:, :, 1, :, jb) + &
+                                                      store%dm_trial_k_dp(:, :, 2, :, jb) + store%alpha* &
+                                                    (store%dm_trial_k_dres(:, :, 1, :, jb) + store%dm_trial_k_dres(:, :, 2, :, jb)))
+            IF (store%dm_pulay_joint_active) magnet = magnet - store%dm_trial_k_g(jb)* &
+                                     (store%dm_trial_k_dp(:, :, 1, :, jb) - store%dm_trial_k_dp(:, :, 2, :, jb) + store%alpha_mag* &
+                                                    (store%dm_trial_k_dres(:, :, 1, :, jb) - store%dm_trial_k_dres(:, :, 2, :, jb)))
+         END DO
+         mixed(:, :, 1, :) = store%dm_trial_k_input(:, :, 1, :) + 0.5_dp*(charge + magnet)
+         mixed(:, :, 2, :) = store%dm_trial_k_input(:, :, 2, :) + 0.5_dp*(charge - magnet)
+      END IF
+      store%dm_trial_k_last = store%dm_trial_k_input
+      store%dm_trial_k_reslast = residual
+   END SUBROUTINE trial_bloch_mix
+
+! **************************************************************************************************
+!> \brief Certify that a full Bloch candidate maps to the density consumed by the fields.
+   SUBROUTINE trial_bloch_roundtrip(qs_env, scf_env, real_candidate, bloch, error)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(dbcsr_p_type), POINTER                        :: real_candidate(:, :)
+      COMPLEX(KIND=dp), INTENT(IN)                       :: bloch(:, :, :, :)
+      REAL(KIND=dp), INTENT(OUT)                         :: error
+
+      INTEGER                                            :: ic, ik, ispin, nao, nkp, nspin
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(cp_fm_type), ALLOCATABLE                      :: ext(:, :, :)
+      TYPE(dbcsr_p_type), POINTER                        :: overlap(:, :), reconstructed(:, :)
+      TYPE(dbcsr_type)                                   :: diff
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+
+      nao = SIZE(bloch, 1); nspin = SIZE(bloch, 3); nkp = SIZE(bloch, 4)
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_s_kp=overlap)
+      CALL get_kpoint_info(kpoints, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      ALLOCATE (ext(nkp, 2, nspin), reconstructed(nspin, SIZE(real_candidate, 2)))
+      DO ispin = 1, nspin
+         DO ik = 1, nkp
+            DO ic = 1, 2
+               CALL cp_fm_create(ext(ik, ic, ispin), fmstruct)
+               ext(ik, ic, ispin)%local_data = 0.0_dp
+            END DO
+            ext(ik, 1, ispin)%local_data(1:nao, 1:nao) = REAL(bloch(:, :, ispin, ik), KIND=dp)
+            ext(ik, 2, ispin)%local_data(1:nao, 1:nao) = AIMAG(bloch(:, :, ispin, ik))
+         END DO
+         DO ic = 1, SIZE(real_candidate, 2)
+            ALLOCATE (reconstructed(ispin, ic)%matrix)
+            CALL dbcsr_create(reconstructed(ispin, ic)%matrix, template=real_candidate(ispin, ic)%matrix)
+            CALL dbcsr_copy(reconstructed(ispin, ic)%matrix, real_candidate(ispin, ic)%matrix)
+         END DO
+      END DO
+      CALL kpoint_density_transform(kpoints, reconstructed, .FALSE., overlap(1, 1)%matrix, &
+                                    sab_nl, scf_env%scf_work1, pmat_ext=ext, overlap_rs=overlap)
+      error = 0.0_dp
+      DO ic = 1, SIZE(real_candidate, 2)
+         DO ispin = 1, nspin
+            CALL dbcsr_create(diff, template=real_candidate(ispin, ic)%matrix)
+            CALL dbcsr_copy(diff, reconstructed(ispin, ic)%matrix)
+            CALL dbcsr_add(diff, real_candidate(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            error = MAX(error, dbcsr_maxabs(diff))
+            CALL dbcsr_release(diff)
+            CALL dbcsr_deallocate_matrix(reconstructed(ispin, ic)%matrix)
+         END DO
+      END DO
+      DO ispin = 1, nspin
+         DO ik = 1, nkp
+            DO ic = 1, 2
+               CALL cp_fm_release(ext(ik, ic, ispin))
+            END DO
+         END DO
+      END DO
+      DEALLOCATE (ext, reconstructed)
+   END SUBROUTINE trial_bloch_roundtrip
+
+! **************************************************************************************************
+!> \brief Eigenvalues of the density in the overlap metric, normalized to [0,1].
+!> \param p ...
+!> \param s ...
+!> \param canonical ...
+!> \param eps_eigval ...
+!> \param maxocc ...
+!> \param occmin ...
+!> \param occmax ...
+!> \param trace ...
+!> \param hermitian_error ...
+!> \param finite ...
+   SUBROUTINE trial_occupation_bounds(p, s, canonical, eps_eigval, maxocc, &
+                                      occmin, occmax, trace, hermitian_error, finite)
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: p, s
+      LOGICAL, INTENT(IN)                                :: canonical
+      REAL(KIND=dp), INTENT(IN)                          :: eps_eigval, maxocc
+      REAL(KIND=dp), INTENT(OUT)                         :: occmin, occmax, trace, hermitian_error
+      LOGICAL, INTENT(OUT)                               :: finite
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: basis(:, :), metric(:, :), &
+                                                            physical(:, :), work(:)
+      INTEGER                                            :: first, i, info, j, n, nr
+      REAL(KIND=dp), ALLOCATABLE                         :: eig(:), rwork(:)
+
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      TYPE(ieee_status_type) :: saved_status
+#endif
+      n = SIZE(p, 1)
+      occmin = 0.0_dp
+      occmax = 0.0_dp
+      trace = 0.0_dp
+      hermitian_error = 0.0_dp
+      finite = ALL(ieee_is_finite(REAL(p))) .AND. ALL(ieee_is_finite(AIMAG(p))) .AND. &
+               ALL(ieee_is_finite(REAL(s))) .AND. ALL(ieee_is_finite(AIMAG(s)))
+      IF (.NOT. finite) RETURN
+      hermitian_error = MAXVAL(ABS(p - CONJG(TRANSPOSE(p))))
+      ALLOCATE (metric(n, n), eig(n))
+      metric = s
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_get_status(saved_status)
+      CALL ieee_set_halting_mode(IEEE_ALL, .FALSE.)
+#endif
+      IF (canonical) THEN
+         CALL trial_metric_heevd(metric, eig, info)
+         finite = info == 0
+         IF (finite) THEN
+            first = 1
+            DO WHILE (first <= n)
+               IF (eig(first) >= eps_eigval) EXIT
+               first = first + 1
+            END DO
+            nr = n - first + 1
+            finite = nr > 0
+            IF (finite) THEN
+               ALLOCATE (basis(n, nr))
+               DO j = 1, nr
+                  basis(:, j) = metric(:, first + j - 1)*SQRT(eig(first + j - 1))
+               END DO
+               physical = MATMUL(CONJG(TRANSPOSE(basis)), MATMUL(p, basis))/maxocc
+               DEALLOCATE (basis)
+            END IF
+         END IF
+      ELSE
+         CALL zpotrf('U', n, metric(1, 1), n, info)
+         finite = info == 0
+         IF (finite) THEN
+            DO j = 1, n
+               DO i = j + 1, n
+                  metric(i, j) = z_zero
+               END DO
+            END DO
+            nr = n
+            physical = MATMUL(metric, MATMUL(p, CONJG(TRANSPOSE(metric))))/maxocc
+         END IF
+      END IF
+      IF (finite) THEN
+         physical = 0.5_dp*(physical + CONJG(TRANSPOSE(physical)))
+         finite = ALL(ieee_is_finite(REAL(physical))) .AND. ALL(ieee_is_finite(AIMAG(physical)))
+         IF (finite) THEN
+            CALL trial_metric_heevd(physical, eig(1:nr), info)
+            finite = info == 0 .AND. ALL(ieee_is_finite(eig(1:nr)))
+            IF (finite) THEN
+               occmin = MINVAL(eig(1:nr))
+               occmax = MAXVAL(eig(1:nr))
+               trace = SUM(eig(1:nr))*maxocc
+            END IF
+         END IF
+      END IF
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_set_status(saved_status)
+#endif
+      IF (ALLOCATED(physical)) DEALLOCATE (physical)
+      DEALLOCATE (metric, eig)
+   END SUBROUTINE trial_occupation_bounds
+
+! **************************************************************************************************
+!> \brief Use CP2K's established divide-and-conquer complex eigensolver kernel and workspace query.
+!> \param matrix overwritten by eigenvectors
+!> \param eigenvalues ...
+!> \param info ...
+   SUBROUTINE trial_metric_heevd(matrix, eigenvalues, info)
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT)   :: matrix
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: eigenvalues
+      INTEGER, INTENT(OUT)                               :: info
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: work(:)
+      INTEGER                                            :: liwork, lrwork, lwork, n
+      INTEGER, ALLOCATABLE                               :: iwork(:)
+      REAL(KIND=dp), ALLOCATABLE                         :: rwork(:)
+
+      n = SIZE(eigenvalues)
+      ALLOCATE (work(1), rwork(1), iwork(1))
+      CALL zheevd('V', 'U', n, matrix(1, 1), SIZE(matrix, 1), eigenvalues(1), &
+                  work(1), -1, rwork(1), -1, iwork(1), -1, info)
+      IF (info /= 0) THEN
+         DEALLOCATE (work, rwork, iwork)
+         RETURN
+      END IF
+      lwork = MAX(1, CEILING(REAL(work(1), KIND=dp)))
+      lrwork = MAX(1, CEILING(rwork(1)))
+      liwork = MAX(1, iwork(1))
+      DEALLOCATE (work, rwork, iwork)
+      ALLOCATE (work(lwork), rwork(lrwork), iwork(liwork))
+      CALL zheevd('V', 'U', n, matrix(1, 1), SIZE(matrix, 1), eigenvalues(1), &
+                  work(1), lwork, rwork(1), lrwork, iwork(1), liwork, info)
+      DEALLOCATE (work, rwork, iwork)
+   END SUBROUTINE trial_metric_heevd
 
 END MODULE qs_scf_diagonalization

@@ -50,8 +50,9 @@ MODULE qs_scf
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_get_info, &
-        dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, dbcsr_release_p, dbcsr_set, dbcsr_type, &
-        dbcsr_type_no_symmetry
+        dbcsr_init_p, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
+        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_release_p, &
+        dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
@@ -84,6 +85,7 @@ MODULE qs_scf
                                               test_for_result
    USE cp_result_types,                 ONLY: cp_result_type
    USE ec_env_types,                    ONLY: energy_correction_type
+   USE ieee_arithmetic,                 ONLY: ieee_is_finite
    USE input_constants,                 ONLY: &
         broyden_type_1, broyden_type_1_explicit, broyden_type_1_explicit_ls, broyden_type_1_ls, &
         broyden_type_2, broyden_type_2_explicit, broyden_type_2_explicit_ls, broyden_type_2_ls, &
@@ -201,7 +203,10 @@ MODULE qs_scf
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
    USE qs_scf_diagonalization,          ONLY: do_general_diag_kp,&
-                                              qs_scf_get_ot_kpoint_operator
+                                              qs_scf_full_bloch_initialize,&
+                                              qs_scf_full_bloch_save,&
+                                              qs_scf_get_ot_kpoint_operator,&
+                                              qs_scf_pulay_trial_check
    USE qs_scf_initialization,           ONLY: qs_scf_env_initialize
    USE qs_scf_loop_utils,               ONLY: &
         qs_scf_candidate_density_delta, qs_scf_check_inner_exit, qs_scf_check_outer_exit, &
@@ -431,11 +436,11 @@ CONTAINS
          ot_kp_subspace_refresh_iter_count, output_unit, scf_energy_message_tag, total_steps
       LOGICAL :: ace_active, added_mos_auto_grow, adiis_pushed, adiis_restarted, adiis_stagnated, &
          adiis_validation, density_full_step, diis_step, do_kpoints, energy_only, exit_inner_loop, &
-         exit_outer_loop, inner_loop_converged, internal_tblite_density_full_step, &
-         internal_tblite_mixer, just_energy, oda_applied, oda_eligible, oda_globalization_active, &
-         oda_interior, oda_predictor_valid, oda_restart_trigger, oda_state_evaluated, oda_trigger, &
-         ot_kp_subspace_refresh, ot_kp_subspace_refresh_pending, outer_loop_converged, &
-         tblite_native_mixer
+         exit_outer_loop, full_bloch_changed, inner_loop_converged, &
+         internal_tblite_density_full_step, internal_tblite_mixer, just_energy, oda_applied, &
+         oda_eligible, oda_globalization_active, oda_interior, oda_predictor_valid, &
+         oda_restart_trigger, oda_state_evaluated, oda_trigger, ot_kp_subspace_refresh, &
+         ot_kp_subspace_refresh_pending, outer_loop_converged, tblite_native_mixer
       REAL(KIND=dp)                                      :: adiis_raw_delta, adiis_step_delta, &
                                                             oda_predictor_lambda, t1, t2
       REAL(KIND=dp), DIMENSION(3)                        :: res_val_3
@@ -642,8 +647,14 @@ CONTAINS
             total_steps = total_steps + 1
             just_energy = energy_only
 
+            CALL qs_scf_full_bloch_initialize(qs_env, scf_env, full_bloch_changed)
+            IF (full_bloch_changed) THEN
+               CALL qs_scf_commit_density_candidate(scf_env, rho)
+               CALL qs_scf_rho_update(rho, qs_env, scf_env, ks_env, mix_rho=.FALSE.)
+            END IF
             CALL qs_ks_update_qs_env(qs_env, just_energy=just_energy, &
                                      calculate_forces=.FALSE.)
+            CALL qs_scf_trial_finite_probe(qs_env, scf_env, "KS")
 
             scf_env%raw_map_delta = 0.0_dp
             scf_env%oda_lambda = 0.0_dp
@@ -852,6 +863,8 @@ CONTAINS
                END IF
             END IF
 
+            CALL qs_scf_trial_finite_probe(qs_env, scf_env, "MO")
+
             IF (added_mos_auto_grow) THEN
                CALL qs_scf_grow_added_mos_auto_kp(qs_env, scf_env, scf_control, output_unit)
                kp_ot_entry_reason = kp_ot_entry_resized
@@ -926,6 +939,7 @@ CONTAINS
             ELSE
                density_full_step = diis_step .OR. tblite_native_mixer .OR. internal_tblite_density_full_step
                CALL qs_scf_density_mixing(scf_env, rho, para_env, density_full_step)
+               CALL qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, output_unit, density_full_step)
             END IF
             IF (dft_control%qs_control%xtb_control%do_tblite .AND. &
                 .NOT. (dft_control%qs_control%do_ls_scf .OR. scf_control%use_ot)) THEN
@@ -1070,6 +1084,7 @@ CONTAINS
 
       converged = inner_loop_converged .AND. outer_loop_converged
       total_scf_steps = total_steps
+      CALL qs_scf_full_bloch_save(qs_env, scf_env, converged)
 
       IF (dft_control%qs_control%cdft) THEN
          dft_control%qs_control%cdft_control%total_steps = &
@@ -3370,5 +3385,73 @@ CONTAINS
                                                                          "Fixed-moment grid integral differs from its target")
       END DO
    END SUBROUTINE qs_scf_check_fixed_spin_populations
+
+! **************************************************************************************************
+!> \brief Identify nonfinite energies, KS blocks, eigenvalues and occupations in update order.
+!> \param qs_env ...
+!> \param scf_env ...
+!> \param phase ...
+   SUBROUTINE qs_scf_trial_finite_probe(qs_env, scf_env, phase)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      CHARACTER(len=*), INTENT(IN)                       :: phase
+
+      INTEGER                                            :: col, ic, ik, ispin, iw, row
+      LOGICAL                                            :: do_kpoints, finite
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      TYPE(dbcsr_iterator_type)                          :: iterator
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+      IF (.NOT. ASSOCIATED(scf_env%mixing_store)) RETURN
+      IF (.NOT. scf_env%mixing_store%dm_trial_diagnostics) RETURN
+      CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks, energy=energy, kpoints=kpoints, &
+                      do_kpoints=do_kpoints, mos=mos)
+      iw = cp_logger_get_default_io_unit()
+      IF (phase == "KS") THEN
+         IF (.NOT. ieee_is_finite(energy%total) .AND. iw > 0) &
+            WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| NONFINITE total KS energy, step ", scf_env%iter_count
+         DO ic = 1, SIZE(matrix_ks, 2)
+            DO ispin = 1, SIZE(matrix_ks, 1)
+               CALL dbcsr_iterator_start(iterator, matrix_ks(ispin, ic)%matrix)
+               DO WHILE (dbcsr_iterator_blocks_left(iterator))
+                  CALL dbcsr_iterator_next_block(iterator, row, col, block)
+                  IF (.NOT. ALL(ieee_is_finite(block))) THEN
+                     IF (iw > 0) WRITE (iw, '(T2,A,5I6)') &
+                        "SCF_TRIAL| NONFINITE KS matrix step,spin,image,row,col ", scf_env%iter_count, ispin, ic, row, col
+                     EXIT
+                  END IF
+               END DO
+               CALL dbcsr_iterator_stop(iterator)
+            END DO
+         END DO
+      ELSE
+         IF (do_kpoints) THEN
+            DO ik = 1, SIZE(kpoints%kp_env)
+               DO ispin = 1, SIZE(kpoints%kp_env(ik)%kpoint_env%mos, 2)
+                  ASSOCIATE (mo => kpoints%kp_env(ik)%kpoint_env%mos(1, ispin))
+                     finite = ALL(ieee_is_finite(mo%eigenvalues))
+                     IF (.NOT. finite .AND. iw > 0) WRITE (iw, '(T2,A,3I6)') &
+                        "SCF_TRIAL| NONFINITE eigenvalues step,k,spin ", scf_env%iter_count, ik, ispin
+                     finite = ALL(ieee_is_finite(mo%occupation_numbers))
+                     IF (.NOT. finite .AND. iw > 0) WRITE (iw, '(T2,A,3I6)') &
+                        "SCF_TRIAL| NONFINITE occupations step,k,spin ", scf_env%iter_count, ik, ispin
+                  END ASSOCIATE
+               END DO
+            END DO
+         ELSE
+            DO ispin = 1, SIZE(mos)
+               finite = ALL(ieee_is_finite(mos(ispin)%eigenvalues))
+               IF (.NOT. finite .AND. iw > 0) WRITE (iw, '(T2,A,2I6)') &
+                  "SCF_TRIAL| NONFINITE eigenvalues step,spin ", scf_env%iter_count, ispin
+               finite = ALL(ieee_is_finite(mos(ispin)%occupation_numbers))
+               IF (.NOT. finite .AND. iw > 0) WRITE (iw, '(T2,A,2I6)') &
+                  "SCF_TRIAL| NONFINITE occupations step,spin ", scf_env%iter_count, ispin
+            END DO
+         END IF
+      END IF
+   END SUBROUTINE qs_scf_trial_finite_probe
 
 END MODULE qs_scf
