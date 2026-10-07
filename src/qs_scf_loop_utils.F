@@ -3102,6 +3102,14 @@ CONTAINS
          update_validated = scf_env%adiis_validated .OR. &
                             scf_env%scf_subspace_buffer%diis_weight >= 1.0_dp
       END IF
+      IF (scf_env%method == ot_diag_method_nr) THEN
+         update_validated = update_validated .AND. scf_env%ot_eigensolver_converged
+         IF (.NOT. scf_env%ot_eigensolver_converged .AND. &
+             scf_env%iter_delta < scf_control%eps_scf .AND. output_unit > 0) THEN
+            WRITE (output_unit, '(T2,A)') &
+               'OT| Density residual reached EPS_SCF, but the inner eigensolver did not converge.'
+         END IF
+      END IF
 
       CALL external_control(should_stop, "SCF", target_time=qs_env%target_time, &
                             start_time=qs_env%start_time)

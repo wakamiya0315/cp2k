@@ -2357,6 +2357,7 @@ CONTAINS
       LOGICAL, INTENT(INOUT)                             :: diis_step
 
       INTEGER                                            :: homo, ispin, nmo, nspin
+      LOGICAL                                            :: ot_converged
       REAL(KIND=dp)                                      :: diis_error, eps_iter
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
       TYPE(cp_fm_type), POINTER                          :: mo_coeff
@@ -2415,7 +2416,10 @@ CONTAINS
                              eps_gradient=eps_iter, &
                              iter_max=scf_control%diagonalization%max_iter, &
                              silent=.TRUE., &
-                             ot_settings=scf_control%diagonalization%ot_settings)
+                             ot_settings=scf_control%diagonalization%ot_settings, &
+                             converged=ot_converged)
+         IF (ispin == 1) scf_env%ot_eigensolver_converged = .TRUE.
+         scf_env%ot_eigensolver_converged = scf_env%ot_eigensolver_converged .AND. ot_converged
          CALL calculate_subspace_eigenvalues(mo_coeff, matrix_ks(ispin)%matrix, &
                                              evals_arg=eigenvalues, &
                                              do_rotation=.TRUE.)
@@ -2455,8 +2459,8 @@ CONTAINS
       LOGICAL, INTENT(INOUT)                             :: diis_step
       LOGICAL, INTENT(OUT)                               :: added_mos_auto_grow
 
-      INTEGER                                            :: ikp, ispin, ks_spin, nspin
-      LOGICAL                                            :: store_kinetic, use_real_wfn
+      INTEGER                                            :: ikp, ispin, ks_spin, not_converged, nspin
+      LOGICAL                                            :: ot_converged, store_kinetic, use_real_wfn
       REAL(KIND=dp)                                      :: eps_iter
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
       TYPE(cp_fm_type)                                   :: coeff_im_work
@@ -2465,6 +2469,7 @@ CONTAINS
       TYPE(dbcsr_type), POINTER                          :: matrix_h_im, matrix_h_re, matrix_s_im, &
                                                             matrix_s_re, matrix_t_im, matrix_t_re
       TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
 
@@ -2479,8 +2484,11 @@ CONTAINS
       IF (store_kinetic) THEN
          CPASSERT(ASSOCIATED(matrix_t))
       END IF
-      CALL get_kpoint_info(kpoints, use_real_wfn=use_real_wfn, sab_nl=sab_nl)
+      CALL get_kpoint_info(kpoints, use_real_wfn=use_real_wfn, sab_nl=sab_nl, para_env=para_env)
       CPASSERT(ASSOCIATED(sab_nl))
+      CPASSERT(ASSOCIATED(para_env))
+      not_converged = 0
+      scf_env%ot_eigensolver_converged = .FALSE.
 
       ! A full diagonalization supplies an orthonormal start after initialization or an
       ! ADDED_MOS AUTO resize. Subsequent SCF steps only redistribute H(k) and S(k).
@@ -2549,7 +2557,7 @@ CONTAINS
                                            eigenvalues=eigenvalues, silent=.TRUE., &
                                            ot_settings=scf_control%diagonalization%ot_settings, &
                                            matrix_t=matrix_t_re, matrix_t_im=matrix_t_im, &
-                                           mo_set=kp%mos(1, ispin))
+                                           mo_set=kp%mos(1, ispin), converged=ot_converged)
                CALL cp_fm_release(coeff_im_work)
             ELSE
                CALL get_mo_set(kp%mos(2, ispin), mo_coeff=coeff_im)
@@ -2561,9 +2569,10 @@ CONTAINS
                                            eigenvalues=eigenvalues, silent=.TRUE., &
                                            ot_settings=scf_control%diagonalization%ot_settings, &
                                            matrix_t=matrix_t_re, matrix_t_im=matrix_t_im, &
-                                           mo_set=kp%mos(1, ispin))
+                                           mo_set=kp%mos(1, ispin), converged=ot_converged)
                kp%mos(2, ispin)%eigenvalues = eigenvalues
             END IF
+            IF (.NOT. ot_converged) not_converged = not_converged + 1
             CALL dbcsr_release_p(matrix_h_re)
             CALL dbcsr_release_p(matrix_h_im)
          END DO
@@ -2572,6 +2581,10 @@ CONTAINS
          IF (ASSOCIATED(matrix_t_re)) CALL dbcsr_release_p(matrix_t_re)
          IF (ASSOCIATED(matrix_t_im)) CALL dbcsr_release_p(matrix_t_im)
       END DO
+
+      ! All SCF ranks must make the same exit decision, including empty/local K-point groups.
+      CALL para_env%sum(not_converged)
+      scf_env%ot_eigensolver_converged = not_converged == 0
 
       CALL kpoint_set_mo_occupation(kpoints, scf_control%smear, &
                                     added_mos_auto=scf_control%added_mos_auto, &

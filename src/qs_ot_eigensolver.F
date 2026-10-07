@@ -100,10 +100,11 @@ CONTAINS
 !> \param size_ortho_space ...
 !> \param silent ...
 !> \param ot_settings ...
+!> \param converged whether the requested inner gradient tolerance was reached
 ! **************************************************************************************************
    SUBROUTINE ot_eigensolver(matrix_h, matrix_s, matrix_orthogonal_space_fm, &
                              matrix_c_fm, preconditioner, eps_gradient, &
-                             iter_max, size_ortho_space, silent, ot_settings)
+                             iter_max, size_ortho_space, silent, ot_settings, converged)
 
       TYPE(dbcsr_type), POINTER                          :: matrix_h, matrix_s
       TYPE(cp_fm_type), INTENT(IN), OPTIONAL             :: matrix_orthogonal_space_fm
@@ -114,6 +115,7 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: size_ortho_space
       LOGICAL, INTENT(IN), OPTIONAL                      :: silent
       TYPE(qs_ot_settings_type), INTENT(IN), OPTIONAL    :: ot_settings
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: converged
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_eigensolver'
       INTEGER, PARAMETER                                 :: max_iter_inner_loop = 40
@@ -132,6 +134,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
+      IF (PRESENT(converged)) converged = .FALSE.
       output_unit = cp_logger_get_default_io_unit()
 
       IF (PRESENT(silent)) THEN
@@ -368,6 +371,7 @@ CONTAINS
 
       END DO outer_scf
 
+      IF (PRESENT(converged)) converged = delta < eps_gradient
       CALL copy_dbcsr_to_fm(matrix_c, matrix_c_fm) ! fm->dbcsr
       CALL dbcsr_release_p(matrix_c) ! fm->dbcsr
 
@@ -392,11 +396,12 @@ CONTAINS
 !> \param matrix_t ...
 !> \param matrix_t_im ...
 !> \param mo_set ...
+!> \param converged whether the requested inner gradient tolerance was reached
 ! **************************************************************************************************
    SUBROUTINE ot_eigensolver_complex(matrix_h, matrix_h_im, matrix_s, matrix_s_im, &
                                      matrix_c_fm, matrix_c_fm_im, preconditioner, &
                                      eps_gradient, iter_max, eigenvalues, silent, ot_settings, &
-                                     matrix_t, matrix_t_im, mo_set)
+                                     matrix_t, matrix_t_im, mo_set, converged)
 
       TYPE(dbcsr_type), POINTER                          :: matrix_h, matrix_h_im, matrix_s, &
                                                             matrix_s_im
@@ -409,6 +414,7 @@ CONTAINS
       TYPE(qs_ot_settings_type), INTENT(IN), OPTIONAL    :: ot_settings
       TYPE(dbcsr_type), OPTIONAL, POINTER                :: matrix_t, matrix_t_im
       TYPE(mo_set_type), INTENT(IN), OPTIONAL            :: mo_set
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: converged
 
       CHARACTER(len=*), PARAMETER :: routineN = 'ot_eigensolver_complex'
       INTEGER, PARAMETER                                 :: max_iter_inner_loop = 40
@@ -424,6 +430,7 @@ CONTAINS
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
 
       CALL timeset(routineN, handle)
+      IF (PRESENT(converged)) converged = .FALSE.
       output_unit = cp_logger_get_default_io_unit()
       my_silent = .FALSE.
       IF (PRESENT(silent)) my_silent = silent
@@ -641,6 +648,7 @@ CONTAINS
          END IF
       END DO outer_scf
 
+      IF (PRESENT(converged)) converged = delta < eps_gradient
       CALL copy_dbcsr_to_fm(matrix_c, matrix_c_fm)
       CALL copy_dbcsr_to_fm(matrix_c_im, matrix_c_fm_im)
       IF (PRESENT(eigenvalues)) THEN

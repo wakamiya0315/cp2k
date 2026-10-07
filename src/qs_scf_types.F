@@ -121,6 +121,8 @@ MODULE qs_scf_types
       TYPE(dbcsr_type), POINTER :: ortho_dbcsr => NULL(), buf1_dbcsr => NULL(), buf2_dbcsr => NULL()
       TYPE(preconditioner_p_type), DIMENSION(:), POINTER :: ot_preconditioner => NULL()
       TYPE(qs_ot_type), POINTER, DIMENSION(:)  :: qs_ot_env => NULL()
+      ! The density residual alone cannot certify an unconverged inner fixed-H OT solve.
+      LOGICAL :: ot_eigensolver_converged = .TRUE.
       TYPE(qs_diis_buffer_type), POINTER :: scf_diis_buffer => NULL()
       TYPE(qs_scf_subspace_buffer_type), POINTER :: scf_subspace_buffer => NULL()
       TYPE(subspace_env_type), POINTER :: subspace_env => NULL()
