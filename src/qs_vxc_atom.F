@@ -21,6 +21,7 @@ MODULE qs_vxc_atom
                                               gth_potential_type,&
                                               sgp_potential_p_type,&
                                               sgp_potential_type
+   USE ieee_arithmetic,                 ONLY: ieee_is_finite
    USE input_constants,                 ONLY: cdft_alpha_constraint,&
                                               cdft_beta_constraint,&
                                               cdft_charge_constraint,&
@@ -111,6 +112,7 @@ MODULE qs_vxc_atom
                                               xc_rho_set_release,&
                                               xc_rho_set_type,&
                                               xc_rho_set_update
+
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_get_num_threads
 #include "./base/base_uses.f90"
 
@@ -317,73 +319,64 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'calculate_vxc_atom'
 
-      INTEGER :: adjoint_bin, adjoint_entry, adjoint_nbins, adjoint_nchannels, &
-         adjoint_tile_count(3), adjoint_tile_lower(3), adjoint_tile_upper(3), &
-         atom_composite_components, bo(2), &
-         composite_image_periodicity(3), composite_local_atom, composite_local_natom, &
-         composite_nflat, composite_pw_nflat, composite_row, &
-         gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
-         ikind, ir, ispin, iw, jdir, myfun, na, natom, nr, nspins
-      INTEGER :: adjoint_handle, adjoint_threads, composite_row_rank, nlcc_entry, nlcc_first, &
-                 nlcc_last, num_pe, section_handle, source_atom, target_atom, xc_deriv_method_id, &
-                 xc_rho_smooth_id, zatom
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: nlcc_source
+      INTEGER :: adjoint_bin, adjoint_entry, adjoint_handle, adjoint_nbins, adjoint_nchannels, &
+         adjoint_threads, adjoint_tile_count(3), adjoint_tile_lower(3), adjoint_tile_upper(3), &
+         atom_composite_components, bo(2), composite_image_periodicity(3), composite_local_atom, &
+         composite_local_natom, composite_nflat, composite_pw_nflat, composite_row, &
+         composite_row_rank, gapw_density_partition, gapw_representation, handle, ia, iat, iatom, &
+         icomponent, idir, ikind, ir, ispin, iw, jdir, myfun, na, natom, nlcc_entry, nlcc_first, &
+         nlcc_last, nr, nspins, num_pe, section_handle, source_atom, target_atom
+      INTEGER :: xc_deriv_method_id, xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
          composite_atom_end, composite_atom_kind, composite_atom_kind_index, composite_atom_start, &
-         composite_grid_atom, composite_local_atoms, composite_row_order
+         composite_grid_atom, composite_local_atoms, composite_row_order, nlcc_source
       INTEGER, DIMENSION(2, 3)                           :: bounds
       INTEGER, DIMENSION(:), POINTER                     :: atom_list
-      LOGICAL :: accint, atom_composite_active, atom_composite_diagnostic, &
+      LOGICAL :: accint, adjoint_private, atom_composite_active, atom_composite_diagnostic, &
          atom_composite_reference, direct_valence_atom_composite, donlcc, evaluate_hard, &
          evaluate_soft, gradient_f, image_partition_atom_composite, lsd, my_calculate_forces, &
-         native_grid_diagnostics, nlcc, one_center_kind, paw_atom, paw_pseudopotentials, &
-         adjoint_private, requested_atom_composite_grid, reuse_partition, rho_g_valid, &
-         skala_atom_grid, &
-         source_matrix_local, tau_f, tau_r_valid, use_atom_composite_density, &
+         native_grid_diagnostics, native_trial_diagnostics, nlcc, one_center_kind, paw_atom, &
+         paw_pseudopotentials, requested_atom_composite_grid, reuse_partition, rho_g_valid, &
+         skala_atom_grid, source_matrix_local, tau_f, tau_r_valid, use_atom_composite_density, &
          use_atom_composite_gradient, use_atom_composite_tau, use_virial
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: composite_partition_included
-      REAL(dp) :: agr, alpha, atom_composite_exc, atom_composite_nelec, composite_grid_volume, &
+      REAL(dp) :: agr, alpha, atom_composite_exc, atom_composite_nelec, &
          composite_cross_cutoff_max, composite_cross_density_max, composite_cross_grad_max, &
          composite_cross_kin_max, composite_density_max, composite_density_min, &
-         composite_grad_max, composite_kin_max, composite_kin_min, composite_tau_integral, &
-         cross_cutoff, density_cut, exc_h, &
-         exc_s, feature_vxc_analytic, feature_vxc_fd, feature_vxc_minus, feature_vxc_plus, &
-         feature_vxc_step, gradient_cut, local_partition_weight, my_adiabatic_rescale_factor, &
-         nlcc_density, nlcc_grid_radius, nlcc_kind_cutoff, nlcc_point_radius, nlcc_reach, &
-         nlcc_spin_factor
-      REAL(dp) :: one_center_density_field_contraction, one_center_density_matrix_contraction, &
-         one_center_field_contraction, one_center_gradient_field_contraction, &
-         one_center_gradient_matrix_contraction, one_center_matrix_contraction, &
-         one_center_rho_grad_field_contraction, one_center_rho_grad_matrix_contraction, &
-         one_center_tau_field_contraction, one_center_tau_matrix_contraction, &
-         one_center_tensor_contraction, partition_adjoint, partition_weight, &
-         smooth_grid_contraction, smooth_input_contraction, target_partition_adjoint, tau_cut, zeff
+         composite_grad_max, composite_grid_volume, composite_kin_max, composite_kin_min, &
+         composite_tau_integral, cross_cutoff, density_cut, exc_h, exc_s, feature_vxc_analytic, &
+         feature_vxc_fd, feature_vxc_minus, feature_vxc_plus, feature_vxc_step, gradient_cut, &
+         local_partition_weight, my_adiabatic_rescale_factor, nlcc_density, nlcc_grid_radius, &
+         nlcc_kind_cutoff, nlcc_point_radius
+      REAL(dp) :: nlcc_reach, nlcc_spin_factor, one_center_density_field_contraction, &
+         one_center_density_matrix_contraction, one_center_field_contraction, &
+         one_center_gradient_field_contraction, one_center_gradient_matrix_contraction, &
+         one_center_matrix_contraction, one_center_rho_grad_field_contraction, &
+         one_center_rho_grad_matrix_contraction, one_center_tau_field_contraction, &
+         one_center_tau_matrix_contraction, one_center_tensor_contraction, partition_adjoint, &
+         partition_weight, smooth_grid_contraction, smooth_input_contraction, &
+         target_partition_adjoint, tau_cut, zeff
       REAL(dp), ALLOCATABLE, DIMENSION(:) :: composite_atomic_grid_weight_grad, &
          composite_atomic_grid_weights, composite_base_grid_weights, composite_distances, &
          composite_grid_weight_grad, composite_grid_weights, composite_partition_weights, &
          nlcc_atom_cutoff, nlcc_cutoff, nlcc_distance
       REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: composite_atom_coord_grad, composite_atom_coords, &
-         composite_cross_density, composite_cross_force, &
-         composite_cross_kin, composite_density, composite_density_grad, &
-         composite_explicit_force, composite_grid_coord_force, &
+         composite_cross_density, composite_cross_force, composite_cross_kin, composite_density, &
+         composite_density_grad, composite_explicit_force, composite_grid_coord_force, &
          composite_grid_coord_grad, composite_grid_coords, composite_kin, composite_kin_grad, &
          composite_local_atom_coords, composite_model_atom_force, composite_moving_smooth_force, &
          composite_nlcc_center_force, composite_nlcc_center_force_local, &
-         composite_nlcc_target_force
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: composite_partition_atom_coords, &
-         composite_partition_force, composite_partition_force_local, &
-         composite_smooth_density_cache, &
-         composite_smooth_kin_cache, local_partition_datom, nlcc_center, nlcc_translation
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: private_density_adjoint, &
-                                                            private_kin_adjoint
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: private_grad_adjoint
+         composite_nlcc_target_force, composite_partition_atom_coords, composite_partition_force
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: composite_partition_force_local, &
+         composite_smooth_density_cache, composite_smooth_kin_cache, local_partition_datom, &
+         nlcc_center, nlcc_translation, private_density_adjoint, private_kin_adjoint
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), TARGET     :: smooth_density_adjoint_storage, &
                                                             smooth_kin_adjoint_storage
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :) :: composite_cross_grad, composite_grad, &
          composite_grad_grad, composite_int_h, composite_int_s, composite_partition_datom, &
-         composite_partition_dstrain, composite_smooth_gradient_cache
+         composite_partition_dstrain, composite_smooth_gradient_cache, private_grad_adjoint
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), TARGET  :: smooth_grad_adjoint_storage
       REAL(dp), DIMENSION(1, 1, 1)                       :: tau_d
       REAL(dp), DIMENSION(1, 1, 1, 1)                    :: rho_d
@@ -394,9 +387,8 @@ CONTAINS
          skala_atom_force_h, skala_atom_force_s, spatial_derivative
       REAL(dp), DIMENSION(3, 2) :: composite_smooth_gradient_adjoint_value, &
          composite_smooth_gradient_value
-      REAL(dp), DIMENSION(3, 3) :: composite_cross_image_virial, &
-         composite_explicit_virial, composite_feature_virial, &
-         composite_interpolation_virial, composite_nlcc_image_virial, &
+      REAL(dp), DIMENSION(3, 3) :: composite_cross_image_virial, composite_explicit_virial, &
+         composite_feature_virial, composite_interpolation_virial, composite_nlcc_image_virial, &
          composite_partition_strain_virial, local_partition_dstrain, nlcc_hessian, &
          skala_atom_virial, skala_atom_virial_h, skala_atom_virial_s
       REAL(dp), DIMENSION(4)                             :: feature_component_analytic, &
@@ -413,12 +405,10 @@ CONTAINS
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_3d_r_cp_type), DIMENSION(3) :: composite_smooth_drho, composite_smooth_drhoa, &
          composite_smooth_drhob, smooth_drho, smooth_drhoa, smooth_drhob
-      TYPE(gth_potential_p_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: nlcc_gth
-      TYPE(sgp_potential_p_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: nlcc_sgp
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(grid_atom_type), POINTER                      :: grid_atom
+      TYPE(gth_potential_p_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: nlcc_gth
       TYPE(gth_potential_type), POINTER                  :: gth_potential
       TYPE(gto_basis_set_type), POINTER                  :: basis_1c
       TYPE(harmonics_atom_type), POINTER                 :: harmonics
@@ -442,6 +432,8 @@ CONTAINS
       TYPE(rho_atom_type), POINTER                       :: rho_atom
       TYPE(section_vals_type), POINTER                   :: gauxc_section, input, my_xc_section, &
                                                             xc_fun_section
+      TYPE(sgp_potential_p_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: nlcc_sgp
       TYPE(sgp_potential_type), POINTER                  :: sgp_potential
       TYPE(tau_basis_cache_type)                         :: tau_basis_cache
       TYPE(virial_type), POINTER                         :: virial
@@ -537,6 +529,7 @@ CONTAINS
       atom_composite_reference = .FALSE.
       paw_pseudopotentials = .FALSE.
       native_grid_diagnostics = .FALSE.
+      native_trial_diagnostics = .FALSE.
       atom_composite_components = 1
       feature_vxc_step = 3.0E-3_dp
       IF (skala_atom_grid) THEN
@@ -546,6 +539,8 @@ CONTAINS
                                    i_val=gapw_representation)
          CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_DIAGNOSTICS", &
                                    l_val=native_grid_diagnostics)
+         CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_TRIAL_DIAGNOSTICS", &
+                                   l_val=native_trial_diagnostics)
       END IF
       IF (skala_atom_grid) THEN
          DO ikind = 1, SIZE(my_kind_set)
@@ -1457,6 +1452,8 @@ CONTAINS
             atom_composite_nelec = SUM(composite_grid_weights* &
                                        (composite_density(:, 1) + composite_density(:, 2)))
             CALL para_env%sum(atom_composite_nelec)
+            IF (native_trial_diagnostics) CALL trial_skala_fields( &
+               para_env, composite_grid_weights, composite_density, composite_grad, composite_kin)
             IF (atom_composite_reference .AND. my_calculate_forces) THEN
                CALL timeset("skala_vxc_model", section_handle)
                CALL skala_gapw_atom_composite_energy( &
@@ -1579,8 +1576,8 @@ CONTAINS
                      nlcc_grid_radius = 0.0_dp
                      DO composite_row = composite_atom_start(iatom), composite_atom_end(iatom)
                         nlcc_grid_radius = MAX(nlcc_grid_radius, SQRT(SUM(( &
-                                               composite_grid_coords(:, composite_row) - &
-                                               particle_set(iatom)%r)**2)))
+                                                                          composite_grid_coords(:, composite_row) - &
+                                                                          particle_set(iatom)%r)**2)))
                      END DO
                      CALL build_nlcc_image_list(particle_set(iatom)%r, composite_atom_coords, &
                                                 nlcc_atom_cutoff, cell%hmat, cell%h_inv, cell%perd, &
@@ -1924,6 +1921,10 @@ CONTAINS
                   composite_local_grid_sizes, composite_local_atom_coords, atom_composite_exc, &
                   composite_density_grad, composite_grad_grad, composite_kin_grad)
                CALL timestop(section_handle)
+            END IF
+            IF (native_trial_diagnostics) THEN
+               CALL trial_skala_adjoint(para_env, lsd, atom_composite_exc, composite_grid_weights, &
+                                 composite_density, composite_grad, composite_density_grad, composite_grad_grad, composite_kin_grad)
             END IF
             CALL timeset("skala_vxc_pw_adj", section_handle)
             composite_pw_nflat = PRODUCT(smooth_rho_r(1)%pw_grid%npts)
@@ -3831,10 +3832,10 @@ CONTAINS
       REAL(dp)                                           :: shell_value
       REAL(dp), DIMENSION(3)                             :: direction, shell_derivative
       REAL(dp), DIMENSION(3, 5, 2)                       :: field_spatial
-      REAL(dp), DIMENSION(4)                             :: radial_derivative_weights, radial_weights
-      REAL(dp), DIMENSION(5, 2)                          :: field
-      REAL(dp), DIMENSION(3, harmonics%max_s_harm)       :: angular_value_derivatives
       REAL(dp), DIMENSION(harmonics%max_s_harm)          :: angular_values
+      REAL(dp), DIMENSION(5, 2)                          :: field
+      REAL(dp), DIMENSION(4)                             :: radial_derivative_weights, radial_weights
+      REAL(dp), DIMENSION(3, harmonics%max_s_harm)       :: angular_value_derivatives
 
       nharm = harmonics%max_s_harm
       spatial = PRESENT(density_spatial)
@@ -4230,11 +4231,12 @@ CONTAINS
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: kind_set
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: grid_coords
 
-      ! Only for skipping work; every listed point passes the exact test (bohr)
       REAL(dp), PARAMETER                                :: prune_margin = 1.0E-6_dp
 
-      INTEGER :: ia, icand, idir, ilocal, image_i1, image_i2, image_i3, ipass, ir, irow, na, &
-         ncand, nr, nrow, nrow_used, row, target_atom
+      INTEGER                                            :: ia, icand, idir, ilocal, image_i1, &
+                                                            image_i2, image_i3, ipass, ir, irow, &
+                                                            na, ncand, nr, nrow, nrow_used, row, &
+                                                            target_atom
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: next_slot, row_count, unsorted_row
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: unsorted_shift
       INTEGER, DIMENSION(2, 3)                           :: shift_range
@@ -4245,6 +4247,8 @@ CONTAINS
       REAL(dp), DIMENSION(3)                             :: center_offset, cross_displacement, &
                                                             fractional, image_translation
       TYPE(grid_atom_type), POINTER                      :: grid_atom
+
+! Only for skipping work; every listed point passes the exact test (bohr)
 
       nrow = SIZE(grid_coords, 2)
       ncand = 0
@@ -4562,8 +4566,8 @@ CONTAINS
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: cross_force_local
       REAL(dp), DIMENSION(2)                             :: cross_density, cross_kin, &
                                                             density_adjoint, kin_adjoint
-      REAL(dp), DIMENSION(3)                             :: cross_spatial_derivative, &
-                                                            displacement, image_translation
+      REAL(dp), DIMENSION(3)                             :: cross_spatial_derivative, displacement, &
+                                                            image_translation
       REAL(dp), DIMENSION(3, 2)                          :: cross_density_spatial, cross_grad, &
                                                             cross_kin_spatial, gradient_adjoint
       REAL(dp), DIMENSION(3, 3)                          :: cross_image_virial_local
@@ -4667,9 +4671,9 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: atom_list
       LOGICAL                                            :: paw_atom
       REAL(dp)                                           :: zeff
+      TYPE(grid_atom_type), POINTER                      :: grid_atom
       TYPE(gth_potential_type), POINTER                  :: gth_potential
       TYPE(gto_basis_set_type), POINTER                  :: basis_1c
-      TYPE(grid_atom_type), POINTER                      :: grid_atom
       TYPE(harmonics_atom_type), POINTER                 :: harmonics
       TYPE(rho_atom_coeff), DIMENSION(:), POINTER        :: dr_h, dr_s, r_h, r_s
       TYPE(rho_atom_coeff), DIMENSION(:, :), POINTER     :: r_h_d, r_s_d
@@ -5093,5 +5097,160 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE calculate_vxc_atom_epr
+
+! **************************************************************************************************
+!> \brief Diagnose the actual model inputs before Skala is evaluated; no feature clipping.
+!> \param para_env ...
+!> \param weights ...
+!> \param density ...
+!> \param gradient ...
+!> \param kinetic ...
+   SUBROUTINE trial_skala_fields(para_env, weights, density, gradient, kinetic)
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: weights
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: density
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: gradient
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: kinetic
+
+      INTEGER                                            :: iw, nbad
+      REAL(KIND=dp)                                      :: bounds(7)
+
+      iw = cp_logger_get_default_io_unit()
+      nbad = COUNT(.NOT. ieee_is_finite(weights))
+      CALL para_env%sum(nbad)
+      IF (nbad > 0 .AND. iw > 0) WRITE (iw, '(T2,A,I12)') "SCF_TRIAL| NONFINITE Skala grid weights ", nbad
+      nbad = COUNT(.NOT. ieee_is_finite(density))
+      CALL para_env%sum(nbad)
+      IF (nbad > 0 .AND. iw > 0) WRITE (iw, '(T2,A,I12)') "SCF_TRIAL| NONFINITE Skala density input ", nbad
+      nbad = COUNT(.NOT. ieee_is_finite(gradient))
+      CALL para_env%sum(nbad)
+      IF (nbad > 0 .AND. iw > 0) WRITE (iw, '(T2,A,I12)') "SCF_TRIAL| NONFINITE Skala gradient input ", nbad
+      nbad = COUNT(.NOT. ieee_is_finite(kinetic))
+      CALL para_env%sum(nbad)
+      IF (nbad > 0 .AND. iw > 0) WRITE (iw, '(T2,A,I12)') "SCF_TRIAL| NONFINITE Skala tau input ", nbad
+      bounds(1) = MINVAL(density)
+      bounds(2) = MAXVAL(density)
+      bounds(3) = MINVAL(kinetic)
+      bounds(4) = MAXVAL(kinetic)
+      bounds(5) = MAXVAL(ABS(gradient))
+      bounds(6) = MINVAL(weights)
+      bounds(7) = MAXVAL(weights)
+      CALL para_env%min(bounds(1))
+      CALL para_env%max(bounds(2))
+      CALL para_env%min(bounds(3))
+      CALL para_env%max(bounds(4))
+      CALL para_env%max(bounds(5))
+      CALL para_env%min(bounds(6))
+      CALL para_env%max(bounds(7))
+      IF (iw > 0) WRITE (iw, '(T2,A,7ES22.12E3)') "SCF_TRIAL| rho min,max;tau min,max;gradmax;weight min,max ", bounds
+   END SUBROUTINE trial_skala_fields
+
+! **************************************************************************************************
+!> \brief Report weighted and volume-normalized adjoints, tau sign support and the gradient trough.
+!> \param para_env ...
+!> \param lsd ...
+!> \param energy ...
+!> \param weights ...
+!> \param density ...
+!> \param gradient ...
+!> \param density_grad ...
+!> \param gradient_grad ...
+!> \param kinetic_grad ...
+   SUBROUTINE trial_skala_adjoint(para_env, lsd, energy, weights, density, gradient, &
+                                  density_grad, gradient_grad, kinetic_grad)
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      LOGICAL, INTENT(IN)                                :: lsd
+      REAL(KIND=dp), INTENT(IN)                          :: energy
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: weights
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: density
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: gradient
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(IN)                                      :: density_grad
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), &
+         INTENT(IN)                                      :: gradient_grad
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(IN)                                      :: kinetic_grad
+
+      INTEGER                                            :: ispin, iw, nbad, nspin
+      LOGICAL, ALLOCATABLE                               :: negative(:), positive_weight(:), &
+                                                            trough(:)
+      REAL(KIND=dp)                                      :: extrema(6), ranges(6), support(4)
+      REAL(KIND=dp), ALLOCATABLE                         :: grad2(:), rho(:), vgrad(:, :), vrho(:), &
+                                                            vtau(:)
+
+      iw = cp_logger_get_default_io_unit()
+      IF (.NOT. ieee_is_finite(energy) .AND. iw > 0) &
+         WRITE (iw, '(T2,A)') "SCF_TRIAL| NONFINITE Skala XC energy"
+      IF (.NOT. ALLOCATED(density_grad) .OR. .NOT. ALLOCATED(gradient_grad) .OR. &
+          .NOT. ALLOCATED(kinetic_grad)) RETURN
+      nbad = COUNT(.NOT. ieee_is_finite(density_grad))
+      CALL para_env%sum(nbad)
+      IF (nbad > 0 .AND. iw > 0) WRITE (iw, '(T2,A,I12)') "SCF_TRIAL| NONFINITE Skala density adjoint ", nbad
+      nbad = COUNT(.NOT. ieee_is_finite(gradient_grad))
+      CALL para_env%sum(nbad)
+      IF (nbad > 0 .AND. iw > 0) WRITE (iw, '(T2,A,I12)') "SCF_TRIAL| NONFINITE Skala gradient adjoint ", nbad
+      nbad = COUNT(.NOT. ieee_is_finite(kinetic_grad))
+      CALL para_env%sum(nbad)
+      IF (nbad > 0 .AND. iw > 0) WRITE (iw, '(T2,A,I12)') "SCF_TRIAL| NONFINITE Skala tau adjoint ", nbad
+      ranges = [MINVAL(density_grad), MAXVAL(density_grad), &
+                MINVAL(gradient_grad), MAXVAL(gradient_grad), MINVAL(kinetic_grad), MAXVAL(kinetic_grad)]
+      DO ispin = 1, 6, 2
+         CALL para_env%min(ranges(ispin))
+         CALL para_env%max(ranges(ispin + 1))
+      END DO
+      IF (iw > 0) WRITE (iw, '(T2,A,6ES22.12E3)') "SCF_TRIAL| weighted rho,gradient,tau adjoint ranges ", ranges
+      ALLOCATE (vtau(SIZE(weights)), vrho(SIZE(weights)), vgrad(SIZE(weights), 3), &
+                rho(SIZE(weights)), grad2(SIZE(weights)), negative(SIZE(weights)), &
+                trough(SIZE(weights)), positive_weight(SIZE(weights)))
+      nspin = MERGE(2, 1, lsd)
+      positive_weight = weights > 0.0_dp
+      DO ispin = 1, nspin
+         IF (lsd) THEN
+            vtau = kinetic_grad(:, ispin)
+            vrho = density_grad(:, ispin)
+            vgrad = gradient_grad(:, :, ispin)
+            rho = density(:, ispin)
+            grad2 = SUM(gradient(:, :, ispin)**2, DIM=2)
+         ELSE
+            vtau = 0.5_dp*SUM(kinetic_grad, DIM=2)
+            vrho = 0.5_dp*SUM(density_grad, DIM=2)
+            vgrad = 0.5_dp*SUM(gradient_grad, DIM=3)
+            rho = SUM(density, DIM=2)
+            grad2 = SUM(gradient(:, :, 1)**2, DIM=2)
+         END IF
+         WHERE (positive_weight)
+            vtau = vtau/weights
+            vrho = vrho/weights
+         ELSEWHERE
+            vtau = 0.0_dp
+            vrho = 0.0_dp
+         END WHERE
+         WHERE (SPREAD(positive_weight, DIM=2, NCOPIES=3))
+            vgrad = vgrad/SPREAD(weights, DIM=2, NCOPIES=3)
+         ELSEWHERE
+            vgrad = 0.0_dp
+         END WHERE
+         negative = positive_weight .AND. 1.0_dp + vtau < 0.0_dp
+         ! Model rho is per spin even in RKS; use that channel for the stage-10 criterion.
+         trough = positive_weight .AND. density(:, ispin) > 1.0_dp .AND. grad2 < 1.0E-2_dp
+         extrema = [MINVAL(vrho, MASK=positive_weight), MAXVAL(vrho, MASK=positive_weight), &
+                    MINVAL(ABS(vgrad), MASK=SPREAD(positive_weight, DIM=2, NCOPIES=3)), MAXVAL(ABS(vgrad)), &
+                    MINVAL(1.0_dp + vtau, MASK=positive_weight), MAXVAL(1.0_dp + vtau, MASK=positive_weight)]
+         support = [SUM(weights, MASK=negative), SUM(weights*rho, MASK=negative), &
+                    SUM(weights, MASK=trough), MAX(0.0_dp, MAXVAL(ABS(vgrad), MASK=SPREAD(trough, DIM=2, NCOPIES=3)))]
+         DO nbad = 1, 6, 2
+            CALL para_env%min(extrema(nbad))
+            CALL para_env%max(extrema(nbad + 1))
+         END DO
+         CALL para_env%sum(support(1:3))
+         CALL para_env%max(support(4))
+         IF (iw > 0) THEN
+            WRITE (iw, '(T2,A,I2,6ES22.12E3)') "SCF_TRIAL| spin,unweighted rho,grad,kinetic-coefficient ranges ", ispin, extrema
+            WRITE (iw, '(T2,A,I2,4ES22.12E3)') "SCF_TRIAL| spin,negative-volume,electrons,trough-volume,trough-adjoint ", &
+               ispin, support
+         END IF
+      END DO
+      DEALLOCATE (vtau, vrho, vgrad, rho, grad2, negative, trough, positive_weight)
+   END SUBROUTINE trial_skala_adjoint
 
 END MODULE qs_vxc_atom

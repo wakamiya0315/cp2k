@@ -17,46 +17,51 @@
 !>        new subroutine shift_unocc_mos (03.2016, Sergey Chulkov)
 ! **************************************************************************************************
 MODULE qs_scf_methods
-   USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_desymmetrize, dbcsr_get_block_p, &
-        dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
-        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_scale, &
-        dbcsr_type
-   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot,&
-                                              dbcsr_maxabs
-   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
-                                              cp_dbcsr_sm_fm_multiply
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
-                                              cp_fm_symm,&
-                                              cp_fm_triangular_multiply,&
-                                              cp_fm_uplo_to_full
-   USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_reduce,&
-                                              cp_fm_cholesky_restore
-   USE cp_fm_diag,                      ONLY: choose_eigv_solver,&
-                                              cp_fm_block_jacobi,&
-                                              cp_fm_geeig
-   USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
-                                              cp_fm_struct_equivalent,&
-                                              cp_fm_struct_release,&
-                                              cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: cp_fm_create,&
-                                              cp_fm_get_info,&
-                                              cp_fm_release,&
-                                              cp_fm_to_fm,&
-                                              cp_fm_type
-   USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
-   USE input_constants,                 ONLY: cholesky_inverse,&
-                                              cholesky_off,&
-                                              cholesky_reduce,&
-                                              cholesky_restore
-   USE kinds,                           ONLY: dp
-   USE mathlib,                         ONLY: invert_matrix
-   USE message_passing,                 ONLY: mp_para_env_type
-   USE parallel_gemm_api,               ONLY: parallel_gemm
-   USE qs_density_mixing_types,         ONLY: dm_pulay_storage_release,&
-                                              mixing_storage_type
-   USE qs_mo_types,                     ONLY: get_mo_set,&
-                                              mo_set_type
+   USE cp_dbcsr_api, ONLY: &
+      dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_desymmetrize, dbcsr_get_block_p, &
+      dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
+      dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_scale, &
+      dbcsr_type
+   USE cp_dbcsr_contrib, ONLY: dbcsr_dot, &
+                               dbcsr_maxabs
+   USE cp_dbcsr_operations, ONLY: copy_dbcsr_to_fm, &
+                                  cp_dbcsr_sm_fm_multiply
+   USE cp_fm_basic_linalg, ONLY: cp_fm_column_scale, &
+                                 cp_fm_symm, &
+                                 cp_fm_triangular_multiply, &
+                                 cp_fm_uplo_to_full
+   USE cp_fm_cholesky, ONLY: cp_fm_cholesky_reduce, &
+                             cp_fm_cholesky_restore
+   USE cp_fm_diag, ONLY: choose_eigv_solver, &
+                         cp_fm_block_jacobi, &
+                         cp_fm_geeig
+   USE cp_fm_struct, ONLY: cp_fm_struct_create, &
+                           cp_fm_struct_equivalent, &
+                           cp_fm_struct_release, &
+                           cp_fm_struct_type
+   USE cp_fm_types, ONLY: cp_fm_create, &
+                          cp_fm_get_info, &
+                          cp_fm_release, &
+                          cp_fm_to_fm, &
+                          cp_fm_type
+   USE cp_log_handling, ONLY: cp_logger_get_default_io_unit
+   USE ieee_arithmetic, ONLY: ieee_is_finite
+#if defined(__HAS_IEEE_EXCEPTIONS)
+   USE ieee_exceptions, ONLY: ieee_status_type, ieee_get_status, ieee_set_status, &
+                              ieee_set_halting_mode, IEEE_ALL
+#endif
+   USE input_constants, ONLY: cholesky_inverse, &
+                              cholesky_off, &
+                              cholesky_reduce, &
+                              cholesky_restore
+   USE kinds, ONLY: dp
+   USE mathlib, ONLY: invert_matrix
+   USE message_passing, ONLY: mp_para_env_type
+   USE parallel_gemm_api, ONLY: parallel_gemm
+   USE qs_density_mixing_types, ONLY: dm_pulay_storage_release, &
+                                      mixing_storage_type
+   USE qs_mo_types, ONLY: get_mo_set, &
+                          mo_set_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -212,7 +217,7 @@ CONTAINS
 
       IF (invert) THEN
          ! P_out = P_in + R of the present step; after a full step p_mix_new is P_out already
-         IF (mixing_store%dm_pulay_ncall > 0) THEN
+         IF (mixing_store%dm_pulay_ncall > 0 .OR. mixing_store%dm_trial_fallback) THEN
             DO ic = 1, nimg
                DO ispin = 1, nspin
                   CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, 0.0_dp, 1.0_dp)
@@ -223,6 +228,13 @@ CONTAINS
          END IF
          CALL timestop(handle)
          RETURN
+      END IF
+
+      mixing_store%dm_trial_fallback = .FALSE.
+      IF (mixing_store%dm_trial_diagnostics) THEN
+         mixing_store%dm_trial_k_slot = 0
+         mixing_store%dm_trial_k_norm = 0.0_dp
+         IF (ALLOCATED(mixing_store%dm_trial_k_g)) DEALLOCATE (mixing_store%dm_trial_k_g)
       END IF
 
       ! residual R = P_out - P_in, kept in p_mix_new until the update
@@ -289,6 +301,10 @@ CONTAINS
             END DO
          END DO
          norm = SQRT(norm)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_slot = ib
+            mixing_store%dm_trial_k_norm = norm
+         END IF
          IF (norm > 0.0_dp) THEN
             DO ic = 1, nimg
                DO ispin = 1, nspin
@@ -327,6 +343,10 @@ CONTAINS
          END DO
          CALL invert_matrix(a, b, inv_err)
          g = MATMUL(b, c)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_g = g
+            CALL trial_history_report(mixing_store, a, b, g)
+         END IF
       END IF
 
       ! keep P_in and R of this step, then form the next input in place of R
@@ -388,7 +408,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(OUT)                         :: iter_delta
       LOGICAL, INTENT(IN)                                :: full_step, invert
 
-      CHARACTER(len=*), PARAMETER                        :: routineN = 'dm_pulay_mixing_spin'
+      CHARACTER(len=*), PARAMETER :: routineN = 'dm_pulay_mixing_spin'
 
       INTEGER                                            :: handle, ib, ic, ich, ispin, iw, jb, kb, &
                                                             nb, nbuffer, nch, nimg
@@ -411,7 +431,7 @@ CONTAINS
       iter_delta = 0.0_dp
 
       IF (invert) THEN
-         IF (mixing_store%dm_pulay_ncall > 0) THEN
+         IF (mixing_store%dm_pulay_ncall > 0 .OR. mixing_store%dm_trial_fallback) THEN
             DO ic = 1, nimg
                DO ispin = 1, 2
                   CALL dbcsr_add(p_mix_new(ispin, ic)%matrix, rho_ao(ispin, ic)%matrix, 0.0_dp, 1.0_dp)
@@ -422,6 +442,13 @@ CONTAINS
          END IF
          CALL timestop(handle)
          RETURN
+      END IF
+
+      mixing_store%dm_trial_fallback = .FALSE.
+      IF (mixing_store%dm_trial_diagnostics) THEN
+         mixing_store%dm_trial_k_slot = 0
+         mixing_store%dm_trial_k_norm = 0.0_dp
+         IF (ALLOCATED(mixing_store%dm_trial_k_g)) DEALLOCATE (mixing_store%dm_trial_k_g)
       END IF
 
       ! residuals of both spins in p_mix_new
@@ -500,6 +527,10 @@ CONTAINS
             END DO
          END DO
          norm = SQRT(norm)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_slot = ib
+            mixing_store%dm_trial_k_norm = norm
+         END IF
          IF (norm > 0.0_dp) THEN
             DO ic = 1, nimg
                DO ich = 1, nch
@@ -577,6 +608,10 @@ CONTAINS
          CALL invert_matrix(a, b, inv_err)
          g = MATMUL(b, c)
          IF (nch == 2 .AND. .NOT. joint_step) g(:) = g(:)/t(:)
+         IF (mixing_store%dm_trial_diagnostics) THEN
+            mixing_store%dm_trial_k_g = g
+            CALL trial_history_report(mixing_store, a, b, g)
+         END IF
       END IF
 
       ! steps of the total (Pulay) and spin (linear, or Pulay with PULAY_P_JOINT) density matrices,
@@ -1394,5 +1429,54 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE shift_unocc_mos
+
+! **************************************************************************************************
+!> \brief Report regularized Gram conditioning and Pulay coefficients without changing the update.
+!> \param mixing_store ...
+!> \param a ...
+!> \param b ...
+!> \param g ...
+   SUBROUTINE trial_history_report(mixing_store, a, b, g)
+      TYPE(mixing_storage_type), POINTER                 :: mixing_store
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: a, b
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: g
+
+      INTEGER                                            :: i, info, iw, n
+      REAL(KIND=dp)                                      :: condition1, condition2
+      REAL(KIND=dp), ALLOCATABLE                         :: eig(:), gram(:, :), work(:)
+
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      TYPE(ieee_status_type) :: saved_status
+#endif
+      iw = cp_logger_get_default_io_unit()
+      n = SIZE(g)
+      IF (.NOT. ALL(ieee_is_finite(a)) .OR. .NOT. ALL(ieee_is_finite(b)) .OR. &
+          .NOT. ALL(ieee_is_finite(g))) THEN
+         IF (iw > 0) WRITE (iw, '(T2,A)') "SCF_TRIAL| NONFINITE Pulay normal equations or coefficients"
+         RETURN
+      END IF
+      condition1 = MAXVAL(SUM(ABS(a), DIM=1))*MAXVAL(SUM(ABS(b), DIM=1))
+      ALLOCATE (gram(n, n), eig(n), work(MAX(1, 3*n)))
+      gram = a
+      DO i = 1, n
+         gram(i, i) = gram(i, i) - mixing_store%broy_w0
+      END DO
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_get_status(saved_status)
+      CALL ieee_set_halting_mode(IEEE_ALL, .FALSE.)
+#endif
+      CALL dsyev('N', 'U', n, gram, n, eig, work, SIZE(work), info)
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_set_status(saved_status)
+#endif
+      condition2 = HUGE(1.0_dp)
+      IF (info == 0 .AND. MINVAL(eig) > 0.0_dp) condition2 = MAXVAL(eig)/MINVAL(eig)
+      IF (iw > 0) THEN
+         WRITE (iw, '(T2,A,I6,2ES22.12E3)') "SCF_TRIAL| history,raw-cond2,regularized-cond1 ", &
+            n, condition2, condition1
+         WRITE (iw, '(T2,A,*(ES22.12E3))') "SCF_TRIAL| coefficients ", g
+      END IF
+      DEALLOCATE (gram, eig, work)
+   END SUBROUTINE trial_history_report
 
 END MODULE qs_scf_methods

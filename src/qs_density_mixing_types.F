@@ -35,8 +35,8 @@ MODULE qs_density_mixing_types
                                   section_type, &
                                   section_vals_type, &
                                   section_vals_val_get
-   USE input_val_types, ONLY: real_t
-   USE kinds, ONLY: default_string_length, &
+   USE input_val_types, ONLY: real_t, lchar_t
+   USE kinds, ONLY: default_path_length, default_string_length, &
                     dp
    USE qs_rho_atom_types, ONLY: rho_atom_coeff
    USE string_utilities, ONLY: s2a
@@ -119,6 +119,17 @@ MODULE qs_density_mixing_types
       ! differences of both (with two spins: of the total density matrix, with PULAY_P_JOINT also of
       ! the spin density matrix, which then shares the coefficients)
       LOGICAL                                           :: dm_pulay = .FALSE.
+      LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
+      REAL(KIND=dp) :: dm_trial_occ_tol = 1.0E-6_dp, dm_trial_charge_tol = 1.0E-6_dp, dm_trial_step_limit = 0.0_dp
+      ! Full Bloch companion: the same affine Pulay candidate, before real-space truncation.
+      ! Allocated only for opt-in one-rank diagnostics; never Fourier-invert a density as an operator.
+      CHARACTER(LEN=default_path_length) :: dm_trial_k_read = "", dm_trial_k_write = ""
+      LOGICAL :: dm_trial_k_loaded = .FALSE.
+      INTEGER :: dm_trial_k_slot = 0
+      REAL(KIND=dp) :: dm_trial_k_norm = 0.0_dp
+      REAL(KIND=dp), ALLOCATABLE :: dm_trial_k_g(:)
+      COMPLEX(KIND=dp), ALLOCATABLE :: dm_trial_k_input(:, :, :, :), dm_trial_k_last(:, :, :, :), &
+                                       dm_trial_k_reslast(:, :, :, :), dm_trial_k_dp(:, :, :, :, :), dm_trial_k_dres(:, :, :, :, :)
       INTEGER                                           :: dm_pulay_ncall = 0
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: dm_pulay_p_last => NULL(), &
                                                            dm_pulay_res_last => NULL()
@@ -235,6 +246,32 @@ CONTAINS
          CALL section_vals_val_get(mixing_section, "PULAY_P_JOINT_START", &
                                    r_val=mixing_store%dm_pulay_joint_start)
       END IF
+      CALL section_vals_val_get(mixing_section, "PULAY_P_DIAGNOSTICS", l_val=mixing_store%dm_trial_diagnostics)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_REJECT", l_val=mixing_store%dm_trial_reject)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_OCC_TOL", r_val=mixing_store%dm_trial_occ_tol)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_CHARGE_TOL", r_val=mixing_store%dm_trial_charge_tol)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_STEP_LIMIT", r_val=mixing_store%dm_trial_step_limit)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_K_STATE_READ", c_val=mixing_store%dm_trial_k_read)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_K_STATE_WRITE", c_val=mixing_store%dm_trial_k_write)
+      IF (LEN_TRIM(mixing_store%dm_trial_k_read) > 0 .OR. LEN_TRIM(mixing_store%dm_trial_k_write) > 0) THEN
+         IF (.NOT. mixing_store%dm_pulay) CALL cp_abort(__LOCATION__, &
+                                                        "Full Bloch checkpoints require DIRECT_P_MIXING with PULAY_P")
+         IF (LEN_TRIM(mixing_store%dm_trial_k_read) > 0 .AND. &
+             mixing_store%dm_trial_k_read == mixing_store%dm_trial_k_write) &
+            CALL cp_abort(__LOCATION__, &
+                          "Read and write full Bloch checkpoints must have different paths")
+      END IF
+      mixing_store%dm_trial_diagnostics = mixing_store%dm_trial_diagnostics .OR. &
+                                          mixing_store%dm_trial_reject .OR. mixing_store%dm_trial_step_limit > 0.0_dp
+      IF (mixing_store%dm_trial_diagnostics) THEN
+         IF (.NOT. mixing_store%dm_pulay) CALL cp_abort(__LOCATION__, &
+                                                        "PULAY_P trial checks require DIRECT_P_MIXING with PULAY_P")
+         CPASSERT(mixing_store%dm_trial_occ_tol >= 0.0_dp)
+         CPASSERT(mixing_store%dm_trial_charge_tol >= 0.0_dp)
+         CPASSERT(mixing_store%dm_trial_step_limit >= 0.0_dp)
+         CPASSERT(mixing_store%alpha > 0.0_dp .AND. mixing_store%alpha <= 1.0_dp)
+      END IF
+      mixing_store%dm_trial_fallback = .FALSE.
       mixing_store%dm_pulay_joint_active = .FALSE.
       CALL section_vals_val_get(mixing_section, "XC_FIELDS", l_val=mixing_store%xc_fields)
       IF (mixing_store%xc_fields) THEN
@@ -305,6 +342,10 @@ CONTAINS
       END IF
 
       CALL dm_pulay_storage_release(mixing_store)
+      IF (ALLOCATED(mixing_store%dm_trial_k_input)) DEALLOCATE (mixing_store%dm_trial_k_input, &
+                                                                mixing_store%dm_trial_k_last, mixing_store%dm_trial_k_reslast, &
+                                                                mixing_store%dm_trial_k_dp, mixing_store%dm_trial_k_dres)
+      IF (ALLOCATED(mixing_store%dm_trial_k_g)) DEALLOCATE (mixing_store%dm_trial_k_g)
       CALL release_field_storage(mixing_store)
 
       IF (ASSOCIATED(mixing_store%pulay_matrix)) THEN
@@ -941,6 +982,52 @@ CONTAINS
                           type_of_var=real_t, &
                           default_r_val=0.0_dp, &
                           usage="PULAY_P_JOINT_START 1.0E-2")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_DIAGNOSTICS", &
+                          description="Diagnose input, output and trial density matrices after Pulay mixing o"// &
+                          "n one MPI rank.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_REJECT", &
+                          description="Reject nonfinite trials, wrong charge and occupation eigenvalues outsi"// &
+                          "de the physical interval. Reset history and use one convex linear step"// &
+                          " for both spins.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_OCC_TOL", &
+                          description="Slack on spin-normalized overlap-metric occupation eigenvalues; "// &
+                          "choose from observed numerical noise.", &
+                          default_r_val=1.0E-6_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_CHARGE_TOL", &
+                          description="Absolute electron-count tolerance for rejecting a Pulay trial.", &
+                          default_r_val=1.0E-6_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_STEP_LIMIT", &
+                          description="Bound on the full-step Frobenius norm divided by the residual norm; "// &
+                          "zero disables the bound.", &
+                          default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_READ", &
+                description="Read a certified paired full Bloch/real-space density before the first KS evaluation; one MPI rank.", &
+                          type_of_var=lchar_t, default_lc_val="")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_WRITE", &
+       description="Write a new paired full Bloch/real-space density only from a converged endpoint with at least two SCF steps.", &
+                          type_of_var=lchar_t, default_lc_val="")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
