@@ -88,7 +88,8 @@ MODULE qs_scf_diagonalization
                                  lattice_fft_off, &
                                  lattice_fft_on
    USE input_section_types, ONLY: section_vals_get_subs_vals, &
-                                  section_vals_type
+                                  section_vals_type, &
+                                  section_vals_val_get
    USE kinds, ONLY: dp, &
                     int_8
    USE kpoint_methods, ONLY: &
@@ -127,7 +128,9 @@ MODULE qs_scf_diagonalization
                       qs_diis_b_clear_kp, &
                       qs_diis_b_info_kp, &
                       qs_diis_b_step, &
-                      qs_diis_b_step_kp
+                      qs_diis_b_step_kp, &
+                      qs_diis_kp_gauge_check, &
+                      qs_diis_kp_gauge_transform
    USE qs_energy_types, ONLY: qs_energy_type
    USE qs_environment_types, ONLY: get_qs_env, &
                                    qs_environment_type
@@ -1007,7 +1010,7 @@ CONTAINS
          CALL qs_diis_b_step_kp(kpoints%scf_diis_buffer, coeffs, ib, nb, scf_env%iter_delta, diis_error, &
                                 cdiis_step, scf_control%eps_diis, nspin, nkp, kplocal, &
                                 MERGE(2, scf_control%nmixing, use_adiis), &
-                                scf_section, para_env_global)
+                                scf_section, para_env_global, complex_errors=.NOT. use_real_wfn)
          diis_weight = 1.0_dp
          IF (use_adiis) THEN
             diis_weight = scf_env%scf_subspace_buffer%diis_weight
@@ -1280,8 +1283,9 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'do_general_diag_kp_omp'
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: coeffs
-      INTEGER                                            :: cdiis_ncall, handle, ib, ikp, kplocal, &
-                                                            nb, nspin, nworkers, thread
+      INTEGER                                            :: cdiis_ncall, gauge_mode, handle, ib, &
+                                                            ikp, kplocal, nb, nspin, nworkers, &
+                                                            thread
       LOGICAL                                            :: cdiis_step, use_adiis
       REAL(KIND=dp)                                      :: diis_weight
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct, mo_struct
@@ -1313,19 +1317,20 @@ CONTAINS
       IF (do_diis) THEN
          CALL get_qs_env(qs_env, para_env=para_env_global)
          scf_section => section_vals_get_subs_vals(qs_env%input, "DFT%SCF")
+         CALL section_vals_val_get(scf_section, "DIAGONALIZATION%DIIS_TEST_GAUGE", i_val=gauge_mode)
          cdiis_ncall = kpoints%scf_diis_buffer%ncall
          CALL qs_diis_b_info_kp(kpoints%scf_diis_buffer, ib, nb)
          CALL qs_diis_b_check_i_alloc_kp(kpoints%scf_diis_buffer, matrix_struct, nspin, kplocal, &
                                          scf_section)
 
 !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(DYNAMIC, 1) NUM_THREADS(nworkers) &
-!$OMP SHARED(workspace,matrix_ks,matrix_s,kpoints,ib,transform_plan,xkp,kplocal,nspin,nworkers) &
+!$OMP SHARED(workspace,matrix_ks,matrix_s,kpoints,ib,transform_plan,xkp,kplocal,nspin,nworkers,gauge_mode) &
 !$OMP PRIVATE(ikp,thread)
          DO ikp = 1, kplocal
             thread = 1
 !$          thread = omp_get_thread_num() + 1
             CALL kp_diis_error_job_local(ikp, workspace(thread), matrix_ks, matrix_s, kpoints, &
-                                         ib, transform_plan, xkp, nspin)
+                                         ib, transform_plan, xkp, nspin, gauge_mode)
          END DO
 !$OMP END PARALLEL DO
 
@@ -1333,7 +1338,7 @@ CONTAINS
          CALL qs_diis_b_step_kp(kpoints%scf_diis_buffer, coeffs, ib, nb, scf_env%iter_delta, diis_error, &
                                 cdiis_step, scf_control%eps_diis, nspin, kplocal, kplocal, &
                                 MERGE(2, scf_control%nmixing, use_adiis), &
-                                scf_section, para_env_global)
+                                scf_section, para_env_global, complex_errors=.TRUE.)
          diis_weight = 1.0_dp
          IF (use_adiis) THEN
             diis_weight = scf_env%scf_subspace_buffer%diis_weight
@@ -1566,7 +1571,7 @@ CONTAINS
 !> \param nspin ...
 ! **************************************************************************************************
    SUBROUTINE kp_diis_error_job_local(ikp, workspace, matrix_ks, matrix_s, kpoints, ib, &
-                                      transform_plan, xkp, nspin)
+                                      transform_plan, xkp, nspin, gauge_mode)
 
       INTEGER, INTENT(IN)                                :: ikp
       TYPE(kp_diag_omp_workspace_type), INTENT(INOUT)    :: workspace
@@ -1575,7 +1580,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: ib
       TYPE(kp_transform_plan_type), INTENT(IN)           :: transform_plan
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
-      INTEGER, INTENT(IN)                                :: nspin
+      INTEGER, INTENT(IN)                                :: nspin, gauge_mode
 
       INTEGER                                            :: ispin
       TYPE(kpoint_env_type), POINTER                     :: kp
@@ -1587,7 +1592,7 @@ CONTAINS
          CALL kp_build_cfm(matrix_ks, ispin, xkp(1:3, ikp), transform_plan, &
                            workspace%cksmat)
          CALL cp_cfm_to_cfm(workspace%csmat_base, workspace%csmat)
-         CALL kp_diis_calc_err_local(kpoints, kp, workspace, ib, ispin, ikp)
+         CALL kp_diis_calc_err_local(kpoints, kp, workspace, ib, ispin, ikp, gauge_mode)
       END DO
 
    END SUBROUTINE kp_diis_error_job_local
@@ -1601,22 +1606,23 @@ CONTAINS
 !> \param ispin ...
 !> \param ikp ...
 ! **************************************************************************************************
-   SUBROUTINE kp_diis_calc_err_local(kpoints, kp, workspace, ib, ispin, ikp)
+   SUBROUTINE kp_diis_calc_err_local(kpoints, kp, workspace, ib, ispin, ikp, gauge_mode)
 
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(kpoint_env_type), POINTER                     :: kp
       TYPE(kp_diag_omp_workspace_type), INTENT(INOUT)    :: workspace
-      INTEGER, INTENT(IN)                                :: ib, ispin, ikp
+      INTEGER, INTENT(IN)                                :: ib, ispin, ikp, gauge_mode
 
-      COMPLEX(KIND=dp), DIMENSION(:, :), POINTER         :: c, error, h, kc, s, sc
-      INTEGER                                            :: homo, nao, nmo
-      REAL(KIND=dp)                                      :: maxocc
-      REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
-         POINTER                                         :: ci, cr
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:, :)          :: reference_error
+      COMPLEX(dp), DIMENSION(:, :), POINTER              :: c, error, h, kc, s, sc
+      INTEGER                                            :: imo, itest, nao, nmo
+      LOGICAL                                            :: unitary_rotated
+      REAL(dp), CONTIGUOUS, DIMENSION(:, :), POINTER     :: ci, cr
+      REAL(dp), DIMENSION(:), POINTER                    :: occupation_numbers
       TYPE(cp_fm_type), POINTER                          :: imos, rmos
 
-      CALL get_mo_set(kp%mos(1, ispin), nao=nao, nmo=nmo, homo=homo, &
-                      mo_coeff=rmos, maxocc=maxocc)
+      CALL get_mo_set(kp%mos(1, ispin), nao=nao, nmo=nmo, mo_coeff=rmos, &
+                      occupation_numbers=occupation_numbers)
       CALL get_mo_set(kp%mos(2, ispin), mo_coeff=imos)
       CALL cp_fm_get_info(rmos, local_data=cr)
       CALL cp_fm_get_info(imos, local_data=ci)
@@ -1628,19 +1634,39 @@ CONTAINS
       s => kpoints%scf_diis_buffer%smat(ikp)%local_data
       h(:, :) = workspace%cksmat%local_data(:, :)
       s(:, :) = workspace%csmat%local_data(:, :)
-
       kc => workspace%cksmat%local_data
       sc => workspace%csmat%local_data
-      CALL zgemm('N', 'N', nao, homo, nao, CMPLX(maxocc, 0.0_dp, KIND=dp), &
-                 h(1, 1), SIZE(h, 1), c(1, 1), SIZE(c, 1), z_zero, kc(1, 1), SIZE(kc, 1))
-      CALL zgemm('N', 'N', nao, homo, nao, CMPLX(2.0_dp, 0.0_dp, KIND=dp), &
-                 s(1, 1), SIZE(s, 1), c(1, 1), SIZE(c, 1), z_zero, sc(1, 1), SIZE(sc, 1))
-
       error => kpoints%scf_diis_buffer%error(ib, ispin, ikp)%local_data
-      CALL zgemm('N', 'T', nao, nao, homo, z_one, sc(1, 1), SIZE(sc, 1), &
-                 kc(1, 1), SIZE(kc, 1), z_zero, error(1, 1), SIZE(error, 1))
-      CALL zgemm('N', 'T', nao, nao, homo, z_one, kc(1, 1), SIZE(kc, 1), &
-                 sc(1, 1), SIZE(sc, 1), -z_one, error(1, 1), SIZE(error, 1))
+
+      DO itest = 0, MERGE(1, 0, gauge_mode > 0)
+         IF (itest == 1) THEN
+            CALL qs_diis_kp_gauge_transform(workspace%cmos, occupation_numbers, ikp, ispin, &
+                                            gauge_mode, unitary_rotated)
+         END IF
+         ! S P K - K P S; P uses all actual occupations.
+         ! This common sign matches the distributed path and cancels in the DIIS Gram matrix.
+         CALL zgemm('N', 'N', nao, nmo, nao, z_one, h(1, 1), SIZE(h, 1), &
+                    c(1, 1), SIZE(c, 1), z_zero, kc(1, 1), SIZE(kc, 1))
+         CALL zgemm('N', 'N', nao, nmo, nao, z_one, s(1, 1), SIZE(s, 1), &
+                    c(1, 1), SIZE(c, 1), z_zero, sc(1, 1), SIZE(sc, 1))
+         DO imo = 1, nmo
+            kc(1:nao, imo) = kc(1:nao, imo)*occupation_numbers(imo)
+         END DO
+         CALL zgemm('N', 'C', nao, nao, nmo, z_one, kc(1, 1), SIZE(kc, 1), &
+                    sc(1, 1), SIZE(sc, 1), z_zero, error(1, 1), SIZE(error, 1))
+         CALL zgemm('N', 'C', nao, nao, nmo, z_one, sc(1, 1), SIZE(sc, 1), &
+                    kc(1, 1), SIZE(kc, 1), -z_one, error(1, 1), SIZE(error, 1))
+         IF (gauge_mode > 0) THEN
+            IF (itest == 0) THEN
+               ALLOCATE (reference_error(nao, nao))
+               reference_error = error(1:nao, 1:nao)
+            ELSE
+               CALL qs_diis_kp_gauge_check(kpoints%scf_diis_buffer%error(ib, ispin, ikp), &
+                                           reference_error, ikp, ispin, gauge_mode, unitary_rotated, reduce=.FALSE.)
+               DEALLOCATE (reference_error)
+            END IF
+         END IF
+      END DO
 
    END SUBROUTINE kp_diis_calc_err_local
 

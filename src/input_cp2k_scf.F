@@ -1098,6 +1098,19 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="DIIS_TEST_GAUGE", &
+                          description="Test-only transformation of copied complex MOs before KS-DIIS. "// &
+                          "PHASE applies deterministic phases; UNITARY rotates an equal positive-occupation "// &
+                          "pair; BOTH applies both. Stored orbitals and the physical density are unchanged. "// &
+                          "The transformed residual matrix and norm are checked against the original.", &
+                          usage="DIIS_TEST_GAUGE BOTH", default_i_val=0, &
+                          enum_c_vals=s2a("NONE", "PHASE", "UNITARY", "BOTH"), &
+                          enum_desc=s2a("No test transformation", "Apply phases", &
+                                        "Rotate equal-occupation orbitals", "Apply phases and rotation"), &
+                          enum_i_vals=[0, 1, 2, 3])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="UPDATE_METHOD", &
                           description="Selects the SCF update method used with diagonalization. MIXING uses "// &
                           "the existing density-mixing and DIIS workflow; ADIIS uses augmented-DIIS "// &
