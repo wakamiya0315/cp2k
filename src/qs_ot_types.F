@@ -104,6 +104,7 @@ MODULE qs_ot_types
       LOGICAL           :: refresh_keep_state = .FALSE.
       LOGICAL           :: check_interpolated_energy = .FALSE.
       LOGICAL           :: count_full_gradients = .FALSE.
+      LOGICAL           :: project_strict_direction = .FALSE.
       REAL(KIND=dp)     :: ds_min = -1.0_dp
       REAL(KIND=dp)     :: energy_gap = -1.0_dp
       INTEGER           :: diis_m = -1
@@ -326,6 +327,7 @@ CONTAINS
       settings%refresh_keep_state = .FALSE.
       settings%check_interpolated_energy = .FALSE.
       settings%count_full_gradients = .FALSE.
+      settings%project_strict_direction = .FALSE.
       settings%preconditioner_name = "FULL_KINETIC"
       settings%preconditioner_type = ot_precond_full_kinetic
       settings%low_rank_base_name = "OVERLAP_INVERSE"
@@ -1770,6 +1772,7 @@ CONTAINS
       CALL section_vals_val_get(ot_section, "REFRESH_KEEP_STATE", l_val=settings%refresh_keep_state)
       CALL section_vals_val_get(ot_section, "CHECK_INTERPOLATED_ENERGY", l_val=settings%check_interpolated_energy)
       CALL section_vals_val_get(ot_section, "COUNT_FULL_GRADIENTS", l_val=settings%count_full_gradients)
+      CALL section_vals_val_get(ot_section, "PROJECT_STRICT_DIRECTION", l_val=settings%project_strict_direction)
 
       !If these values are negative we will set them "optimal" for a given precondtioner below
       CALL section_vals_val_get(ot_section, "STEPSIZE", r_val=settings%ds_min)

@@ -890,6 +890,16 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="PROJECT_STRICT_DIRECTION", &
+                          description="For occupation-preconditioned complex STRICT (ALGORITHM STRICT)"// &
+                          " Mermin OT, project each new search direction onto the tangent space of the"// &
+                          " reference orbitals C0 in the overlap metric and recompute its slope; a"// &
+                          " direction that is then not downhill is replaced by the projected"// &
+                          " preconditioned gradient.", &
+                          usage="PROJECT_STRICT_DIRECTION ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create( &
          keyword, __LOCATION__, name="STEPSIZE", &
          description="Initial stepsize used for the line search, sometimes this parameter can be reduced to stabilize DIIS"// &

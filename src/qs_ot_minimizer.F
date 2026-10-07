@@ -36,7 +36,8 @@ MODULE qs_ot_minimizer
    USE qs_ot,                           ONLY: qs_ot_get_derivative,&
                                               qs_ot_get_derivative_complex,&
                                               qs_ot_get_derivative_ref,&
-                                              qs_ot_get_derivative_ref_complex
+                                              qs_ot_get_derivative_ref_complex,&
+                                              qs_ot_project_complex_tangent
    USE qs_ot_types,                     ONLY: qs_ot_kpoint_preconditioner_scale,&
                                               qs_ot_type
 #include "./base/base_uses.f90"
@@ -60,6 +61,7 @@ MODULE qs_ot_minimizer
               ot_mermin_response_shadow_followup, &
               ot_mermin_secant_curvature, &
               ot_mini, &
+              ot_project_strict_direction, &
               ot_mini_prepare_gradient
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ot_minimizer'
@@ -460,6 +462,149 @@ CONTAINS
       END IF
 
    END SUBROUTINE ot_mini_sum_kpoint_scalar
+
+! **************************************************************************************************
+!> \brief Directional derivative <G,D> of the current gradient along the current direction.
+!>        Uses the product metric of the minimizers: orbital blocks with weight one, the
+!>        anti-Hermitian rotation chart with one half, and the auxiliary occupation labels.
+!> \param qs_ot_env OT channel environments
+!> \param para_env_inter_kp communicator across K-point groups
+!> \return directional derivative
+! **************************************************************************************************
+   FUNCTION ot_direction_slope(qs_ot_env, para_env_inter_kp) RESULT(slope)
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
+      TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env_inter_kp
+      REAL(KIND=dp)                                      :: slope
+
+      INTEGER                                            :: ispin
+      REAL(KIND=dp)                                      :: tmp
+
+      slope = 0.0_dp
+      DO ispin = 1, SIZE(qs_ot_env)
+         IF (qs_ot_env(1)%settings%ks) THEN
+            CALL dbcsr_dot(qs_ot_env(ispin)%matrix_gx, qs_ot_env(ispin)%matrix_dx, tmp)
+            slope = slope + tmp
+            IF (qs_ot_env(ispin)%has_complex_kpoint_state) THEN
+               CALL dbcsr_dot(qs_ot_env(ispin)%matrix_gx_im, qs_ot_env(ispin)%matrix_dx_im, tmp)
+               slope = slope + tmp
+            END IF
+            IF (qs_ot_env(1)%settings%do_rotation) THEN
+               CALL dbcsr_dot(qs_ot_env(ispin)%rot_mat_gx, qs_ot_env(ispin)%rot_mat_dx, tmp)
+               slope = slope + 0.5_dp*tmp
+               IF (qs_ot_env(ispin)%has_complex_kpoint_state) THEN
+                  CALL dbcsr_dot(qs_ot_env(ispin)%rot_mat_gx_im, qs_ot_env(ispin)%rot_mat_dx_im, tmp)
+                  slope = slope + 0.5_dp*tmp
+               END IF
+            END IF
+         END IF
+         IF (qs_ot_env(1)%settings%do_ener) THEN
+            slope = slope + DOT_PRODUCT(qs_ot_env(ispin)%ener_gx, qs_ot_env(ispin)%ener_dx)
+         END IF
+      END DO
+      CALL ot_mini_sum_kpoint_scalar(para_env_inter_kp, slope)
+
+   END FUNCTION ot_direction_slope
+
+! **************************************************************************************************
+!> \brief Project the orbital block of the current direction of every complex STRICT channel.
+!> \param qs_ot_env OT channel environments
+!> \param para_env_inter_kp communicator across K-point groups
+!> \param before norm of C0^H S D over all channels before the projection
+!> \param after the same norm after the projection
+! **************************************************************************************************
+   SUBROUTINE ot_project_strict_channels(qs_ot_env, para_env_inter_kp, before, after)
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
+      TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env_inter_kp
+      REAL(KIND=dp), INTENT(OUT)                         :: before, after
+
+      INTEGER                                            :: ispin
+      REAL(KIND=dp)                                      :: channel_after, channel_before
+
+      before = 0.0_dp
+      after = 0.0_dp
+      DO ispin = 1, SIZE(qs_ot_env)
+         CPASSERT(qs_ot_env(ispin)%has_complex_kpoint_state)
+         CALL qs_ot_project_complex_tangent(qs_ot_env(ispin), channel_before, channel_after)
+         before = before + channel_before**2
+         after = after + channel_after**2
+      END DO
+      CALL ot_mini_sum_kpoint_scalar(para_env_inter_kp, before)
+      CALL ot_mini_sum_kpoint_scalar(para_env_inter_kp, after)
+      before = SQRT(before)
+      after = SQRT(after)
+
+   END SUBROUTINE ot_project_strict_channels
+
+! **************************************************************************************************
+!> \brief Impose the STRICT tangent condition C0^H S D = 0 on a new search direction (R05).
+!>
+!> Opt-in (PROJECT_STRICT_DIRECTION) for occupation-preconditioned complex STRICT channels. The
+!> numerical directions of the minimizers can leave the tangent space although the projected
+!> gradient keeps them inside it in exact arithmetic; the line search then moves C off the STRICT
+!> manifold. After the projection the slope is recomputed. If the projected direction is not
+!> downhill, the history contribution is discarded and the projected preconditioned physical
+!> gradient is used instead. The convergence measure (delta) of the direction is not changed.
+!> \param qs_ot_env OT channel environments
+!> \param para_env_inter_kp communicator across K-point groups
+! **************************************************************************************************
+   SUBROUTINE ot_project_strict_direction(qs_ot_env, para_env_inter_kp)
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
+      TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env_inter_kp
+
+      INTEGER                                            :: ispin, output_unit
+      LOGICAL                                            :: fallback
+      REAL(KIND=dp)                                      :: after, before, slope, slope_before, tmp
+
+      IF (.NOT. qs_ot_env(1)%settings%project_strict_direction) RETURN
+      IF (.NOT. (qs_ot_env(1)%settings%occupation_preconditioner .AND. qs_ot_env(1)%settings%ks)) RETURN
+      IF (qs_ot_env(1)%settings%ot_algorithm /= "TOD") RETURN
+      IF (.NOT. qs_ot_env(1)%has_complex_kpoint_state) RETURN
+
+      slope_before = qs_ot_env(1)%gradient
+      CALL ot_project_strict_channels(qs_ot_env, para_env_inter_kp, before, after)
+      slope = ot_direction_slope(qs_ot_env, para_env_inter_kp)
+      fallback = .NOT. ieee_is_finite(slope) .OR. slope >= 0.0_dp
+      IF (fallback) THEN
+         qs_ot_env(1)%diis_iter = 1
+         DO ispin = 1, SIZE(qs_ot_env)
+            IF (ASSOCIATED(qs_ot_env(ispin)%preconditioner)) THEN
+               CALL apply_preconditioner(qs_ot_env(ispin)%preconditioner, &
+                                         qs_ot_env(ispin)%matrix_gx, qs_ot_env(ispin)%matrix_gx_im, &
+                                         qs_ot_env(ispin)%matrix_dx, qs_ot_env(ispin)%matrix_dx_im)
+               CPASSERT(qs_ot_env(ispin)%kpoint_weight > 0.0_dp)
+               tmp = -qs_ot_kpoint_preconditioner_scale(qs_ot_env(ispin)%kpoint_weight)
+               CALL dbcsr_scale(qs_ot_env(ispin)%matrix_dx, tmp)
+               CALL dbcsr_scale(qs_ot_env(ispin)%matrix_dx_im, tmp)
+            ELSE
+               CALL dbcsr_copy(qs_ot_env(ispin)%matrix_dx, qs_ot_env(ispin)%matrix_gx)
+               CALL dbcsr_copy(qs_ot_env(ispin)%matrix_dx_im, qs_ot_env(ispin)%matrix_gx_im)
+               CALL dbcsr_scale(qs_ot_env(ispin)%matrix_dx, -1.0_dp)
+               CALL dbcsr_scale(qs_ot_env(ispin)%matrix_dx_im, -1.0_dp)
+            END IF
+            IF (qs_ot_env(1)%settings%do_rotation) THEN
+               CALL dbcsr_copy(qs_ot_env(ispin)%rot_mat_dx, qs_ot_env(ispin)%rot_mat_gx)
+               CALL dbcsr_copy(qs_ot_env(ispin)%rot_mat_dx_im, qs_ot_env(ispin)%rot_mat_gx_im)
+               CALL dbcsr_scale(qs_ot_env(ispin)%rot_mat_dx, -1.0_dp)
+               CALL dbcsr_scale(qs_ot_env(ispin)%rot_mat_dx_im, -1.0_dp)
+            END IF
+            IF (qs_ot_env(1)%settings%do_ener) qs_ot_env(ispin)%ener_dx = -qs_ot_env(ispin)%ener_gx
+         END DO
+         CALL ot_project_strict_channels(qs_ot_env, para_env_inter_kp, tmp, after)
+         slope = ot_direction_slope(qs_ot_env, para_env_inter_kp)
+         qs_ot_env(1)%OT_METHOD_FULL = "OT P-SD"
+      END IF
+      qs_ot_env(1)%gradient = slope
+
+      IF (qs_ot_env(1)%settings%diagnostics) THEN
+         output_unit = cp_logger_get_default_io_unit()
+         IF (output_unit > 0) THEN
+            WRITE (output_unit, '(A,4(1X,ES23.15),1X,L1)') &
+               'OT| PROJECT |C0^H S D| before after, slope before after, fallback:', &
+               before, after, slope_before, slope, fallback
+         END IF
+      END IF
+
+   END SUBROUTINE ot_project_strict_direction
 
 ! **************************************************************************************************
 !> \brief Assess a finite-response candidate at its accepted Mermin endpoint.
@@ -1852,6 +1997,7 @@ CONTAINS
          qs_ot_env(1)%delta = 0.0_dp
          qs_ot_env(1)%gradient = 0.0_dp
       END IF
+      CALL ot_project_strict_direction(qs_ot_env, para_env_inter_kp)
 
       CALL timestop(handle)
 
@@ -2253,6 +2399,7 @@ CONTAINS
          qs_ot_env(1)%gradient = beta_pr*qs_ot_env(1)%gradient - qs_ot_env(1)%gnorm
       END IF
       qs_ot_env(1)%gnorm_old = qs_ot_env(1)%gnorm
+      CALL ot_project_strict_direction(qs_ot_env, para_env_inter_kp)
 
       CALL timestop(handle)
 
@@ -3397,6 +3544,7 @@ CONTAINS
          qs_ot_env(1)%gnorm = -test_down
          qs_ot_env(1)%gradient = test_down
       END IF
+      CALL ot_project_strict_direction(qs_ot_env, para_env_inter_kp)
 
       DEALLOCATE (alpha, rho, history_index)
       CALL timestop(handle)
