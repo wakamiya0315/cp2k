@@ -291,7 +291,8 @@ CONTAINS
       COMPLEX(KIND=dp), DIMENSION(n, k, 2)               :: actual_c, actual_x, base_x, dx, expected_c
       COMPLEX(KIND=dp), DIMENSION(k, k, 2)               :: actual_a, base_a, da
       COMPLEX(KIND=dp), DIMENSION(n, n)                  :: actual_p, expected_p
-      INTEGER                                            :: channel, component, sample, scenario
+      INTEGER                                            :: channel, component, nsample, sample, &
+                                                            scenario
       REAL(KIND=dp)                                      :: actual_kts, actual_state_f, expected_kts, &
                                                             expected_state_f, position
       REAL(KIND=dp), DIMENSION(4)                       :: actual_f, actual_labels, base_labels, &
@@ -343,7 +344,7 @@ CONTAINS
          CALL put_complex_pair(rotation_direction(1, channel), rotation_direction(2, channel), da(:, :, channel))
       END DO
 
-      DO scenario = 1, 3
+      DO scenario = 1, 4
          search(1)%line_search_count = 0
          search(1)%ds_min = 0.15_dp
          DO channel = 1, 2
@@ -354,8 +355,11 @@ CONTAINS
             CALL put_complex_pair(rotation(1, channel), rotation(2, channel), base_a(:, :, channel))
             search(channel)%ener_x = base_labels((channel - 1)*k + 1:channel*k)
          END DO
-         DO sample = 1, MERGE(3, 4, scenario == 3)
-            IF (scenario /= 2) THEN
+         nsample = MERGE(3, 4, scenario == 3)
+         ! Scenario 4 stays uphill through the 12-evaluation bound and must return to the origin.
+         IF (scenario == 4) nsample = 12
+         DO sample = 1, nsample
+            IF (scenario /= 2 .AND. scenario /= 4) THEN
                ! The actual fourth-point F is above two already evaluated lower samples.
                search(1)%etotal = energy_samples(sample)
             ELSE
@@ -381,6 +385,11 @@ CONTAINS
                 ABS(search(1)%ot_pos(5) - position) > 1.0E-14_dp) nfail = nfail + 1
             search(1)%etotal = -2.001_dp
             CALL do_line_search_3pnt(search)
+         ELSE IF (scenario == 4) THEN
+            ! Back at the evaluated origin with a full-gradient request and no abort; the next
+            ! search starts again from the initial step, not from a zero step.
+            position = 0.0_dp
+            IF (ABS(search(1)%ds_min - 0.15_dp) > 1.0E-14_dp) nfail = nfail + 1
          ELSE
             position = search(1)%ot_pos(4)
          END IF

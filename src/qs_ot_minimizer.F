@@ -1283,6 +1283,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
+      decision = ''
       ! The actual-F check is opt-in (CHECK_INTERPOLATED_ENERGY); without it this search is
       ! the upstream three-point search.
       guarded_mermin = use_three_point_mermin_search(qs_ot_env) .AND. &
@@ -1374,7 +1375,15 @@ CONTAINS
             pos = MINVAL(qs_ot_env(1)%OT_pos(2:count), MASK=qs_ot_env(1)%OT_pos(2:count) > 0.0_dp)
             qs_ot_env(1)%OT_pos(count + 1) = 0.5_dp*pos
          ELSE
-            CPABORT("Mermin OT line search found no actual free-energy descent in 12 evaluations.")
+            decision = 'ORIGIN'
+            ! The evaluation bound is reached and no positive step lies below the origin by more
+            ! than roundoff. At a stationary origin the scatter of the actual F exceeds that
+            ! allowance. Return to the evaluated origin and request its full gradient there: no
+            ! uphill point is accepted, and the unchanged convergence tests decide at that
+            ! evaluation. At a non-stationary origin the run continues from the same state.
+            qs_ot_env(1)%OT_pos(count + 1) = qs_ot_env(1)%OT_pos(1)
+            qs_ot_env(1)%energy_only = .FALSE.
+            qs_ot_env(1)%line_search_might_be_done = .TRUE.
          END IF
          IF (qs_ot_env(1)%settings%diagnostics) THEN
             output_unit = cp_logger_get_default_io_unit()
@@ -1390,7 +1399,12 @@ CONTAINS
          CPABORT("NYI")
       END SELECT
       ds = qs_ot_env(1)%OT_pos(count + 1) - qs_ot_env(1)%OT_pos(count)
-      qs_ot_env(1)%ds_min = qs_ot_env(1)%OT_pos(count + 1)
+      IF (decision == 'ORIGIN') THEN
+         ! The next search starts from this search's initial step, not from a zero step.
+         qs_ot_env(1)%ds_min = qs_ot_env(1)%OT_pos(2)/0.8_dp
+      ELSE
+         qs_ot_env(1)%ds_min = qs_ot_env(1)%OT_pos(count + 1)
+      END IF
 
       CALL take_step(ds, qs_ot_env)
 
