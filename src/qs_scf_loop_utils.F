@@ -3598,7 +3598,7 @@ CONTAINS
       LOGICAL                                            :: diis_step
       INTEGER, INTENT(IN)                                :: output_unit
 
-      LOGICAL                                            :: valid
+      LOGICAL                                            :: free_converged, valid
       REAL(KIND=dp)                                      :: density_kts, eks, entropy, &
                                                             final_raw_residual
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -3616,6 +3616,7 @@ CONTAINS
                       kpoints=kpoints, scf_control=control)
 
       final_raw_residual = scf_env%iter_delta
+      free_converged = final_raw_residual < control%eps_scf .AND. scf_env%iter_count >= 2
       CALL cleanup_scf_loop(scf_env)
 
       ! now, print out energies and charges corresponding to the obtained wfn
@@ -3645,6 +3646,10 @@ CONTAINS
             "SCF_FREE_ENERGY| finalized raw-state F,raw-residual,entropy consistency error ", &
             energy%total, final_raw_residual, density_kts - scf_env%mixing_store%dm_trial_raw_kts
          CALL qs_scf_print_summary(output_unit, qs_env)
+         ! An unconverged raw map is not an accepted F step for an outer restart.
+         IF (.NOT. free_converged) CALL cp_abort(__LOCATION__, &
+                                                 "SCF run NOT converged: strict free-energy inner limit; raw state certified; "// &
+                                                 "no outer restart accepted")
       END IF
 
    END SUBROUTINE qs_scf_inner_finalize
