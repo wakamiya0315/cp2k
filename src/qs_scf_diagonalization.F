@@ -1643,7 +1643,8 @@ CONTAINS
             CALL qs_diis_kp_gauge_transform(workspace%cmos, occupation_numbers, ikp, ispin, &
                                             gauge_mode, unitary_rotated)
          END IF
-         ! K P S - S P K; P uses all actual occupations, not a maxocc/HOMO projector.
+         ! S P K - K P S; P uses all actual occupations.
+         ! This common sign matches the distributed path and cancels in the DIIS Gram matrix.
          CALL zgemm('N', 'N', nao, nmo, nao, z_one, h(1, 1), SIZE(h, 1), &
                     c(1, 1), SIZE(c, 1), z_zero, kc(1, 1), SIZE(kc, 1))
          CALL zgemm('N', 'N', nao, nmo, nao, z_one, s(1, 1), SIZE(s, 1), &

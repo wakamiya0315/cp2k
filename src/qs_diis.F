@@ -1120,7 +1120,8 @@ CONTAINS
    END SUBROUTINE qs_diis_b_calc_err_kp
 
 ! **************************************************************************************************
-!> \brief Form K P S - S P K with P = C diag(f) C^H, retaining every actual occupation.
+!> \brief Form S P K - K P S with P = C diag(f) C^H, retaining every actual occupation.
+!>        A common residual sign leaves the Hermitian Gram matrix and DIIS coefficients unchanged.
 !> \param cmos Copied complex orbitals.
 !> \param occupation_numbers Actual occupations, including a fractional tail.
 !> \param parameters Kohn-Sham matrix.
