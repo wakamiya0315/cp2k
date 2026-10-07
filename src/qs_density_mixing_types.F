@@ -16,6 +16,8 @@ MODULE qs_density_mixing_types
    USE tblite_scf, ONLY: mixer_type
 #endif
    USE ao_util, ONLY: exp_radius
+   USE cp_dbcsr_api, ONLY: dbcsr_deallocate_matrix, &
+                           dbcsr_p_type
    USE input_constants, ONLY: broy_mix, &
                               direct_p_mix, &
                               gaussian, &
@@ -53,7 +55,8 @@ MODULE qs_density_mixing_types
                                  modified_broyden_mixing_nr = 5, &
                                  multisecant_mixing_nr = 6, &
                                  new_pulay_mixing_nr = 7
-   PUBLIC :: cp_1d_z_p_type, mixing_storage_create, mixing_storage_type, mixing_storage_release, create_mixing_section
+   PUBLIC :: cp_1d_z_p_type, mixing_storage_create, mixing_storage_type, mixing_storage_release, create_mixing_section, &
+             dm_pulay_storage_release
 
    TYPE cp_1d_z_p_type
       COMPLEX(dp), DIMENSION(:), POINTER :: cc => NULL()
@@ -103,6 +106,15 @@ MODULE qs_density_mixing_types
       TYPE(rho_atom_coeff), DIMENSION(:, :, :), POINTER :: cpc_h_in_buffer => NULL(), cpc_s_in_buffer => NULL()
       TYPE(rho_atom_coeff), DIMENSION(:, :, :), POINTER :: cpc_h_res_buffer => NULL(), cpc_s_res_buffer => NULL()
       TYPE(rho_atom_coeff), DIMENSION(:, :, :), POINTER :: dcpc_h_in => NULL(), dcpc_s_in => NULL()
+      ! Pulay (Anderson) acceleration of DIRECT_P_MIXING: the input density matrix and residual
+      ! P_out - P_in of the previous step, and NBUFFER normalized differences of both, for every
+      ! spin and image
+      LOGICAL                                           :: dm_pulay = .FALSE.
+      INTEGER                                           :: dm_pulay_ncall = 0
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: dm_pulay_p_last => NULL(), &
+                                                           dm_pulay_res_last => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:, :, :), POINTER   :: dm_pulay_dp => NULL(), &
+                                                           dm_pulay_dres => NULL()
 #if defined(__TBLITE)
       CLASS(mixer_type), ALLOCATABLE                    :: tb_scc_mixer
 #endif
@@ -199,6 +211,12 @@ CONTAINS
       CALL section_vals_val_get(mixing_section, "NSKIP", i_val=mixing_store%nskip_mixing)
       CALL section_vals_val_get(mixing_section, "MAX_GVEC_EXP", r_val=mixing_store%max_gvec_exp)
       CALL section_vals_val_get(mixing_section, "GMIX_P", l_val=mixing_store%gmix_p)
+      CALL section_vals_val_get(mixing_section, "PULAY_P", l_val=mixing_store%dm_pulay)
+      mixing_store%dm_pulay = mixing_store%dm_pulay .AND. mixing_method == direct_mixing_nr
+      mixing_store%dm_pulay_ncall = 0
+      IF (mixing_store%dm_pulay) THEN
+         CALL section_vals_val_get(mixing_section, "BROY_W0", r_val=mixing_store%broy_w0)
+      END IF
 
       IF (mixing_store%max_gvec_exp > 0._dp) THEN
          alpha = 0.25_dp/mixing_store%max_gvec_exp
@@ -258,6 +276,8 @@ CONTAINS
       IF (ASSOCIATED(mixing_store%special_metric)) THEN
          DEALLOCATE (mixing_store%special_metric)
       END IF
+
+      CALL dm_pulay_storage_release(mixing_store)
 
       IF (ASSOCIATED(mixing_store%pulay_matrix)) THEN
          DEALLOCATE (mixing_store%pulay_matrix)
@@ -823,6 +843,53 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P", &
+                          description="With DIRECT_P_MIXING: accelerate the mixing of the real-space "// &
+                          "density matrices with Pulay's (Anderson's) method. The residual is "// &
+                          "P_out - P_in over all spins and periodic images, the history holds the "// &
+                          "last NBUFFER steps and BROY_W0 regularizes its normal equations. All "// &
+                          "densities (grid, kinetic energy density, GAPW one-centre terms) stay derived "// &
+                          "from one density matrix. The Kohn-Sham DIIS is switched off.", &
+                          repeats=.FALSE., &
+                          lone_keyword_l_val=.TRUE., &
+                          default_l_val=.FALSE., &
+                          usage="PULAY_P")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
    END SUBROUTINE create_mixing_section
+
+! **************************************************************************************************
+!> \brief Releases the density-matrix history of PULAY_P
+!> \param mixing_store ...
+! **************************************************************************************************
+   SUBROUTINE dm_pulay_storage_release(mixing_store)
+      TYPE(mixing_storage_type), INTENT(INOUT)           :: mixing_store
+
+      INTEGER                                            :: i, j, k
+
+      IF (ASSOCIATED(mixing_store%dm_pulay_p_last)) THEN
+         DO j = 1, SIZE(mixing_store%dm_pulay_p_last, 2)
+            DO i = 1, SIZE(mixing_store%dm_pulay_p_last, 1)
+               CALL dbcsr_deallocate_matrix(mixing_store%dm_pulay_p_last(i, j)%matrix)
+               CALL dbcsr_deallocate_matrix(mixing_store%dm_pulay_res_last(i, j)%matrix)
+            END DO
+         END DO
+         DEALLOCATE (mixing_store%dm_pulay_p_last, mixing_store%dm_pulay_res_last)
+      END IF
+      IF (ASSOCIATED(mixing_store%dm_pulay_dp)) THEN
+         DO k = 1, SIZE(mixing_store%dm_pulay_dp, 3)
+            DO j = 1, SIZE(mixing_store%dm_pulay_dp, 2)
+               DO i = 1, SIZE(mixing_store%dm_pulay_dp, 1)
+                  CALL dbcsr_deallocate_matrix(mixing_store%dm_pulay_dp(i, j, k)%matrix)
+                  CALL dbcsr_deallocate_matrix(mixing_store%dm_pulay_dres(i, j, k)%matrix)
+               END DO
+            END DO
+         END DO
+         DEALLOCATE (mixing_store%dm_pulay_dp, mixing_store%dm_pulay_dres)
+      END IF
+      mixing_store%dm_pulay_ncall = 0
+
+   END SUBROUTINE dm_pulay_storage_release
 
 END MODULE qs_density_mixing_types

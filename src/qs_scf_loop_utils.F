@@ -3012,6 +3012,9 @@ CONTAINS
          CALL scf_env_density_mixing(scf_env%p_mix_new, &
                                      scf_env%mixing_store, rho_ao_kp, para_env, scf_env%iter_delta, scf_env%iter_count, &
                                      diis=diis_step)
+         IF (scf_env%mixing_store%dm_pulay .AND. scf_env%iter_method(1:6) == "P_Mix/") THEN
+            scf_env%iter_method = "P_Pul/"//scf_env%iter_method(7:)
+         END IF
       CASE (gspace_mixing_nr, pulay_mixing_nr, broyden_mixing_nr, modified_broyden_mixing_nr, &
             multisecant_mixing_nr, new_pulay_mixing_nr)
          ! Compute the difference p_out-p_in
