@@ -208,6 +208,7 @@ MODULE qs_scf
    USE qs_scf_diagonalization,          ONLY: do_general_diag_kp,&
                                               qs_scf_bloch_entropy,&
                                               qs_scf_free_operator_snapshot,&
+                                              qs_scf_free_symmetry_snapshot,&
                                               qs_scf_full_bloch_initialize,&
                                               qs_scf_full_bloch_save,&
                                               qs_scf_get_ot_kpoint_operator,&
@@ -3681,7 +3682,7 @@ CONTAINS
       COMPLEX(dp), INTENT(IN) :: initial_k(:, :, :, :), proposal_k(:, :, :, :)
 
       INTEGER :: pass, ih, nh, SEQUENCE, sample, ic, ispin, base, sign_index
-      REAL(dp) :: lambda, h(6), derivative(3), real_derivative, dot, f, eks
+      REAL(dp) :: lambda, h(6), derivative(3), adjoint_derivative(3), real_derivative, dot, f, eks
       LOGICAL :: valid
       COMPLEX(dp), ALLOCATABLE :: candidate(:, :, :, :)
       TYPE(dbcsr_p_type), POINTER :: ks(:, :), ref0(:, :), ref1(:, :), reference(:, :), direction_rs(:, :)
@@ -3727,6 +3728,11 @@ CONTAINS
          END DO
          IF (iw > 0) WRITE (iw, '(A,I4,4ES26.17E3)') &
             "F_DIAG_OPERATOR| base,real_KS,Bloch_KS,Bloch_core,Bloch_kinetic ", base, real_derivative, derivative
+         CALL qs_scf_free_symmetry_snapshot(qs_env, scf_env, initial_k, proposal_k, adjoint_derivative, &
+            TRIM(store%dm_trial_free_diag_file)//MERGE(".midpoint.bin.adjoint", ".input000.bin.adjoint", base == 1))
+         IF (iw > 0) WRITE (iw, '(A,I4,4ES26.17E3)') &
+            "F_DIAG_ADJOINT| base,real_KS,Bloch_symmetry_KS,Bloch_symmetry_core,Bloch_symmetry_kinetic ", &
+            base, real_derivative, adjoint_derivative
          IF (ABS(real_derivative - derivative(1)) > 1.0E-10_dp) &
             CALL cp_abort(__LOCATION__, "F diagnostic real/Bloch contraction mismatch")
          DO pass = 1, 2
