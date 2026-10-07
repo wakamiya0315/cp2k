@@ -97,6 +97,7 @@ MODULE qs_ot_types
       INTEGER           :: chebyshev_degree = 8
       INTEGER           :: fermi_low_rank_max_rank = 48
       LOGICAL           :: safer_diis = .FALSE.
+      LOGICAL           :: restore_constraint = .FALSE.
       REAL(KIND=dp)     :: ds_min = -1.0_dp
       REAL(KIND=dp)     :: energy_gap = -1.0_dp
       INTEGER           :: diis_m = -1
@@ -328,6 +329,7 @@ CONTAINS
       settings%line_search_method = "2PNT"
       settings%ds_min = 0.15_dp
       settings%safer_diis = .TRUE.
+      settings%restore_constraint = .FALSE.
       settings%energy_gap = 0.2_dp
       settings%eps_taylor = 1.0E-16_dp
       settings%max_taylor = 4
@@ -1706,6 +1708,7 @@ CONTAINS
          CPABORT("READ OTSCF MINIMIZER: Value unknown")
       END SELECT
       CALL section_vals_val_get(ot_section, "SAFER_DIIS", l_val=settings%safer_diis)
+      CALL section_vals_val_get(ot_section, "RESTORE_CONSTRAINT", l_val=settings%restore_constraint)
       CALL section_vals_val_get(ot_section, "LINESEARCH", i_val=ls_method)
       SELECT CASE (ls_method)
       CASE (ls_none)
@@ -1999,6 +2002,8 @@ CONTAINS
          IF (settings%ot_algorithm == 'TOD') THEN
             WRITE (output_unit, '(A,E14.5,T49,A,I14)') "  eps_taylor     :", settings%eps_taylor, &
                "  max_taylor     :", settings%max_taylor
+            IF (settings%restore_constraint) &
+               WRITE (output_unit, '(A)') "  (S C0)^T X = 0 restored after each minimizer update"
          END IF
          IF (settings%ot_algorithm == 'REF') THEN
             WRITE (output_unit, '(A,1X,A,T49,A,I14)') "  ortho_irac     :", settings%ortho_irac, &

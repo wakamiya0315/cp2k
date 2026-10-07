@@ -310,6 +310,14 @@ CONTAINS
       delta = qs_ot_env(1)%delta
       energy_only = qs_ot_env(1)%energy_only
 
+      ! optionally restore the constraint (S C0)^T X = 0 before the orbitals are built from X
+      IF (qs_ot_env(1)%settings%restore_constraint .AND. &
+          qs_ot_env(1)%settings%ot_algorithm == "TOD") THEN
+         DO ispin = 1, SIZE(qs_ot_env)
+            CALL ot_restore_constraint(qs_ot_env(ispin))
+         END DO
+      END IF
+
       ! generate the orbitals using the new matrix_x
       DO ispin = 1, SIZE(qs_ot_env)
          CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff_b=mo_coeff)
@@ -496,6 +504,25 @@ CONTAINS
       END IF
       CALL timestop(handle)
    END SUBROUTINE ot_scf_init
+
+! **************************************************************************************************
+!> \brief X <- X - C0 (S C0)^T X, the projection onto the constraint (S C0)^T X = 0 in the S metric.
+!>        C = C0 cos(U) + X sin(U)/U is S-orthonormal only on this constraint. The gradient
+!>        projection in qs_ot_get_derivative leaves a roundoff component along C0 that a FULL_ALL
+!>        step scales by 1/ENERGY_GAP; for all-electron core orbitals it accumulates over long runs.
+!>        Exact for C0^T S C0 = I, which ot_scf_init receives from orthonormalized orbitals.
+!> \param qs_ot_env ...
+! **************************************************************************************************
+   SUBROUTINE ot_restore_constraint(qs_ot_env)
+      TYPE(qs_ot_type)                                   :: qs_ot_env
+
+      TYPE(dbcsr_type)                                   :: kk
+
+      CALL dbcsr_copy(kk, qs_ot_env%matrix_p, name="ot_constraint_kk")
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env%matrix_sc0, qs_ot_env%matrix_x, 0.0_dp, kk)
+      CALL dbcsr_multiply('N', 'N', -1.0_dp, qs_ot_env%matrix_c0, kk, 1.0_dp, qs_ot_env%matrix_x)
+      CALL dbcsr_release(kk)
+   END SUBROUTINE ot_restore_constraint
 
 ! **************************************************************************************************
 !> \brief True if CP2K_SKALA_OT_METRIC_DIAG is set to a non-empty value. The report is a read-only
