@@ -63,10 +63,8 @@ MODULE qs_rho_atom_methods
                                               whittaker_ci
 
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, &
-!$                    omp_get_thread_num, &
-!$                    omp_lock_kind, &
-!$                    omp_init_lock, omp_set_lock, &
-!$                    omp_unset_lock, omp_destroy_lock
+!$                    omp_get_num_threads, &
+!$                    omp_get_thread_num
 
 #include "./base/base_uses.f90"
 
@@ -570,9 +568,9 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'calculate_rho_atom_coeff'
 
-      INTEGER :: bo(2), handle, i, iac, iatom, ibc, icol, ikind, img, irow, ispin, jatom, jkind, &
-         kac, katom, kbc, kkind, len_CPC, len_PC1, max_gau, max_nsgf, mepos, n_cont_a, n_cont_b, &
-         nat_kind, natom, nimages, nkind, nsoctot, nspins, num_pe
+      INTEGER :: bo(2), handle, i, iac, iatom, ibc, icol, ikind, img, irow, ispin, ithread, jatom, &
+         jkind, kac, katom, kbc, kkind, len_CPC, len_PC1, max_gau, max_nsgf, mepos, n_cont_a, &
+         n_cont_b, nat_kind, natom, nimages, nkind, nsoctot, nspins, nthread, num_pe
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: kind_of, nsatbas_kind
       INTEGER, DIMENSION(3)                              :: cell_b
       INTEGER, DIMENSION(:), POINTER                     :: a_list, list_a, list_b
@@ -594,10 +592,8 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
+      TYPE(rho_atom_coeff), ALLOCATABLE, DIMENSION(:, :) :: cpc_h_thread, cpc_s_thread
       TYPE(rho_atom_coeff), DIMENSION(:), POINTER        :: p_block_spin
-
-!$    INTEGER(kind=omp_lock_kind), ALLOCATABLE, DIMENSION(:) :: locks
-!$    INTEGER                                            :: lock, number_of_locks
 
       CALL timeset(routineN, handle)
 
@@ -686,11 +682,12 @@ CONTAINS
 !$OMP                 , nspins, rho_ao                    &
 !$OMP                 , nkind, qs_kind_set                &
 !$OMP                 , oce, eps_cpc                      &
-!$OMP                 , rho_atom_set                      &
-!$OMP                 , natom, locks, number_of_locks     &
+!$OMP                 , rho_atom_set, natom               &
 !$OMP                 , paw_kind, nsatbas_kind, has_intac &
 !$OMP                 )                                   &
 !$OMP          PRIVATE( p_block_spin, ispin               &
+!$OMP                 , cpc_h_thread, cpc_s_thread        &
+!$OMP                 , ithread, nthread                  &
 !$OMP                 , p_matrix, proj_work1, proj_work2  &
 !$OMP                 , mepos                             &
 !$OMP                 , ikind, jkind, iatom, jatom        &
@@ -712,16 +709,24 @@ CONTAINS
       ALLOCATE (p_matrix(max_nsgf, max_nsgf))
       ALLOCATE (proj_work1(len_PC1), proj_work2(len_CPC))
 
-!$OMP SINGLE
-!$    number_of_locks = nspins*natom
-!$    ALLOCATE (locks(number_of_locks))
-!$OMP END SINGLE
-
-!$OMP DO
-!$    DO lock = 1, number_of_locks
-!$       call omp_init_lock(locks(lock))
-!$    END DO
-!$OMP END DO
+      ! Each thread adds its projections to private copies of the one-center density matrices,
+      ! which are summed in thread order after the loop: no thread waits for another, and the
+      ! result does not depend on their timing. With one thread the sums are those of a direct
+      ! accumulation.
+      ALLOCATE (cpc_h_thread(nspins, natom), cpc_s_thread(nspins, natom))
+      DO katom = 1, natom
+         DO ispin = 1, nspins
+            NULLIFY (cpc_h_thread(ispin, katom)%r_coef, cpc_s_thread(ispin, katom)%r_coef)
+            IF (.NOT. ASSOCIATED(rho_atom_set(katom)%cpc_h)) CYCLE
+            IF (.NOT. ASSOCIATED(rho_atom_set(katom)%cpc_h(ispin)%r_coef)) CYCLE
+            ALLOCATE (cpc_h_thread(ispin, katom)%r_coef, &
+                      MOLD=rho_atom_set(katom)%cpc_h(ispin)%r_coef)
+            ALLOCATE (cpc_s_thread(ispin, katom)%r_coef, &
+                      MOLD=rho_atom_set(katom)%cpc_s(ispin)%r_coef)
+            cpc_h_thread(ispin, katom)%r_coef = 0.0_dp
+            cpc_s_thread(ispin, katom)%r_coef = 0.0_dp
+         END DO
+      END DO
 
       mepos = 0
 !$    mepos = omp_get_thread_num()
@@ -826,10 +831,9 @@ CONTAINS
                         factor = 1.0_dp
                         IF (iatom == jatom) factor = 0.5_dp
 
-                        r_coef_h => rho_atom_set(katom)%cpc_h(ispin)%r_coef
-                        r_coef_s => rho_atom_set(katom)%cpc_s(ispin)%r_coef
+                        r_coef_h => cpc_h_thread(ispin, katom)%r_coef
+                        r_coef_s => cpc_s_thread(ispin, katom)%r_coef
 
-!$                      CALL omp_set_lock(locks((katom - 1)*nspins + ispin))
                         IF (iatom <= jatom) THEN
                            CALL proj_blk(C_coeff_hh_a, C_coeff_ss_a, n_cont_a, &
                                          C_coeff_hh_b, C_coeff_ss_b, n_cont_b, &
@@ -841,7 +845,6 @@ CONTAINS
                                          p_matrix, max_nsgf, r_coef_h, r_coef_s, nsoctot, &
                                          len_PC1, len_CPC, factor, distab, proj_work1, proj_work2)
                         END IF
-!$                      CALL omp_unset_lock(locks((katom - 1)*nspins + ispin))
 
                      END DO
                      EXIT !search loop over jatom-katom list
@@ -850,17 +853,31 @@ CONTAINS
             END DO
          END DO
       END DO
-      ! Wait for all threads to finish the loop before locks can be freed
-!$OMP BARRIER
-
-!$OMP DO
-!$    DO lock = 1, number_of_locks
-!$       call omp_destroy_lock(locks(lock))
-!$    END DO
+      nthread = 1
+!$    nthread = omp_get_num_threads()
+!$OMP DO ORDERED SCHEDULE(STATIC, 1)
+      DO ithread = 1, nthread
+!$OMP ORDERED
+         DO katom = 1, natom
+            DO ispin = 1, nspins
+               IF (.NOT. ASSOCIATED(cpc_h_thread(ispin, katom)%r_coef)) CYCLE
+               rho_atom_set(katom)%cpc_h(ispin)%r_coef = rho_atom_set(katom)%cpc_h(ispin)%r_coef + &
+                                                         cpc_h_thread(ispin, katom)%r_coef
+               rho_atom_set(katom)%cpc_s(ispin)%r_coef = rho_atom_set(katom)%cpc_s(ispin)%r_coef + &
+                                                         cpc_s_thread(ispin, katom)%r_coef
+            END DO
+         END DO
+!$OMP END ORDERED
+      END DO
 !$OMP END DO
-!$OMP SINGLE
-!$    DEALLOCATE (locks)
-!$OMP END SINGLE NOWAIT
+      DO katom = 1, natom
+         DO ispin = 1, nspins
+            IF (ASSOCIATED(cpc_h_thread(ispin, katom)%r_coef)) THEN
+               DEALLOCATE (cpc_h_thread(ispin, katom)%r_coef, cpc_s_thread(ispin, katom)%r_coef)
+            END IF
+         END DO
+      END DO
+      DEALLOCATE (cpc_h_thread, cpc_s_thread)
 
       DEALLOCATE (p_block_spin, p_matrix, proj_work1, proj_work2)
 !$OMP END PARALLEL

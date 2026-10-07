@@ -25,6 +25,8 @@ MODULE qs_vxc_atom_utils
    USE qs_kind_types,                   ONLY: has_nlcc
    USE qs_rho_atom_types,               ONLY: rho_atom_coeff,&
                                               rho_atom_type
+!$ USE OMP_LIB, ONLY: omp_get_num_threads, &
+!$                    omp_get_thread_num
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -433,10 +435,11 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'calc_tau_atom'
 
-      INTEGER                                            :: dir, handle, ia, ibas, igrid, ir, ispin, &
-                                                            na, nbas, ngrid, nr
-      REAL(dp)                                           :: tau_sum
+      INTEGER                                            :: dir, handle, ia, ibas, igrid0, ihs, &
+                                                            ir, ispin, na, nbas, ngrid, nr
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: tau_sum
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: work
+      REAL(dp), DIMENSION(:, :), POINTER                 :: cpc
 
       CALL timeset(routineN, handle)
 
@@ -450,47 +453,45 @@ CONTAINS
       na = tau_cache%na
       nbas = tau_cache%nsatbas
       ngrid = na*nr
-      ALLOCATE (work(ngrid, nbas))
 
+      ! tau = 1/2 sum_ij P_ij grad(phi_i) . grad(phi_j), shell by shell: the threads take radial
+      ! shells, multiply the gradients of the shell by the density matrix and sum the products
+      ! over the basis functions.
       DO ispin = 1, nspins
-         DO dir = 1, 3
-            CALL dgemm('N', 'T', ngrid, nbas, nbas, 0.5_dp, tau_cache%grad(:, :, dir), &
-                       ngrid, rho_atom%cpc_h(ispin)%r_coef, nbas, 0.0_dp, work, ngrid)
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(2) SCHEDULE(STATIC) &
-!$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, tau_h, work) &
-!$OMP PRIVATE(ia, ibas, igrid, ir, tau_sum)
+         DO ihs = 1, 2
+            IF (ihs == 1) THEN
+               cpc => rho_atom%cpc_h(ispin)%r_coef
+            ELSE
+               cpc => rho_atom%cpc_s(ispin)%r_coef
+            END IF
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(cpc, ihs, ispin, na, nbas, ngrid, nr, tau_cache, tau_h, tau_s) &
+!$OMP PRIVATE(dir, ia, ibas, igrid0, ir, tau_sum, work)
+            ALLOCATE (tau_sum(na), work(na, nbas))
+!$OMP DO SCHEDULE(STATIC)
             DO ir = 1, nr
-               DO ia = 1, na
-                  igrid = ia + (ir - 1)*na
-                  tau_sum = 0.0_dp
+               igrid0 = (ir - 1)*na
+               tau_sum = 0.0_dp
+               DO dir = 1, 3
+                  CALL dgemm('N', 'T', na, nbas, nbas, 0.5_dp, tau_cache%grad(igrid0 + 1, 1, dir), &
+                             ngrid, cpc, nbas, 0.0_dp, work, na)
                   DO ibas = 1, nbas
-                     tau_sum = tau_sum + tau_cache%grad(igrid, ibas, dir)*work(igrid, ibas)
+                     DO ia = 1, na
+                        tau_sum(ia) = tau_sum(ia) + tau_cache%grad(igrid0 + ia, ibas, dir)*work(ia, ibas)
+                     END DO
                   END DO
-                  tau_h(ia, ir, ispin) = tau_h(ia, ir, ispin) + tau_sum
                END DO
+               IF (ihs == 1) THEN
+                  tau_h(1:na, ir, ispin) = tau_sum
+               ELSE
+                  tau_s(1:na, ir, ispin) = tau_sum
+               END IF
             END DO
-!$OMP END PARALLEL DO
-
-            CALL dgemm('N', 'T', ngrid, nbas, nbas, 0.5_dp, tau_cache%grad(:, :, dir), &
-                       ngrid, rho_atom%cpc_s(ispin)%r_coef, nbas, 0.0_dp, work, ngrid)
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(2) SCHEDULE(STATIC) &
-!$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, tau_s, work) &
-!$OMP PRIVATE(ia, ibas, igrid, ir, tau_sum)
-            DO ir = 1, nr
-               DO ia = 1, na
-                  igrid = ia + (ir - 1)*na
-                  tau_sum = 0.0_dp
-                  DO ibas = 1, nbas
-                     tau_sum = tau_sum + tau_cache%grad(igrid, ibas, dir)*work(igrid, ibas)
-                  END DO
-                  tau_s(ia, ir, ispin) = tau_s(ia, ir, ispin) + tau_sum
-               END DO
-            END DO
-!$OMP END PARALLEL DO
+!$OMP END DO
+            DEALLOCATE (tau_sum, work)
+!$OMP END PARALLEL
          END DO
       END DO
-
-      DEALLOCATE (work)
 
       CALL timestop(handle)
 
@@ -740,7 +741,13 @@ CONTAINS
    END SUBROUTINE gaVxcgb_noGC
 
 ! **************************************************************************************************
-!> \brief ...
+!> \brief One-center XC matrix elements of a gradient-corrected potential: the integrals of the
+!>        density potential vxc and of the gradient potential vxg against products of primitive
+!>        Gaussians, added to int_hh and int_ss.
+!> \details For every pair of primitives the radial integrals with the potentials are matrix
+!>          products, (na x nr) potentials times (nr x l) radial functions. They are formed for all
+!>          pairs at once and split over the threads by columns; the angular contractions with the
+!>          Clebsch-Gordan coefficients follow pair by pair as before.
 !> \param vxc_h ...
 !> \param vxc_s ...
 !> \param vxg_h ...
@@ -765,18 +772,17 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'gaVxcgb_GC'
 
-      INTEGER :: dmax_iso_not0_local, handle, ia, ic, icg, ipgf1, ipgf2, ir, iset1, iset2, iso, &
-         iso1, iso2, ispin, l, lmax12, lmax_expansion, lmin12, m1, m2, max_iso_not0, &
-         max_iso_not0_local, max_s_harm, maxl, maxso, n1, n2, na, ngau1, ngau2, nngau1, nr, nset, &
-         size1
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cg_n_list, dcg_n_list
+      INTEGER :: col, col_count, col_first, col_last, dmax_iso_not0_local, handle, ia, ic, icg, &
+         idir, ipair, ipgf1, ipgf2, ir, iset1, iset2, iso, iso1, iso2, ispin, ithread, l, lmax12, &
+         lmax_expansion, lmin12, m1, m2, max_iso_not0, max_iso_not0_local, max_s_harm, maxl, &
+         maxso, n1, n2, na, ngau1, ngau2, nngau1, npair, nr, nset, nthread, size1
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cg_n_list, dcg_n_list, pair_col
       INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: cg_list, dcg_list
       INTEGER, DIMENSION(:), POINTER                     :: lmax, lmin, npgf
-      REAL(dp)                                           :: urad
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: g1, g2
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: dgg, gg, gVXCg_h, gVXCg_s, matso_h, &
-                                                            matso_s
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: gVXGg_h, gVXGg_s
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: dgg, gg, matso_h, matso_s, radial, radial_d, &
+         radial_u, vxc_grad_h, vxc_grad_s, xc_h, xc_s
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: vxg_comp_h, vxg_comp_s, xg_h, xg_s
       REAL(dp), DIMENSION(:, :), POINTER                 :: zet
       REAL(dp), DIMENSION(:, :, :), POINTER              :: my_CG
       REAL(dp), DIMENSION(:, :, :, :), POINTER           :: my_CG_dxyz
@@ -798,18 +804,131 @@ CONTAINS
       max_s_harm = harmonics%max_s_harm
 
       ALLOCATE (g1(nr), g2(nr), gg(nr, 0:2*maxl), dgg(nr, 0:2*maxl))
-      ALLOCATE (gVXCg_h(na, 0:2*maxl), gVXCg_s(na, 0:2*maxl))
-      ALLOCATE (gVXGg_h(3, na, 0:2*maxl), gVXGg_s(3, na, 0:2*maxl))
       ALLOCATE (cg_list(2, nsoset(maxl)**2, max_s_harm), cg_n_list(max_s_harm), &
                 dcg_list(2, nsoset(maxl)**2, max_s_harm), dcg_n_list(max_s_harm))
-
       ALLOCATE (matso_h(nsoset(maxl), nsoset(maxl)), &
                 matso_s(nsoset(maxl), nsoset(maxl)))
 
-      DO ispin = 1, nspins
+      ! Radial functions of all primitive pairs as columns: the products of the two Gaussians
+      ! times r**l (radial), their radial derivative factors (radial_d) and the same divided by
+      ! r**2 (radial_u). pair_col(ipair) is the column of l = lmin12 of the pair, 0 if the pair
+      ! lies above the expansion of the local densities.
+      npair = 0
+      DO iset1 = 1, nset
+         DO iset2 = 1, nset
+            npair = npair + npgf(iset1)*npgf(iset2)
+         END DO
+      END DO
+      ALLOCATE (pair_col(npair))
+      col_count = 0
+      ipair = 0
+      DO iset1 = 1, nset
+         DO iset2 = 1, nset
+            DO ipgf1 = 1, npgf(iset1)
+               DO ipgf2 = 1, npgf(iset2)
+                  ipair = ipair + 1
+                  pair_col(ipair) = 0
+                  lmin12 = lmin(iset1) + lmin(iset2)
+                  IF (lmin12 > lmax_expansion) CYCLE
+                  lmax12 = MIN(lmax(iset1) + lmax(iset2), lmax_expansion)
+                  pair_col(ipair) = col_count + 1
+                  col_count = col_count + lmax12 - lmin12 + 1
+               END DO
+            END DO
+         END DO
+      END DO
+      ALLOCATE (radial(nr, col_count), radial_d(nr, col_count), radial_u(nr, col_count))
+      ipair = 0
+      DO iset1 = 1, nset
+         DO iset2 = 1, nset
+            DO ipgf1 = 1, npgf(iset1)
+               g1(1:nr) = EXP(-zet(ipgf1, iset1)*grid_atom%rad2(1:nr))
+               DO ipgf2 = 1, npgf(iset2)
+                  ipair = ipair + 1
+                  IF (pair_col(ipair) == 0) CYCLE
+                  g2(1:nr) = EXP(-zet(ipgf2, iset2)*grid_atom%rad2(1:nr))
+                  lmin12 = lmin(iset1) + lmin(iset2)
+                  lmax12 = MIN(lmax(iset1) + lmax(iset2), lmax_expansion)
+                  gg = 0.0_dp
+                  dgg = 0.0_dp
+                  IF (lmin12 == 0) THEN
+                     gg(1:nr, lmin12) = g1(1:nr)*g2(1:nr)
+                  ELSE
+                     gg(1:nr, lmin12) = grid_atom%rad2l(1:nr, lmin12)*g1(1:nr)*g2(1:nr)
+                  END IF
+                  DO l = lmin12 + 1, lmax12
+                     gg(1:nr, l) = grid_atom%rad(1:nr)*gg(:, l - 1)
+                     dgg(1:nr, l - 1) = dgg(1:nr, l - 1) - 2.0_dp*(zet(ipgf1, iset1) + &
+                                                                   zet(ipgf2, iset2))*gg(1:nr, l)
+                  END DO
+                  dgg(1:nr, lmax12) = dgg(1:nr, lmax12) - 2.0_dp*(zet(ipgf1, iset1) + &
+                                                                  zet(ipgf2, iset2))*grid_atom%rad(1:nr)* &
+                                      gg(1:nr, lmax12)
+                  DO l = lmin12, lmax12
+                     col = pair_col(ipair) + l - lmin12
+                     radial(:, col) = gg(:, l)
+                     radial_d(:, col) = dgg(:, l)
+                     radial_u(:, col) = gg(:, l)*grid_atom%oorad2l(:, 1)
+                  END DO
+               END DO
+            END DO
+         END DO
+      END DO
 
-         g1 = 0.0_dp
-         g2 = 0.0_dp
+      ALLOCATE (vxc_grad_h(na, nr), vxc_grad_s(na, nr), vxg_comp_h(na, nr, 3), &
+                vxg_comp_s(na, nr, 3), xc_h(na, col_count), xc_s(na, col_count), &
+                xg_h(na, col_count, 3), xg_s(na, col_count, 3))
+
+      DO ispin = 1, nspins
+         ! The gradient potential along the radial direction (vxg . a) and its components
+         DO ir = 1, nr
+            DO ia = 1, na
+               vxc_grad_h(ia, ir) = vxg_h(1, ia, ir, ispin)*harmonics%a(1, ia) + &
+                                    vxg_h(2, ia, ir, ispin)*harmonics%a(2, ia) + &
+                                    vxg_h(3, ia, ir, ispin)*harmonics%a(3, ia)
+               vxc_grad_s(ia, ir) = vxg_s(1, ia, ir, ispin)*harmonics%a(1, ia) + &
+                                    vxg_s(2, ia, ir, ispin)*harmonics%a(2, ia) + &
+                                    vxg_s(3, ia, ir, ispin)*harmonics%a(3, ia)
+               DO idir = 1, 3
+                  vxg_comp_h(ia, ir, idir) = vxg_h(idir, ia, ir, ispin)
+                  vxg_comp_s(ia, ir, idir) = vxg_s(idir, ia, ir, ispin)
+               END DO
+            END DO
+         END DO
+
+         ! Radial integrals for all pairs: xc = vxc radial + (vxg . a) radial_d and
+         ! xg_d = vxg_d radial_u, with the columns shared out to the threads.
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(col_count, ispin, na, nr, radial, radial_d, radial_u, vxc_grad_h, vxc_grad_s, &
+!$OMP        vxc_h, vxc_s, vxg_comp_h, vxg_comp_s, xc_h, xc_s, xg_h, xg_s) &
+!$OMP PRIVATE(col_first, col_last, idir, ithread, nthread)
+         nthread = 1
+         ithread = 0
+!$       nthread = omp_get_num_threads()
+!$       ithread = omp_get_thread_num()
+         col_first = (col_count*ithread)/nthread + 1
+         col_last = (col_count*(ithread + 1))/nthread
+         IF (col_last >= col_first) THEN
+            CALL dgemm('N', 'N', na, col_last - col_first + 1, nr, 1.0_dp, vxc_h(:, :, ispin), &
+                       na, radial(:, col_first), nr, 0.0_dp, xc_h(:, col_first), na)
+            CALL dgemm('N', 'N', na, col_last - col_first + 1, nr, 1.0_dp, vxc_grad_h, na, &
+                       radial_d(:, col_first), nr, 1.0_dp, xc_h(:, col_first), na)
+            CALL dgemm('N', 'N', na, col_last - col_first + 1, nr, 1.0_dp, vxc_s(:, :, ispin), &
+                       na, radial(:, col_first), nr, 0.0_dp, xc_s(:, col_first), na)
+            CALL dgemm('N', 'N', na, col_last - col_first + 1, nr, 1.0_dp, vxc_grad_s, na, &
+                       radial_d(:, col_first), nr, 1.0_dp, xc_s(:, col_first), na)
+            DO idir = 1, 3
+               CALL dgemm('N', 'N', na, col_last - col_first + 1, nr, 1.0_dp, &
+                          vxg_comp_h(:, :, idir), na, radial_u(:, col_first), nr, 0.0_dp, &
+                          xg_h(:, col_first, idir), na)
+               CALL dgemm('N', 'N', na, col_last - col_first + 1, nr, 1.0_dp, &
+                          vxg_comp_s(:, :, idir), na, radial_u(:, col_first), nr, 0.0_dp, &
+                          xg_s(:, col_first, idir), na)
+            END DO
+         END IF
+!$OMP END PARALLEL
+
+         ipair = 0
          m1 = 0
          DO iset1 = 1, nset
             n1 = nsoset(lmax(iset1))
@@ -827,90 +946,15 @@ CONTAINS
                   size1 = nsoset(lmax(iset1)) - nsoset(lmin(iset1) - 1)
                   nngau1 = nsoset(lmin(iset1) - 1) + ngau1
 
-                  g1(1:nr) = EXP(-zet(ipgf1, iset1)*grid_atom%rad2(1:nr))
                   DO ipgf2 = 1, npgf(iset2)
                      ngau2 = n2*(ipgf2 - 1) + m2
-
-                     g2(1:nr) = EXP(-zet(ipgf2, iset2)*grid_atom%rad2(1:nr))
+                     ipair = ipair + 1
                      lmin12 = lmin(iset1) + lmin(iset2)
-                     lmax12 = lmax(iset1) + lmax(iset2)
 
                      !test reduce expansion local densities
                      IF (lmin12 <= lmax_expansion) THEN
-
-                        gg = 0.0_dp
-                        dgg = 0.0_dp
-
-                        IF (lmin12 == 0) THEN
-                           gg(1:nr, lmin12) = g1(1:nr)*g2(1:nr)
-                        ELSE
-                           gg(1:nr, lmin12) = grid_atom%rad2l(1:nr, lmin12)*g1(1:nr)*g2(1:nr)
-                        END IF
-
-                        !test reduce expansion local densities
-                        IF (lmax12 > lmax_expansion) lmax12 = lmax_expansion
-
-                        DO l = lmin12 + 1, lmax12
-                           gg(1:nr, l) = grid_atom%rad(1:nr)*gg(:, l - 1)
-                           dgg(1:nr, l - 1) = dgg(1:nr, l - 1) - 2.0_dp*(zet(ipgf1, iset1) + &
-                                                                         zet(ipgf2, iset2))*gg(1:nr, l)
-                        END DO
-                        dgg(1:nr, lmax12) = dgg(1:nr, lmax12) - 2.0_dp*(zet(ipgf1, iset1) + &
-                                                                        zet(ipgf2, iset2))*grid_atom%rad(1:nr)* &
-                                            gg(1:nr, lmax12)
-
-                        gVXCg_h = 0.0_dp
-                        gVXCg_s = 0.0_dp
-                        gVXGg_h = 0.0_dp
-                        gVXGg_s = 0.0_dp
-
-                        ! Cross Term
-                        DO l = lmin12, lmax12
-                           DO ia = 1, na
-                              DO ir = 1, nr
-                                 gVXCg_h(ia, l) = gVXCg_h(ia, l) + &
-                                                  gg(ir, l)*vxc_h(ia, ir, ispin) + &
-                                                  dgg(ir, l)* &
-                                                  (vxg_h(1, ia, ir, ispin)*harmonics%a(1, ia) + &
-                                                   vxg_h(2, ia, ir, ispin)*harmonics%a(2, ia) + &
-                                                   vxg_h(3, ia, ir, ispin)*harmonics%a(3, ia))
-
-                                 gVXCg_s(ia, l) = gVXCg_s(ia, l) + &
-                                                  gg(ir, l)*vxc_s(ia, ir, ispin) + &
-                                                  dgg(ir, l)* &
-                                                  (vxg_s(1, ia, ir, ispin)*harmonics%a(1, ia) + &
-                                                   vxg_s(2, ia, ir, ispin)*harmonics%a(2, ia) + &
-                                                   vxg_s(3, ia, ir, ispin)*harmonics%a(3, ia))
-
-                                 urad = grid_atom%oorad2l(ir, 1)
-
-                                 gVXGg_h(1, ia, l) = gVXGg_h(1, ia, l) + &
-                                                     vxg_h(1, ia, ir, ispin)* &
-                                                     gg(ir, l)*urad
-
-                                 gVXGg_h(2, ia, l) = gVXGg_h(2, ia, l) + &
-                                                     vxg_h(2, ia, ir, ispin)* &
-                                                     gg(ir, l)*urad
-
-                                 gVXGg_h(3, ia, l) = gVXGg_h(3, ia, l) + &
-                                                     vxg_h(3, ia, ir, ispin)* &
-                                                     gg(ir, l)*urad
-
-                                 gVXGg_s(1, ia, l) = gVXGg_s(1, ia, l) + &
-                                                     vxg_s(1, ia, ir, ispin)* &
-                                                     gg(ir, l)*urad
-
-                                 gVXGg_s(2, ia, l) = gVXGg_s(2, ia, l) + &
-                                                     vxg_s(2, ia, ir, ispin)* &
-                                                     gg(ir, l)*urad
-
-                                 gVXGg_s(3, ia, l) = gVXGg_s(3, ia, l) + &
-                                                     vxg_s(3, ia, ir, ispin)* &
-                                                     gg(ir, l)*urad
-
-                              END DO ! ir
-                           END DO ! ia
-                        END DO ! l
+                        ! column of l in xc and xg
+                        col = pair_col(ipair) - lmin12
 
                         matso_h = 0.0_dp
                         matso_s = 0.0_dp
@@ -925,19 +969,15 @@ CONTAINS
                               CPASSERT(l <= lmax_expansion)
                               DO ia = 1, na
                                  matso_h(iso1, iso2) = matso_h(iso1, iso2) + &
-                                                       gVXCg_h(ia, l)* &
+                                                       xc_h(ia, col + l)* &
                                                        harmonics%slm(ia, iso)* &
                                                        my_CG(iso1, iso2, iso)
                                  matso_s(iso1, iso2) = matso_s(iso1, iso2) + &
-                                                       gVXCg_s(ia, l)* &
+                                                       xc_s(ia, col + l)* &
                                                        harmonics%slm(ia, iso)* &
                                                        my_CG(iso1, iso2, iso)
                               END DO ! ia
-
-                              !test reduce expansion local densities
-
                            END DO
-
                         END DO ! iso
 
                         DO iso = 1, dmax_iso_not0_local
@@ -950,24 +990,20 @@ CONTAINS
                               CPASSERT(l <= lmax_expansion)
                               DO ia = 1, na
                                  matso_h(iso1, iso2) = matso_h(iso1, iso2) + &
-                                                       (gVXGg_h(1, ia, l)*my_CG_dxyz(1, iso1, iso2, iso) + &
-                                                        gVXGg_h(2, ia, l)*my_CG_dxyz(2, iso1, iso2, iso) + &
-                                                        gVXGg_h(3, ia, l)*my_CG_dxyz(3, iso1, iso2, iso))* &
+                                                       (xg_h(ia, col + l, 1)*my_CG_dxyz(1, iso1, iso2, iso) + &
+                                                        xg_h(ia, col + l, 2)*my_CG_dxyz(2, iso1, iso2, iso) + &
+                                                        xg_h(ia, col + l, 3)*my_CG_dxyz(3, iso1, iso2, iso))* &
                                                        harmonics%slm(ia, iso)
 
                                  matso_s(iso1, iso2) = matso_s(iso1, iso2) + &
-                                                       (gVXGg_s(1, ia, l)*my_CG_dxyz(1, iso1, iso2, iso) + &
-                                                        gVXGg_s(2, ia, l)*my_CG_dxyz(2, iso1, iso2, iso) + &
-                                                        gVXGg_s(3, ia, l)*my_CG_dxyz(3, iso1, iso2, iso))* &
+                                                       (xg_s(ia, col + l, 1)*my_CG_dxyz(1, iso1, iso2, iso) + &
+                                                        xg_s(ia, col + l, 2)*my_CG_dxyz(2, iso1, iso2, iso) + &
+                                                        xg_s(ia, col + l, 3)*my_CG_dxyz(3, iso1, iso2, iso))* &
                                                        harmonics%slm(ia, iso)
 
                               END DO ! ia
-
-                              !test reduce expansion local densities
-
                            END DO ! icg
                         END DO ! iso
-                        !test reduce expansion local densities
                      END IF ! lmax_expansion
 
                      !  Write in the global matrix
@@ -988,7 +1024,8 @@ CONTAINS
          END DO ! iset1
       END DO ! ispin
 
-      DEALLOCATE (g1, g2, gg, dgg, matso_h, matso_s, gVXCg_h, gVXCg_s, gVXGg_h, gVXGg_s)
+      DEALLOCATE (g1, g2, gg, dgg, matso_h, matso_s, radial, radial_d, radial_u, pair_col)
+      DEALLOCATE (vxc_grad_h, vxc_grad_s, vxg_comp_h, vxg_comp_s, xc_h, xc_s, xg_h, xg_s)
       DEALLOCATE (cg_list, cg_n_list, dcg_list, dcg_n_list)
 
       CALL timestop(handle)
@@ -1015,10 +1052,12 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'dgaVtaudgb'
 
-      INTEGER                                            :: dir, handle, ia, ibas, igrid, iold, ir, &
-                                                            ispin, jbas, jold, max_old_basis, na, &
-                                                            nbas, ngrid, nr
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: int_h, int_s, weighted_grad
+      INTEGER                                            :: dir, handle, ia, ibas, igrid0, iold, &
+                                                            ir, ispin, ithread, jbas, jold, &
+                                                            max_old_basis, na, nbas, ngrid, nr, &
+                                                            nthread
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: int_h, int_h_local, int_s, &
+                                                            int_s_local, weighted_grad
 
       CALL timeset(routineN, handle)
 
@@ -1030,7 +1069,7 @@ CONTAINS
       nbas = tau_cache%nsatbas
       ngrid = na*nr
       max_old_basis = MAXVAL(tau_cache%n2oindex)
-      ALLOCATE (int_h(nbas, nbas), int_s(nbas, nbas), weighted_grad(ngrid, nbas))
+      ALLOCATE (int_h(nbas, nbas), int_s(nbas, nbas))
 
       DO ispin = 1, nspins
          CPASSERT(SIZE(int_hh(ispin)%r_coef, 1) >= max_old_basis)
@@ -1039,39 +1078,50 @@ CONTAINS
          CPASSERT(SIZE(int_ss(ispin)%r_coef, 2) >= max_old_basis)
          int_h = 0.0_dp
          int_s = 0.0_dp
-         DO dir = 1, 3
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(3) SCHEDULE(STATIC) &
-!$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, vtau_h, weighted_grad) &
-!$OMP PRIVATE(ia, ibas, igrid, ir)
-            DO ibas = 1, nbas
-               DO ir = 1, nr
+         ! The threads take radial shells and sum their integrals in private matrices, which
+         ! are added in thread order.
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(int_h, int_s, ispin, na, nbas, ngrid, nr, tau_cache, vtau_h, vtau_s) &
+!$OMP PRIVATE(dir, ia, ibas, igrid0, int_h_local, int_s_local, ir, ithread, nthread, &
+!$OMP         weighted_grad)
+         nthread = 1
+!$       nthread = omp_get_num_threads()
+         ALLOCATE (int_h_local(nbas, nbas), int_s_local(nbas, nbas), weighted_grad(na, nbas))
+         int_h_local = 0.0_dp
+         int_s_local = 0.0_dp
+!$OMP DO SCHEDULE(STATIC)
+         DO ir = 1, nr
+            igrid0 = (ir - 1)*na
+            DO dir = 1, 3
+               DO ibas = 1, nbas
                   DO ia = 1, na
-                     igrid = ia + (ir - 1)*na
-                     weighted_grad(igrid, ibas) = vtau_h(ia, ir, ispin)* &
-                                                  tau_cache%grad(igrid, ibas, dir)
+                     weighted_grad(ia, ibas) = vtau_h(ia, ir, ispin)* &
+                                               tau_cache%grad(igrid0 + ia, ibas, dir)
                   END DO
                END DO
-            END DO
-!$OMP END PARALLEL DO
-            CALL dgemm('T', 'N', nbas, nbas, ngrid, 0.5_dp, tau_cache%grad(:, :, dir), &
-                       ngrid, weighted_grad, ngrid, 1.0_dp, int_h, nbas)
-
-!$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(3) SCHEDULE(STATIC) &
-!$OMP SHARED(dir, ispin, na, nbas, nr, tau_cache, vtau_s, weighted_grad) &
-!$OMP PRIVATE(ia, ibas, igrid, ir)
-            DO ibas = 1, nbas
-               DO ir = 1, nr
+               CALL dgemm('T', 'N', nbas, nbas, na, 0.5_dp, tau_cache%grad(igrid0 + 1, 1, dir), &
+                          ngrid, weighted_grad, na, 1.0_dp, int_h_local, nbas)
+               DO ibas = 1, nbas
                   DO ia = 1, na
-                     igrid = ia + (ir - 1)*na
-                     weighted_grad(igrid, ibas) = vtau_s(ia, ir, ispin)* &
-                                                  tau_cache%grad(igrid, ibas, dir)
+                     weighted_grad(ia, ibas) = vtau_s(ia, ir, ispin)* &
+                                               tau_cache%grad(igrid0 + ia, ibas, dir)
                   END DO
                END DO
+               CALL dgemm('T', 'N', nbas, nbas, na, 0.5_dp, tau_cache%grad(igrid0 + 1, 1, dir), &
+                          ngrid, weighted_grad, na, 1.0_dp, int_s_local, nbas)
             END DO
-!$OMP END PARALLEL DO
-            CALL dgemm('T', 'N', nbas, nbas, ngrid, 0.5_dp, tau_cache%grad(:, :, dir), &
-                       ngrid, weighted_grad, ngrid, 1.0_dp, int_s, nbas)
          END DO
+!$OMP END DO
+!$OMP DO ORDERED SCHEDULE(STATIC, 1)
+         DO ithread = 1, nthread
+!$OMP ORDERED
+            int_h = int_h + int_h_local
+            int_s = int_s + int_s_local
+!$OMP END ORDERED
+         END DO
+!$OMP END DO
+         DEALLOCATE (int_h_local, int_s_local, weighted_grad)
+!$OMP END PARALLEL
 
 !$OMP PARALLEL DO DEFAULT(NONE) COLLAPSE(2) SCHEDULE(STATIC) &
 !$OMP SHARED(int_h, int_hh, int_s, int_ss, ispin, nbas, tau_cache) &
@@ -1089,7 +1139,7 @@ CONTAINS
 !$OMP END PARALLEL DO
       END DO
 
-      DEALLOCATE (int_h, int_s, weighted_grad)
+      DEALLOCATE (int_h, int_s)
 
       CALL timestop(handle)
 
