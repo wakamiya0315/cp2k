@@ -960,16 +960,16 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_DIAGNOSTICS", &
-                          description="Diagnose input, output and trial density matrices after Pulay mixing o"// &
-                          "n one MPI rank.", &
+                          description="Diagnose input, output and trial density matrices after Pulay "// &
+                          "mixing on one MPI rank.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_REJECT", &
-                          description="Reject nonfinite trials, wrong charge and occupation eigenvalues outsi"// &
-                          "de the physical interval. Reset history and use one convex linear step"// &
-                          " for both spins.", &
+                          description="Reject nonfinite trials, wrong charge and occupation eigenvalues "// &
+                          "outside the physical interval. Reset history and use one convex linear "// &
+                          "step for both spins.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)

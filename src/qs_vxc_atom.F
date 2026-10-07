@@ -313,16 +313,14 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'calculate_vxc_atom'
 
-      INTEGER :: adjoint_bin, adjoint_entry, adjoint_nbins, adjoint_nchannels, &
-         adjoint_tile_count(3), adjoint_tile_lower(3), adjoint_tile_upper(3), &
-         atom_composite_components, bo(2), &
-         composite_image_periodicity(3), composite_local_atom, composite_local_natom, &
-         composite_nflat, composite_pw_nflat, composite_row, &
-         gapw_density_partition, gapw_representation, handle, ia, iat, iatom, icomponent, idir, &
-         ikind, ir, ispin, iw, jdir, myfun, na, natom, nr, nspins
-      INTEGER :: adjoint_handle, adjoint_threads, composite_row_rank, nlcc_entry, nlcc_first, &
-                 nlcc_last, num_pe, on, section_handle, source_atom, target_atom, &
-                 xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: adjoint_bin, adjoint_entry, adjoint_handle, adjoint_nbins, adjoint_nchannels, &
+         adjoint_threads, adjoint_tile_count(3), adjoint_tile_lower(3), adjoint_tile_upper(3), &
+         atom_composite_components, bo(2), composite_image_periodicity(3), composite_local_atom, &
+         composite_local_natom, composite_nflat, composite_pw_nflat, composite_row, &
+         composite_row_rank, gapw_density_partition, gapw_representation, handle, ia, iat, iatom, &
+         icomponent, idir, ikind, ir, ispin, iw, jdir, myfun, na, natom, nlcc_entry, nlcc_first, &
+         nlcc_last, nr, nspins, num_pe, on, section_handle, source_atom, target_atom
+      INTEGER :: xc_deriv_method_id, xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &

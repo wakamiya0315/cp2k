@@ -3070,12 +3070,12 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: active_images, image_atom
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: image_shift
       INTEGER, DIMENSION(3)                              :: partition_periodicity
-      REAL(KIND=dp)                                      :: dist_diff, ds_dmu, factor_ij, &
-                                                            factor_ji, mu, mu_raw, rab, switch
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: distances, image_fade, &
-                                                            normalized_weights
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :) :: image_coords, image_fade_gradient, &
-         mean_log_derivative, rvecs, target_log_derivative, unit_rvecs
+      REAL(KIND=dp)                                      :: dist_diff, ds_dmu, factor_ij, factor_ji, &
+                                                            mu, mu_raw, rab, switch
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: distances, image_fade, normalized_weights
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: image_coords, image_fade_gradient, &
+                                                            mean_log_derivative, rvecs, &
+                                                            target_log_derivative, unit_rvecs
       REAL(KIND=dp), DIMENSION(3) :: dlog_i, dlog_j, dmu_image_i, dmu_image_j, ds_image_i, &
          ds_image_j, fade_log, image_translation, image_weight_derivative, pair, unit_pair
 

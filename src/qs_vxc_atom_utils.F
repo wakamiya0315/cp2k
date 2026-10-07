@@ -27,6 +27,7 @@ MODULE qs_vxc_atom_utils
    USE qs_rho_atom_types,               ONLY: rho_atom_coeff,&
                                               rho_atom_type
    USE util,                            ONLY: sort
+
 !$ USE OMP_LIB, ONLY: omp_get_num_threads, &
 !$                    omp_get_thread_num
 #include "./base/base_uses.f90"
@@ -211,8 +212,8 @@ CONTAINS
          INTENT(INOUT)                                   :: center, translation
       REAL(dp), ALLOCATABLE, DIMENSION(:), INTENT(INOUT) :: distance, cutoff
 
-      INTEGER                                            :: i1, i2, i3, iatom, idir, ientry, &
-                                                            nentry, pass
+      INTEGER                                            :: i1, i2, i3, iatom, idir, ientry, nentry, &
+                                                            pass
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: order, sorted_source
       INTEGER, DIMENSION(3)                              :: base, shell
       REAL(dp)                                           :: image_distance, reach
@@ -620,8 +621,8 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'calc_tau_atom'
 
-      INTEGER                                            :: dir, handle, ia, ibas, igrid0, ihs, &
-                                                            ir, ispin, na, nbas, ngrid, nr
+      INTEGER                                            :: dir, handle, ia, ibas, igrid0, ihs, ir, &
+                                                            ispin, na, nbas, ngrid, nr
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: tau_sum
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: work
       REAL(dp), DIMENSION(:, :), POINTER                 :: cpc
@@ -965,8 +966,9 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: cg_list, dcg_list
       INTEGER, DIMENSION(:), POINTER                     :: lmax, lmin, npgf
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: g1, g2
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: dgg, gg, matso_h, matso_s, radial, radial_d, &
-         radial_u, vxc_grad_h, vxc_grad_s, xc_h, xc_s
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: dgg, gg, matso_h, matso_s, radial, &
+                                                            radial_d, radial_u, vxc_grad_h, &
+                                                            vxc_grad_s, xc_h, xc_s
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: vxg_comp_h, vxg_comp_s, xg_h, xg_s
       REAL(dp), DIMENSION(:, :), POINTER                 :: zet
       REAL(dp), DIMENSION(:, :, :), POINTER              :: my_CG
@@ -1237,12 +1239,12 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'dgaVtaudgb'
 
-      INTEGER                                            :: dir, handle, ia, ibas, igrid0, iold, &
-                                                            ir, ispin, ithread, jbas, jold, &
+      INTEGER                                            :: dir, handle, ia, ibas, igrid0, iold, ir, &
+                                                            ispin, ithread, jbas, jold, &
                                                             max_old_basis, na, nbas, ngrid, nr, &
                                                             nthread
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: int_h, int_h_local, int_s, &
-                                                            int_s_local, weighted_grad
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: int_h, int_h_local, int_s, int_s_local, &
+                                                            weighted_grad
 
       CALL timeset(routineN, handle)
 
