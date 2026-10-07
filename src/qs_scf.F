@@ -106,7 +106,9 @@ MODULE qs_scf
         outer_scf_optimizer_newton_ls, plus_u_lowdin, sic_eo, smear_fermi_dirac, smear_gaussian, &
         smear_mp, smear_mv, tblite_scc_mixer_tblite
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
-                                              section_vals_type
+                                              section_vals_type,&
+                                              section_vals_val_get,&
+                                              section_vals_val_set
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
@@ -253,6 +255,7 @@ MODULE qs_scf
    USE qs_wf_history_methods,           ONLY: wfi_purge_history,&
                                               wfi_update
    USE scf_control_types,               ONLY: scf_control_type
+   USE skala_gpw_functional,            ONLY: get_gauxc_section
    USE smeagol_interface,               ONLY: run_smeagol_bulktrans,&
                                               run_smeagol_emtrans
    USE tblite_interface,                ONLY: tb_get_energy,&
@@ -3714,6 +3717,8 @@ CONTAINS
             derivative = derivative + dot; CALL dbcsr_release(delta)
          END DO
       END DO
+      IF (scf_env%mixing_store%dm_trial_free_precision_compare) &
+         CALL qs_scf_free_precision_compare(qs_env, scf_env, control, iw, initial, proposal, initial_k, 0.0_dp)
       DO probe = 1, 2
          lambda = 1.0E-3_dp/(2.0_dp**(probe - 1))
          candidate_k = initial_k + lambda*(proposal_k - initial_k)
@@ -3727,6 +3732,8 @@ CONTAINS
          IF (.NOT. valid) CALL cp_abort(__LOCATION__, &
                                         "Free-energy validation segment is not physical")
          fd(probe) = (eks - scf_env%mixing_store%dm_trial_eks_input)/lambda
+         IF (scf_env%mixing_store%dm_trial_free_precision_compare) &
+            CALL qs_scf_free_precision_compare(qs_env, scf_env, control, iw, initial, proposal, candidate_k, lambda)
       END DO
       DO ic = 1, SIZE(initial, 2)
          DO ispin = 1, SIZE(initial, 1)
@@ -3752,6 +3759,85 @@ CONTAINS
       IF (scf_env%mixing_store%dm_trial_free_diag_level > 0) &
          CALL qs_scf_free_diagnostics(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
    END SUBROUTINE qs_scf_free_validate
+
+! **************************************************************************************************
+!> \brief Diagnostic only: evaluate the current validation state again with the other native SKALA
+!>        model precision and print the energy decomposition and KS directional contraction of both.
+!> \note The same density matrix P = initial + lambda (proposal - initial) is rebuilt with the same
+!>       operations as the caller, so every difference between the two printed rows comes from the
+!>       model precision. The model keyword is restored before returning; the caller's next
+!>       evaluation (the next probe or the repeat at the input) rebuilds the state at that precision.
+!>       The extra evaluations are counted in dm_trial_free_evaluations.
+   SUBROUTINE qs_scf_free_precision_compare(qs_env, scf_env, control, iw, initial, proposal, candidate_k, lambda)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: control
+      INTEGER, INTENT(IN)                                :: iw
+      TYPE(dbcsr_p_type), POINTER                        :: initial(:, :), proposal(:, :)
+      COMPLEX(KIND=dp), INTENT(IN)                       :: candidate_k(:, :, :, :)
+      REAL(KIND=dp), INTENT(IN)                          :: lambda
+
+      INTEGER                                            :: ic, ispin
+      LOGICAL                                            :: fp64, valid
+      REAL(KIND=dp)                                      :: eks, f
+      TYPE(section_vals_type), POINTER                   :: gauxc_section, input, xc_section
+
+      CALL get_qs_env(qs_env, input=input)
+      xc_section => section_vals_get_subs_vals(input, "DFT%XC")
+      gauxc_section => get_gauxc_section(xc_section)
+      IF (.NOT. ASSOCIATED(gauxc_section)) CALL cp_abort(__LOCATION__, &
+                                                         "PULAY_P_FREE_PRECISION_COMPARE needs the native SKALA functional")
+      CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_MODEL_FP64", l_val=fp64)
+      CALL print_state(fp64)
+      CALL section_vals_val_set(gauxc_section, "NATIVE_GRID_MODEL_FP64", l_val=.NOT. fp64)
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+            IF (lambda /= 0.0_dp) &
+               CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, proposal(ispin, ic)%matrix, 1.0_dp - lambda, lambda)
+         END DO
+      END DO
+      CALL qs_scf_free_evaluate(qs_env, scf_env, control, candidate_k, f, eks, valid)
+      IF (.NOT. valid) CALL cp_abort(__LOCATION__, "Precision comparison state is not physical")
+      CALL print_state(.NOT. fp64)
+      CALL section_vals_val_set(gauxc_section, "NATIVE_GRID_MODEL_FP64", l_val=fp64)
+
+   CONTAINS
+
+      SUBROUTINE print_state(model_fp64)
+      LOGICAL, INTENT(IN)                                :: model_fp64
+
+      REAL(KIND=dp)                                      :: dot, ks_directional, other, values(11)
+      TYPE(dbcsr_p_type), POINTER                        :: ks(:, :)
+      TYPE(dbcsr_type)                                   :: delta
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+         CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control, matrix_ks_kp=ks)
+         ks_directional = 0.0_dp
+         DO ic = 1, SIZE(initial, 2)
+            DO ispin = 1, SIZE(initial, 1)
+               CALL dbcsr_create(delta, template=initial(ispin, ic)%matrix)
+               CALL dbcsr_copy(delta, proposal(ispin, ic)%matrix)
+               CALL dbcsr_add(delta, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               CALL dbcsr_dot(delta, ks(ispin, ic)%matrix, dot)
+               ks_directional = ks_directional + dot
+               CALL dbcsr_release(delta)
+            END DO
+         END DO
+         other = energy%gcp + energy%qmmm_el + energy%mulliken + SUM(energy%ddapc_restraint) + &
+                 energy%s2_restraint + energy%dft_plus_u + energy%efield + energy%efield_core + &
+                 energy%ee + energy%ee_core + energy%exc_aux_fit + energy%image_charge + &
+                 energy%sccs_pol + energy%cdft + energy%exc1_aux_fit
+         IF (dft_control%apply_embed_pot) other = other + energy%embed_corr
+         values = [energy%core, energy%core_overlap + energy%core_self + energy%core_cneo, &
+                   energy%hartree, energy%hartree_1c, energy%exc, energy%exc1, energy%ex, &
+                   energy%dispersion, other, energy%kinetic, energy%kTS]
+         IF (iw > 0) WRITE (iw, '(A,ES26.17E3,L3,2ES26.17E3,12ES26.17E3)') &
+            "F_PRECISION| lambda,fp64,F,EKS,core,constants,H,H1c,XC,XC1,ex,D3,other,kinetic,kTS,KS-direction ", &
+            lambda, model_fp64, energy%total, energy%total - energy%kTS, values, ks_directional
+      END SUBROUTINE print_state
+   END SUBROUTINE qs_scf_free_precision_compare
 
 ! **************************************************************************************************
 !> \brief Registered repeated/central probes without changing the F acceptance or SCF criterion.

@@ -116,6 +116,7 @@ MODULE qs_density_mixing_types
       LOGICAL                                           :: dm_pulay = .FALSE.
       LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
       LOGICAL :: dm_trial_free_energy = .FALSE., dm_trial_free_validate = .FALSE.
+      LOGICAL :: dm_trial_free_precision_compare = .FALSE.
       INTEGER :: dm_trial_free_backtracks = 12, dm_trial_free_evaluations = 0
       INTEGER :: dm_trial_free_diag_level = 0
       CHARACTER(LEN=default_path_length) :: dm_trial_free_diag_file = ""
@@ -255,6 +256,10 @@ CONTAINS
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_BACKTRACKS", i_val=mixing_store%dm_trial_free_backtracks)
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_DIAGNOSTICS", i_val=mixing_store%dm_trial_free_diag_level)
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_DIAG_FILE", c_val=mixing_store%dm_trial_free_diag_file)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_PRECISION_COMPARE", &
+                                l_val=mixing_store%dm_trial_free_precision_compare)
+      IF (mixing_store%dm_trial_free_precision_compare .AND. .NOT. mixing_store%dm_trial_free_validate) &
+         CALL cp_abort(__LOCATION__, "PULAY_P_FREE_PRECISION_COMPARE requires PULAY_P_FREE_VALIDATE")
       IF (mixing_store%dm_trial_free_diag_level > 0) THEN
          IF (.NOT. mixing_store%dm_trial_free_validate .OR. &
              LEN_TRIM(mixing_store%dm_trial_free_diag_file) == 0) &
@@ -1061,6 +1066,15 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAG_FILE", &
                           description="Private new stream export prefix for independent P/S/KS/entropy checks.", &
                           type_of_var=lchar_t, default_lc_val="")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_PRECISION_COMPARE", &
+                          description="Diagnostic only: re-evaluate each FREE_VALIDATE state (input and both "// &
+                          "forward probes) with the other native SKALA model precision and print the energy "// &
+                          "decomposition and KS directional contraction of both. The density matrix is the "// &
+                          "same for both evaluations; the following evaluation restores the input precision. "// &
+                          "Requires FREE_VALIDATE.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
