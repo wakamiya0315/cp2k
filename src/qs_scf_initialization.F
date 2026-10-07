@@ -96,6 +96,7 @@ MODULE qs_scf_initialization
                                               fb_env_write_info
    USE qs_fb_env_types,                 ONLY: fb_env_create,&
                                               fb_env_has_data
+   USE qs_gspace_mixing,                ONLY: mixing_init_xc_fields
    USE qs_harris_types,                 ONLY: harris_type
    USE qs_harris_utils,                 ONLY: harris_density_update
    USE qs_initial_guess,                ONLY: calculate_first_density_matrix
@@ -1430,7 +1431,8 @@ CONTAINS
          IF (scf_env%mixing_store%dm_pulay) scf_env%mixing_store%dm_pulay_ncall = 0
       END IF
       IF (scf_env%mixing_method > 1) THEN
-         IF (dft_control%qs_control%gapw) THEN
+         IF (dft_control%qs_control%gapw .OR. &
+             (dft_control%qs_control%gapw_xc .AND. scf_env%mixing_store%xc_fields)) THEN
             CALL get_qs_env(qs_env=qs_env, rho_atom_set=rho_atom)
             CALL mixing_init(scf_env%mixing_method, rho, scf_env%mixing_store, &
                              para_env, rho_atom=rho_atom)
@@ -1442,6 +1444,7 @@ CONTAINS
             CALL mixing_init(scf_env%mixing_method, rho, scf_env%mixing_store, &
                              para_env)
          END IF
+         IF (scf_env%mixing_store%xc_fields) CALL mixing_init_xc_fields(qs_env, scf_env%mixing_store)
       END IF
 
       DO ispin = 1, SIZE(mos) !fm->dbcsr

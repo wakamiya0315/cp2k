@@ -35,7 +35,8 @@ MODULE qs_gspace_mixing
                                               modified_broyden_mixing_nr,&
                                               multisecant_mixing_nr,&
                                               new_pulay_mixing_nr,&
-                                              pulay_mixing_nr
+                                              pulay_mixing_nr,&
+                                              release_field_storage
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_rho_atom_types,               ONLY: rho_atom_type
@@ -49,7 +50,14 @@ MODULE qs_gspace_mixing
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_gspace_mixing'
 
-   PUBLIC :: gspace_mixing
+   PUBLIC :: gspace_mixing, mixing_init_xc_fields
+
+   ! A field read by the XC functional besides the density on the grid (XC_FIELDS), in
+   ! reciprocal and real space
+   TYPE xc_field_type
+      TYPE(pw_c1d_gs_type), POINTER                      :: g => NULL()
+      TYPE(pw_r3d_rs_type), POINTER                      :: r => NULL()
+   END TYPE xc_field_type
 
 CONTAINS
 
@@ -78,18 +86,20 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'gspace_mixing'
 
-      INTEGER                                            :: handle, iatom, ig, ispin, natom, ng, &
-                                                            nspin
+      INTEGER                                            :: handle, iatom, ifield, ig, ispin, natom, &
+                                                            nfield, ng, nspin
       LOGICAL                                            :: gapw
       REAL(dp)                                           :: alpha
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: tot_rho_r
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: tot_rho_r, tot_rho_xc_r
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(pw_c1d_gs_type)                               :: rho_tmp
       TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER        :: rho_g
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_r
+      TYPE(qs_rho_type), POINTER                         :: rho_xc
       TYPE(rho_atom_type), DIMENSION(:), POINTER         :: rho_atom
+      TYPE(xc_field_type), ALLOCATABLE, DIMENSION(:, :)  :: fields
 
       CALL timeset(routineN, handle)
 
@@ -106,12 +116,24 @@ CONTAINS
          CPASSERT(ng == SIZE(mixing_store%rhoin(1)%cc))
 
          alpha = mixing_store%alpha
-         gapw = dft_control%qs_control%gapw
+         gapw = one_centre_mixing(dft_control, mixing_store)
          natom = 0
 
          IF (mixing_store%gmix_p .AND. gapw) THEN
             CALL get_qs_env(qs_env=qs_env, rho_atom_set=rho_atom)
             natom = SIZE(rho_atom)
+         END IF
+
+         nfield = 0
+         IF (mixing_store%xc_fields) THEN
+            CALL get_xc_fields(qs_env, rho, fields, nfield)
+            CPASSERT(nfield == mixing_store%nfield)
+            DO ifield = 1, nfield
+               CPASSERT(SIZE(fields(ifield, 1)%g%array) == ng)
+            END DO
+            IF (nspin == 2) CALL fields_spin_to_charge_mag(fields, nfield)
+         ELSE
+            ALLOCATE (fields(0, nspin))
          END IF
 
          IF (nspin == 2) THEN
@@ -145,6 +167,13 @@ CONTAINS
                END DO
             END IF
 
+            DO ispin = 1, nspin
+               DO ifield = 1, nfield
+                  mixing_store%field_in(ifield, ispin)%cc(:) = fields(ifield, ispin)%g%array(:)
+               END DO
+            END DO
+            IF (nfield > 0 .AND. nspin == 2) CALL fields_charge_mag_to_spin(fields, nfield)
+
             mixing_store%iter_method = "NoMix"
             IF (nspin == 2) THEN
                IF (mixing_store%gmix_p .AND. gapw) THEN
@@ -162,11 +191,11 @@ CONTAINS
 
          IF ((iter_count + 1 - mixing_store%nskip_mixing) <= mixing_store%n_simple_mix) THEN
             CALL cite_reference(Kerker1981)
-            CALL gmix_potential_only(qs_env, mixing_store, rho)
+            CALL gmix_potential_only(qs_env, mixing_store, rho, fields, nfield)
             mixing_store%iter_method = "Kerker"
          ELSE IF (mixing_method == gspace_mixing_nr) THEN
             CALL cite_reference(Kerker1981)
-            CALL gmix_potential_only(qs_env, mixing_store, rho)
+            CALL gmix_potential_only(qs_env, mixing_store, rho, fields, nfield)
             mixing_store%iter_method = "Kerker"
          ELSE IF (mixing_method == pulay_mixing_nr) THEN
             CALL pulay_mixing(qs_env, mixing_store, rho, para_env)
@@ -176,7 +205,7 @@ CONTAINS
             mixing_store%iter_method = "NPulay"
          ELSE IF (mixing_method == broyden_mixing_nr) THEN
             CALL cite_reference(Broyden1965)
-            CALL broyden_mixing(qs_env, mixing_store, rho, para_env)
+            CALL broyden_mixing(qs_env, mixing_store, rho, para_env, fields, nfield)
             mixing_store%iter_method = "Broy."
          ELSE IF (mixing_method == modified_broyden_mixing_nr) THEN
             CALL cite_reference(Johnson1988)
@@ -203,11 +232,199 @@ CONTAINS
             CALL pw_transfer(rho_g(ispin), rho_r(ispin))
             tot_rho_r(ispin) = pw_integrate_function(rho_r(ispin), isign=-1)
          END DO
+
+         IF (nfield > 0) THEN
+            IF (nspin == 2) CALL fields_charge_mag_to_spin(fields, nfield)
+            DO ispin = 1, nspin
+               DO ifield = 1, nfield
+                  CALL pw_transfer(fields(ifield, ispin)%g, fields(ifield, ispin)%r)
+               END DO
+            END DO
+            IF (dft_control%qs_control%gapw_xc) THEN
+               ! field 1 is the soft XC density
+               CALL get_qs_env(qs_env, rho_xc=rho_xc)
+               CALL qs_rho_get(rho_xc, tot_rho_r=tot_rho_xc_r)
+               DO ispin = 1, nspin
+                  tot_rho_xc_r(ispin) = pw_integrate_function(fields(1, ispin)%r, isign=-1)
+               END DO
+            END IF
+         END IF
       END IF
 
       CALL timestop(handle)
 
    END SUBROUTINE gspace_mixing
+
+! **************************************************************************************************
+!> \brief Whether the GAPW one-centre coefficients take part in the G-space mixing: with GMIX_P in
+!>        GAPW, and with XC_FIELDS also in GAPW_XC, whose XC functional reads them
+!> \param dft_control ...
+!> \param mixing_store ...
+!> \return ...
+! **************************************************************************************************
+   PURE FUNCTION one_centre_mixing(dft_control, mixing_store) RESULT(gapw)
+      TYPE(dft_control_type), INTENT(IN)                 :: dft_control
+      TYPE(mixing_storage_type), INTENT(IN)              :: mixing_store
+      LOGICAL                                            :: gapw
+
+      gapw = dft_control%qs_control%gapw .OR. &
+             (dft_control%qs_control%gapw_xc .AND. mixing_store%xc_fields)
+
+   END FUNCTION one_centre_mixing
+
+! **************************************************************************************************
+!> \brief The fields read by the XC functional besides the density that gspace_mixing mixes:
+!>        in GAPW_XC the separate soft XC density and its kinetic energy density, otherwise the
+!>        kinetic energy density; the latter only for functionals that need it
+!> \param qs_env ...
+!> \param rho the density that is mixed (the Hartree density in GAPW_XC)
+!> \param fields (field, spin)
+!> \param nfield ...
+! **************************************************************************************************
+   SUBROUTINE get_xc_fields(qs_env, rho, fields, nfield)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(xc_field_type), ALLOCATABLE, DIMENSION(:, :)  :: fields
+      INTEGER, INTENT(OUT)                               :: nfield
+
+      INTEGER                                            :: ifield, ispin, nspin
+      LOGICAL                                            :: tau
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER        :: rho_g, tau_g
+      TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_r, tau_r
+      TYPE(qs_rho_type), POINTER                         :: rho_xc
+
+      NULLIFY (dft_control, rho_g, rho_r, rho_xc, tau_g, tau_r)
+      CALL get_qs_env(qs_env, dft_control=dft_control)
+      nspin = dft_control%nspins
+      tau = dft_control%use_kinetic_energy_density
+      IF (dft_control%qs_control%gapw_xc) THEN
+         CALL get_qs_env(qs_env, rho_xc=rho_xc)
+         CALL qs_rho_get(rho_xc, rho_g=rho_g, rho_r=rho_r, tau_g=tau_g, tau_r=tau_r)
+         nfield = MERGE(2, 1, tau)
+      ELSE
+         CALL qs_rho_get(rho, tau_g=tau_g, tau_r=tau_r)
+         nfield = MERGE(1, 0, tau)
+      END IF
+      IF (ALLOCATED(fields)) DEALLOCATE (fields)
+      ALLOCATE (fields(nfield, nspin))
+      DO ispin = 1, nspin
+         ifield = 0
+         IF (dft_control%qs_control%gapw_xc) THEN
+            ifield = ifield + 1
+            fields(ifield, ispin)%g => rho_g(ispin)
+            fields(ifield, ispin)%r => rho_r(ispin)
+         END IF
+         IF (tau) THEN
+            ifield = ifield + 1
+            fields(ifield, ispin)%g => tau_g(ispin)
+            fields(ifield, ispin)%r => tau_r(ispin)
+         END IF
+      END DO
+
+   END SUBROUTINE get_xc_fields
+
+! **************************************************************************************************
+!> \brief Spin-up/spin-down fields to total/magnetization, as the density is mixed
+!> \param fields ...
+!> \param nfield ...
+! **************************************************************************************************
+   SUBROUTINE fields_spin_to_charge_mag(fields, nfield)
+      TYPE(xc_field_type), DIMENSION(:, :), INTENT(INOUT) :: fields
+      INTEGER, INTENT(IN)                                :: nfield
+
+      COMPLEX(dp), DIMENSION(:), POINTER                 :: down, up
+      INTEGER                                            :: ifield
+
+      DO ifield = 1, nfield
+         up => fields(ifield, 1)%g%array
+         down => fields(ifield, 2)%g%array
+         up(:) = up(:) + down(:)
+         down(:) = up(:) - 2.0_dp*down(:)
+      END DO
+
+   END SUBROUTINE fields_spin_to_charge_mag
+
+! **************************************************************************************************
+!> \brief Total/magnetization fields back to spin-up/spin-down
+!> \param fields ...
+!> \param nfield ...
+! **************************************************************************************************
+   SUBROUTINE fields_charge_mag_to_spin(fields, nfield)
+      TYPE(xc_field_type), DIMENSION(:, :), INTENT(INOUT) :: fields
+      INTEGER, INTENT(IN)                                :: nfield
+
+      COMPLEX(dp), DIMENSION(:), POINTER                 :: mag, total
+      INTEGER                                            :: ifield
+
+      DO ifield = 1, nfield
+         total => fields(ifield, 1)%g%array
+         mag => fields(ifield, 2)%g%array
+         total(:) = 0.5_dp*(total(:) + mag(:))
+         mag(:) = total(:) - mag(:)
+      END DO
+
+   END SUBROUTINE fields_charge_mag_to_spin
+
+! **************************************************************************************************
+!> \brief Stores the present XC fields as the first input of an SCF run (XC_FIELDS), after
+!>        mixing_init has done the same for the density
+!> \param qs_env ...
+!> \param mixing_store ...
+! **************************************************************************************************
+   SUBROUTINE mixing_init_xc_fields(qs_env, mixing_store)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(mixing_storage_type), POINTER                 :: mixing_store
+
+      INTEGER                                            :: ib, ifield, ispin, nbuffer, nfield, ng, &
+                                                            nspin
+      TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(xc_field_type), ALLOCATABLE, DIMENSION(:, :)  :: fields
+
+      NULLIFY (rho)
+      CALL get_qs_env(qs_env, rho=rho)
+      CALL get_xc_fields(qs_env, rho, fields, nfield)
+      nspin = SIZE(fields, 2)
+      nbuffer = mixing_store%nbuffer
+      IF (nfield == 0) THEN
+         CALL release_field_storage(mixing_store)
+         RETURN
+      END IF
+      ng = SIZE(fields(1, 1)%g%array)
+      IF (ASSOCIATED(mixing_store%field_in)) THEN
+         IF (SIZE(mixing_store%field_in, 1) /= nfield .OR. &
+             SIZE(mixing_store%field_in(1, 1)%cc) /= ng) CALL release_field_storage(mixing_store)
+      END IF
+      IF (.NOT. ASSOCIATED(mixing_store%field_in)) THEN
+         ALLOCATE (mixing_store%field_in(nfield, nspin), mixing_store%field_in_old(nfield, nspin), &
+                   mixing_store%field_last_res(nfield, nspin), mixing_store%field_dbuf(nbuffer, nfield, nspin))
+         DO ispin = 1, nspin
+            DO ifield = 1, nfield
+               ALLOCATE (mixing_store%field_in(ifield, ispin)%cc(ng), &
+                         mixing_store%field_in_old(ifield, ispin)%cc(ng), &
+                         mixing_store%field_last_res(ifield, ispin)%cc(ng))
+               DO ib = 1, nbuffer
+                  ALLOCATE (mixing_store%field_dbuf(ib, ifield, ispin)%cc(ng))
+               END DO
+            END DO
+         END DO
+      END IF
+      mixing_store%nfield = nfield
+
+      IF (nspin == 2) CALL fields_spin_to_charge_mag(fields, nfield)
+      DO ispin = 1, nspin
+         DO ifield = 1, nfield
+            mixing_store%field_in(ifield, ispin)%cc(:) = fields(ifield, ispin)%g%array(:)
+            mixing_store%field_in_old(ifield, ispin)%cc(:) = z_zero
+            mixing_store%field_last_res(ifield, ispin)%cc(:) = z_zero
+            DO ib = 1, nbuffer
+               mixing_store%field_dbuf(ib, ifield, ispin)%cc(:) = z_zero
+            END DO
+         END DO
+      END DO
+      IF (nspin == 2) CALL fields_charge_mag_to_spin(fields, nfield)
+
+   END SUBROUTINE mixing_init_xc_fields
 
 ! **************************************************************************************************
 !> \brief Convert GAPW compensation charge coefficients from spin-up/spin-down
@@ -332,17 +549,19 @@ CONTAINS
 !> \author MI
 ! **************************************************************************************************
 
-   SUBROUTINE gmix_potential_only(qs_env, mixing_store, rho)
+   SUBROUTINE gmix_potential_only(qs_env, mixing_store, rho, fields, nfield)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(mixing_storage_type), POINTER                 :: mixing_store
       TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(xc_field_type), DIMENSION(:, :), INTENT(IN)   :: fields
+      INTEGER, INTENT(IN)                                :: nfield
 
       CHARACTER(len=*), PARAMETER :: routineN = 'gmix_potential_only'
 
       COMPLEX(dp), DIMENSION(:), POINTER                 :: cc_new
-      INTEGER                                            :: handle, iatom, ig, ispin, natom, ng, &
-                                                            nspin
+      INTEGER                                            :: handle, iatom, ifield, ig, ispin, natom, &
+                                                            ng, nspin
       LOGICAL                                            :: gapw
       REAL(dp)                                           :: alpha, alpha_eff, f_mix
       REAL(dp), DIMENSION(:), POINTER                    :: kerker_eff
@@ -362,7 +581,7 @@ CONTAINS
       nspin = SIZE(rho_g, 1)
       ng = SIZE(rho_g(1)%pw_grid%gsq)
 
-      gapw = dft_control%qs_control%gapw
+      gapw = one_centre_mixing(dft_control, mixing_store)
       alpha = mixing_store%alpha
 
       DO ispin = 1, nspin
@@ -384,6 +603,17 @@ CONTAINS
             f_mix = alpha_eff
             cc_new(ig) = (1.0_dp - f_mix)*mixing_store%rhoin(ispin)%cc(ig) + f_mix*cc_new(ig)
             mixing_store%rhoin(ispin)%cc(ig) = cc_new(ig)
+         END DO
+
+         ! the XC fields with the same factors (XC_FIELDS)
+         DO ifield = 1, nfield
+            cc_new => fields(ifield, ispin)%g%array
+            DO ig = 1, ng
+               f_mix = alpha_eff
+               IF (ig <= mixing_store%ig_max) f_mix = alpha_eff*kerker_eff(ig)
+               cc_new(ig) = (1.0_dp - f_mix)*mixing_store%field_in(ifield, ispin)%cc(ig) + f_mix*cc_new(ig)
+               mixing_store%field_in(ifield, ispin)%cc(ig) = cc_new(ig)
+            END DO
          END DO
 
       END DO
@@ -680,20 +910,23 @@ CONTAINS
 !> \author MI
 ! **************************************************************************************************
 
-   SUBROUTINE broyden_mixing(qs_env, mixing_store, rho, para_env)
+   SUBROUTINE broyden_mixing(qs_env, mixing_store, rho, para_env, fields, nfield)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(mixing_storage_type), POINTER                 :: mixing_store
       TYPE(qs_rho_type), POINTER                         :: rho
       TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(xc_field_type), DIMENSION(:, :), INTENT(IN)   :: fields
+      INTEGER, INTENT(IN)                                :: nfield
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'broyden_mixing'
 
       COMPLEX(dp)                                        :: cc_mix
-      COMPLEX(dp), ALLOCATABLE, DIMENSION(:)             :: res_rho
-      INTEGER                                            :: handle, i, iatom, ib, ig, ispin, j, jb, &
-                                                            kb, n1, n2, natom, nb, nbuffer, ng, &
-                                                            nspin
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:)             :: res_field, res_rho
+      COMPLEX(dp), DIMENSION(:), POINTER                 :: field
+      INTEGER                                            :: handle, i, iatom, ib, ifield, ig, ispin, &
+                                                            j, jb, kb, n1, n2, natom, nb, nbuffer, &
+                                                            ng, nspin
       LOGICAL                                            :: gapw, only_kerker
       REAL(dp)                                           :: alpha, alpha_eff, dcpc_h_res, &
                                                             dcpc_s_res, delta_norm, f_mix, &
@@ -722,9 +955,9 @@ CONTAINS
       alpha = mixing_store%alpha
       w0 = mixing_store%broy_w0
       nbuffer = mixing_store%nbuffer
-      gapw = dft_control%qs_control%gapw
+      gapw = one_centre_mixing(dft_control, mixing_store)
 
-      ALLOCATE (res_rho(ng))
+      ALLOCATE (res_rho(ng), res_field(ng))
 
       mixing_store%ncall = mixing_store%ncall + 1
       IF (mixing_store%ncall == 1) THEN
@@ -763,6 +996,17 @@ CONTAINS
                rho_g(ispin)%array(ig) = mixing_store%rhoin(ispin)%cc(ig) + f_mix*res_rho(ig)
                mixing_store%rhoin_old(ispin)%cc(ig) = mixing_store%rhoin(ispin)%cc(ig)
                mixing_store%rhoin(ispin)%cc(ig) = rho_g(ispin)%array(ig)
+            END DO
+            DO ifield = 1, nfield
+               field => fields(ifield, ispin)%g%array
+               DO ig = 1, ng
+                  res_field(ig) = field(ig) - mixing_store%field_in(ifield, ispin)%cc(ig)
+                  mixing_store%field_last_res(ifield, ispin)%cc(ig) = res_field(ig)
+                  f_mix = alpha_eff*kerker_eff(ig)
+                  field(ig) = mixing_store%field_in(ifield, ispin)%cc(ig) + f_mix*res_field(ig)
+                  mixing_store%field_in_old(ifield, ispin)%cc(ig) = mixing_store%field_in(ifield, ispin)%cc(ig)
+                  mixing_store%field_in(ifield, ispin)%cc(ig) = field(ig)
+               END DO
             END DO
 
             IF (mixing_store%gmix_p) THEN
@@ -876,6 +1120,18 @@ CONTAINS
                      f_mix*mixing_store%res_buffer(ib, ispin)%cc(ig) + &
                      mixing_store%drho_buffer(ib, ispin)%cc(ig)
                END DO
+               ! each XC field: (change of the input + preconditioned change of the residual),
+               ! divided by the norm of the density's residual change, as for the density
+               DO ifield = 1, nfield
+                  field => fields(ifield, ispin)%g%array
+                  DO ig = 1, ng
+                     f_mix = alpha_eff*kerker_eff(ig)
+                     res_field(ig) = field(ig) - mixing_store%field_in(ifield, ispin)%cc(ig)
+                     mixing_store%field_dbuf(ib, ifield, ispin)%cc(ig) = &
+                        (mixing_store%field_in(ifield, ispin)%cc(ig) - mixing_store%field_in_old(ifield, ispin)%cc(ig) + &
+                         f_mix*(res_field(ig) - mixing_store%field_last_res(ifield, ispin)%cc(ig)))/delta_norm
+                  END DO
+               END DO
                DO jb = 1, nb
                   DO kb = jb, nb
                      DO ig = 1, mixing_store%ig_max !ng
@@ -919,6 +1175,23 @@ CONTAINS
                mixing_store%rhoin_old(ispin)%cc(ig) = mixing_store%rhoin(ispin)%cc(ig)
                mixing_store%rhoin(ispin)%cc(ig) = rho_g(ispin)%array(ig)
             END DO
+            ! each XC field with the coefficients G of the density
+            DO ifield = 1, nfield
+               field => fields(ifield, ispin)%g%array
+               DO ig = 1, ng
+                  cc_mix = z_zero
+                  DO jb = 1, nb
+                     cc_mix = cc_mix - G(jb)*mixing_store%field_dbuf(jb, ifield, ispin)%cc(ig)
+                  END DO
+                  f_mix = alpha_eff*kerker_eff(ig)
+                  res_field(ig) = field(ig) - mixing_store%field_in(ifield, ispin)%cc(ig)
+                  mixing_store%field_last_res(ifield, ispin)%cc(ig) = res_field(ig)
+                  IF (res_norm > 1.E-14_dp) field(ig) = mixing_store%field_in(ifield, ispin)%cc(ig) + &
+                                                        f_mix*res_field(ig) + cc_mix
+                  mixing_store%field_in_old(ifield, ispin)%cc(ig) = mixing_store%field_in(ifield, ispin)%cc(ig)
+                  mixing_store%field_in(ifield, ispin)%cc(ig) = field(ig)
+               END DO
+            END DO
 
             IF (mixing_store%gmix_p) THEN
                IF (gapw) THEN
@@ -959,7 +1232,7 @@ CONTAINS
 
       END DO ! ispin
 
-      DEALLOCATE (res_rho)
+      DEALLOCATE (res_rho, res_field)
 
       CALL timestop(handle)
 
