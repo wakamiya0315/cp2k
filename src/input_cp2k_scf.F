@@ -844,6 +844,14 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="DIAGNOSTICS", &
+                          description="Print the unpreconditioned OT product-gradient block norms"// &
+                          " and measured line-search energies and slopes. This does not change"// &
+                          " the minimizer or its convergence criterion.", &
+                          usage="DIAGNOSTICS ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create( &
          keyword, __LOCATION__, name="STEPSIZE", &
          description="Initial stepsize used for the line search, sometimes this parameter can be reduced to stabilize DIIS"// &

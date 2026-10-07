@@ -311,6 +311,10 @@ CONTAINS
          RETURN
       END IF
 
+      IF (qs_ot_env(1)%settings%diagnostics .AND. .NOT. qs_ot_env(1)%energy_only) THEN
+         CALL ot_print_raw_gradient(qs_ot_env, para_env_inter_kp)
+      END IF
+
       SELECT CASE (qs_ot_env(1)%settings%OT_METHOD)
       CASE ("CG")
          IF (current_point_is_fine(qs_ot_env)) THEN
@@ -352,6 +356,55 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE ot_mini
+
+! **************************************************************************************************
+!> \brief Print physical product-chart gradient norms before applying a minimizer/preconditioner.
+!>
+!> These are L2 norms of the actual fixed-chart derivative, not the preconditioned SCF delta.
+!> Complex orbital blocks include real and imaginary parts. The one-half factor accounts for
+!> the anti-Hermitian rotation chart. Channel weights are already included in the derivative;
+!> only the inter-K-point communicator must be summed here. No stopping test is changed.
+!> \param qs_ot_env local spin/K-point environments
+!> \param para_env_inter_kp communicator across K-point groups
+! **************************************************************************************************
+   SUBROUTINE ot_print_raw_gradient(qs_ot_env, para_env_inter_kp)
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
+      TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env_inter_kp
+
+      INTEGER                                            :: block, ispin, output_unit
+      REAL(KIND=dp)                                      :: norm_sq(3), tmp
+
+      norm_sq(:) = 0.0_dp
+      DO ispin = 1, SIZE(qs_ot_env)
+         IF (qs_ot_env(1)%settings%ks) THEN
+            CALL dbcsr_dot(qs_ot_env(ispin)%matrix_gx, qs_ot_env(ispin)%matrix_gx, tmp)
+            norm_sq(1) = norm_sq(1) + tmp
+            IF (qs_ot_env(ispin)%has_complex_kpoint_state) THEN
+               CALL dbcsr_dot(qs_ot_env(ispin)%matrix_gx_im, qs_ot_env(ispin)%matrix_gx_im, tmp)
+               norm_sq(1) = norm_sq(1) + tmp
+            END IF
+            IF (qs_ot_env(1)%settings%do_rotation) THEN
+               CALL dbcsr_dot(qs_ot_env(ispin)%rot_mat_gx, qs_ot_env(ispin)%rot_mat_gx, tmp)
+               norm_sq(2) = norm_sq(2) + 0.5_dp*tmp
+               IF (qs_ot_env(ispin)%has_complex_kpoint_state) THEN
+                  CALL dbcsr_dot(qs_ot_env(ispin)%rot_mat_gx_im, qs_ot_env(ispin)%rot_mat_gx_im, tmp)
+                  norm_sq(2) = norm_sq(2) + 0.5_dp*tmp
+               END IF
+            END IF
+         END IF
+         IF (qs_ot_env(1)%settings%do_ener) THEN
+            norm_sq(3) = norm_sq(3) + DOT_PRODUCT(qs_ot_env(ispin)%ener_gx, qs_ot_env(ispin)%ener_gx)
+         END IF
+      END DO
+      DO block = 1, SIZE(norm_sq)
+         CALL ot_mini_sum_kpoint_scalar(para_env_inter_kp, norm_sq(block))
+      END DO
+      output_unit = cp_logger_get_default_io_unit()
+      IF (output_unit > 0) THEN
+         WRITE (output_unit, '(A,4(1X,ES23.15))') 'OT| RAW_GRADIENT orbital rotation energies total:', &
+            SQRT(MAX(0.0_dp, norm_sq)), SQRT(MAX(0.0_dp, SUM(norm_sq)))
+      END IF
+   END SUBROUTINE ot_print_raw_gradient
 
 ! **************************************************************************************************
 !> \brief Evaluate the current OT derivative without advancing the minimizer.
@@ -957,6 +1010,22 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE do_line_search(qs_ot_env)
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
+
+      INTEGER                                            :: count, output_unit
+
+      IF (qs_ot_env(1)%settings%diagnostics) THEN
+         output_unit = cp_logger_get_default_io_unit()
+         count = qs_ot_env(1)%line_search_count
+         IF (output_unit > 0) THEN
+            IF (count == 0) THEN
+               WRITE (output_unit, '(A,4(1X,ES23.15))') 'OT| SEARCH energy slope step delta:', &
+                  qs_ot_env(1)%etotal, qs_ot_env(1)%gradient, qs_ot_env(1)%ds_min, qs_ot_env(1)%delta
+            ELSE
+               WRITE (output_unit, '(A,2(1X,ES23.15))') 'OT| TRIAL position energy:', &
+                  qs_ot_env(1)%OT_pos(count + 1), qs_ot_env(1)%etotal
+            END IF
+         END IF
+      END IF
 
       SELECT CASE (qs_ot_env(1)%settings%line_search_method)
       CASE ("GOLD")

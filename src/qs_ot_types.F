@@ -91,6 +91,7 @@ MODULE qs_ot_types
       INTEGER           :: precond_solver_type = -1
       INTEGER           :: chebyshev_degree = 8
       LOGICAL           :: safer_diis = .FALSE.
+      LOGICAL           :: diagnostics = .FALSE.
       REAL(KIND=dp)     :: ds_min = -1.0_dp
       REAL(KIND=dp)     :: energy_gap = -1.0_dp
       INTEGER           :: diis_m = -1
@@ -303,6 +304,7 @@ CONTAINS
       settings%diis_m = 7
       settings%lbfgs_curvature_tol = 1.0E-4_dp
       settings%lbfgs_damping = .TRUE.
+      settings%diagnostics = .FALSE.
       settings%preconditioner_name = "FULL_KINETIC"
       settings%preconditioner_type = ot_precond_full_kinetic
       settings%low_rank_base_name = "OVERLAP_INVERSE"
@@ -1716,6 +1718,7 @@ CONTAINS
       END IF
 
       CALL section_vals_val_get(ot_section, "MAX_SCF_DIIS", i_val=settings%max_scf_diis)
+      CALL section_vals_val_get(ot_section, "DIAGNOSTICS", l_val=settings%diagnostics)
 
       !If these values are negative we will set them "optimal" for a given precondtioner below
       CALL section_vals_val_get(ot_section, "STEPSIZE", r_val=settings%ds_min)
