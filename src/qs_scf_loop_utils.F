@@ -1084,6 +1084,22 @@ CONTAINS
                       para_env_inter_kp=para_env_inter_kp, &
                       gradient_prepared=ot_gradient_prepared)
       END IF
+      IF (physical_base_state .AND. local_ot_env(1)%settings%diagnostics_state .AND. &
+          local_ot_env(1)%line_search_count == 1) THEN
+         IF (MOD(scf_env%ot_diagnostic_evaluations - 1, &
+                 local_ot_env(1)%settings%diagnostics_state_interval) == 0) THEN
+            DO local_kpoint = 1, SIZE(kpoints%kp_env)
+               kp => kpoints%kp_env(local_kpoint)%kpoint_env
+               DO ispin = 1, nspin_ot
+                  local_channel = qs_ot_channel_index(ispin, kp%nkpoint, nspin_ot) - first_channel + 1
+                  CALL qs_scf_dump_ot_direction( &
+                     kp, local_ot_env(local_channel), ispin, scf_env%ot_diagnostic_evaluations, &
+                     scf_env%iter_count, wkp(kp%nkpoint), energy%total, local_ot_env(1)%etotal, &
+                     local_ot_env(1)%gradient)
+               END DO
+            END DO
+         END IF
+      END IF
       scf_env%iter_delta = local_ot_env(1)%delta
       energy_only = local_ot_env(1)%energy_only
 
@@ -2906,6 +2922,62 @@ CONTAINS
       DEALLOCATE (dense)
       IF (ionode) CLOSE (unit)
    END SUBROUTINE qs_scf_dump_ot_current_state
+
+! **************************************************************************************************
+!> \brief Export the actual stored search direction and its final raw covector, read-only.
+!>        The matching OTSTAT01 export precedes this minimizer call; the physical MO set is
+!>        still unchanged here, although the chart has advanced to its first trial coordinate.
+!> \param kp Actual physical K-point state.
+!> \param ot_env Channel containing the proposed direction.
+!> \param ispin Spin channel.
+!> \param evaluation Matching state-export identity.
+!> \param iteration Physical SCF iteration.
+!> \param weight K-point weight.
+!> \param native_f Actual physical origin F.
+!> \param chart_f Origin F seen by the line search.
+!> \param slope Reported total search slope.
+! **************************************************************************************************
+   SUBROUTINE qs_scf_dump_ot_direction(kp, ot_env, ispin, evaluation, iteration, weight, native_f, chart_f, slope)
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(qs_ot_type), INTENT(IN)                       :: ot_env
+      INTEGER, INTENT(IN)                                :: ispin, evaluation, iteration
+      REAL(KIND=dp), INTENT(IN)                          :: weight, native_f, chart_f, slope
+
+      CHARACTER(LEN=128)                                 :: filename
+      INTEGER                                            :: nao, nmo, unit
+      LOGICAL                                            :: ionode
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
+
+      CPASSERT(ot_env%use_dx)
+      CALL get_mo_set(kp%mos(1, ispin), nao=nao, nmo=nmo)
+      ionode = ot_env%para_env%is_source()
+      WRITE (filename, '(A,I0,A,I0,A,I0,A)') 'ot-direction-e', evaluation, '-k', kp%nkpoint, '-s', ispin, '.bin'
+      IF (ionode) THEN
+         OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='NEW', ACCESS='STREAM', FORM='UNFORMATTED')
+         WRITE (unit) 'OTDIR001'
+         WRITE (unit) evaluation, iteration, kp%nkpoint, ispin, nao, nmo
+         WRITE (unit) weight, native_f, chart_f, slope
+         WRITE (unit) ot_env%ener_dx, ot_env%ener_gx
+      END IF
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_dx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_dx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_dx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_dx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_gx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_gx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_gx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_gx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      DEALLOCATE (dense)
+      IF (ionode) CLOSE (unit)
+   END SUBROUTINE qs_scf_dump_ot_direction
 
 ! **************************************************************************************************
 !> \brief Read-only actual C/f capture bracketing a reference-chart refresh.
