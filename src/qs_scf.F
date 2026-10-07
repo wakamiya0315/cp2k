@@ -3743,7 +3743,7 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: fraction
       INTEGER, INTENT(IN)                                :: repetition, index, origin
 
-      REAL(dp)                                           :: other, values(11)
+      REAL(dp)                                           :: component_error, other, values(11)
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(qs_energy_type), POINTER                      :: energy
 
@@ -3768,9 +3768,10 @@ CONTAINS
                  energy%ee + energy%ee_core + energy%exc_aux_fit + energy%image_charge + &
                  energy%sccs_pol + energy%cdft + energy%exc1_aux_fit
          IF (dft_control%apply_embed_pot) other = other + energy%embed_corr
-         CPASSERT(ABS(eks - (energy%core + energy%core_overlap + energy%core_self + energy%core_cneo + &
-                             energy%hartree + energy%hartree_1c + energy%exc + energy%exc1 + energy%ex + &
-                             energy%dispersion + other)) <= 1.0E-10_dp)
+         component_error = ABS(eks - (energy%core + energy%core_overlap + energy%core_self + energy%core_cneo + &
+                                      energy%hartree + energy%hartree_1c + energy%exc + energy%exc1 + energy%ex + &
+                                      energy%dispersion + other))
+         CPASSERT(component_error <= 1.0E-10_dp)
          values = [energy%core, energy%core_overlap + energy%core_self + energy%core_cneo, &
                    energy%hartree, energy%hartree_1c, energy%exc, energy%exc1, energy%ex, &
                    energy%dispersion, other, energy%kinetic, energy%kTS]
