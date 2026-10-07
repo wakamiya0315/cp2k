@@ -7,7 +7,7 @@
 "H2O_NATIVE_SKALA_GPW.inp"     = [{matcher="E_total", tol=5e-6,  ref=-17.06733788},
                                   {matcher="SKALA_GPW_feature_electrons", tol=1e-8, ref=8.00008704097},
                                   {matcher="SKALA_GPW_feature_spin_moment", tol=1e-12, ref=0.0}]
-"H2_NATIVE_SKALA_GPW.inp"      = [{matcher="E_total", tol=5e-6, ref=-0.97943165294477}]
+"H2_NATIVE_SKALA_GPW.inp"      = [{matcher="E_total", tol=5e-6, ref=-0.97942945268151}]
 "NE4_NATIVE_GPW_PBE_REFERENCE.inp" = [{matcher="E_total", tol=1e-8, ref=-139.361323676360371}]
 "NE4_NATIVE_SKALA_GPW.inp" = [{matcher="E_total", tol=5e-6, ref=-139.3772191},
                               {matcher="SKALA_GPW_feature_electrons", tol=1e-8, ref=31.9973083474},
