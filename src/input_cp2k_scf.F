@@ -852,6 +852,18 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="DIAGNOSTICS_STATE", &
+                          description="Write native binary C/S/H and fixed-chart derivative snapshots"// &
+                          " at current Mermin OT states, without modifying the solver.", &
+                          usage="DIAGNOSTICS_STATE ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="DIAGNOSTICS_STATE_INTERVAL", &
+                          description="Current-state diagnostic interval in accepted gradient evaluations.", &
+                          usage="DIAGNOSTICS_STATE_INTERVAL 1", default_i_val=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create( &
          keyword, __LOCATION__, name="STEPSIZE", &
          description="Initial stepsize used for the line search, sometimes this parameter can be reduced to stabilize DIIS"// &

@@ -99,6 +99,7 @@ MODULE qs_scf_types
    TYPE qs_scf_env_type
       TYPE(qs_outer_scf_type) :: outer_scf = qs_outer_scf_type()
       INTEGER :: iter_count = -1
+      INTEGER :: ot_diagnostic_evaluations = 0
       INTEGER :: cholesky_method = -1, nelectron = -1, method = -1, mixing_method = -1, nskip_mixing = -1
       REAL(KIND=dp) :: iter_param = -1.0_dp, iter_delta = -1.0_dp, p_mix_alpha = -1.0_dp, sum_zeff_corr = -1.0_dp
       ! ADIIS diagnostics: accepted-step norm and raw-map delta.
