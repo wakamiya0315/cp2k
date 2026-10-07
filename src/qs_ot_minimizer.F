@@ -372,12 +372,18 @@ CONTAINS
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
       TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env_inter_kp
 
-      INTEGER                                            :: block, ispin, output_unit
-      REAL(KIND=dp)                                      :: norm_sq(3), tmp
+      INTEGER                                            :: block, ispin, ncol, nrow, output_unit
+      REAL(KIND=dp)                                      :: norm_sq(3), nvariables, tmp
 
       norm_sq(:) = 0.0_dp
+      nvariables = 0.0_dp
       DO ispin = 1, SIZE(qs_ot_env)
          IF (qs_ot_env(1)%settings%ks) THEN
+            CALL dbcsr_get_info(qs_ot_env(ispin)%matrix_gx, &
+                                nfullrows_total=nrow, nfullcols_total=ncol)
+            tmp = REAL(INT(nrow, int_8)*INT(ncol, int_8), dp)
+            IF (qs_ot_env(ispin)%has_complex_kpoint_state) tmp = 2.0_dp*tmp
+            nvariables = nvariables + tmp
             CALL dbcsr_dot(qs_ot_env(ispin)%matrix_gx, qs_ot_env(ispin)%matrix_gx, tmp)
             norm_sq(1) = norm_sq(1) + tmp
             IF (qs_ot_env(ispin)%has_complex_kpoint_state) THEN
@@ -395,15 +401,22 @@ CONTAINS
          END IF
          IF (qs_ot_env(1)%settings%do_ener) THEN
             norm_sq(3) = norm_sq(3) + DOT_PRODUCT(qs_ot_env(ispin)%ener_gx, qs_ot_env(ispin)%ener_gx)
+            nvariables = nvariables + REAL(SIZE(qs_ot_env(ispin)%ener_gx), dp)
          END IF
       END DO
       DO block = 1, SIZE(norm_sq)
          CALL ot_mini_sum_kpoint_scalar(para_env_inter_kp, norm_sq(block))
       END DO
+      CALL ot_mini_sum_kpoint_scalar(para_env_inter_kp, nvariables)
       output_unit = cp_logger_get_default_io_unit()
       IF (output_unit > 0) THEN
          WRITE (output_unit, '(A,4(1X,ES23.15))') 'OT| RAW_GRADIENT orbital rotation energies total:', &
             SQRT(MAX(0.0_dp, norm_sq)), SQRT(MAX(0.0_dp, SUM(norm_sq)))
+         ! Use the conventional CG denominator, without padding it with rotation variables.
+         IF (nvariables > 0.0_dp) THEN
+            WRITE (output_unit, '(A,2(1X,ES23.15))') 'OT| RAW_RMS nvariables value:', &
+               nvariables, SQRT(MAX(0.0_dp, SUM(norm_sq))/nvariables)
+         END IF
       END IF
    END SUBROUTINE ot_print_raw_gradient
 
