@@ -14,3 +14,5 @@
 "H2P_NATIVE_SKALA_GPW_UKS_PBC_FORCE_DEBUG.inp" = [{matcher="DEBUG_force_sum", tol=1e-3, ref=0.0}]
 "HF_NATIVE_SKALA_GAPW_PAW_NLCC_STRESS.inp" = [{matcher="E_total", tol=5e-4, ref=-23.72450827765146},
                                                 {matcher="SKALA_GAPW_composite_electrons", tol=1e-8, ref=9.23040392825558}]
+"HF_NATIVE_SKALA_GAPW_PAW_NLCC_UKS_STRESS.inp" = [{matcher="E_total", tol=1e-08, ref=-23.72309322054821},
+                                                    {matcher="SKALA_GAPW_composite_electrons", tol=1e-08, ref=9.225301625858458}]
