@@ -935,9 +935,9 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'init_rho_atom'
 
       CHARACTER(LEN=4)                                   :: my_ikind, my_la, my_llmax
-      INTEGER :: handle, ikind, il, iso, iso1, iso2, l1, l1l2, l2, la, lc1, lc2, lcleb, ll, llmax, &
-         lmax_sphere, lp, m1, m2, max_s_harm, max_s_set, maxl, maxlgto, maxs, mm, mp, na, nat, &
-         natom, nr, nspins, quadrature
+      INTEGER :: handle, ikind, il, ilg, iso, iso1, iso2, l1, l1l2, l2, la, lc1, lc2, lcleb, ll, &
+         llmax, lmax_sphere, lp, m1, m2, max_s_harm, max_s_set, maxl, maxlgto, maxs, mm, mp, na, &
+         nat, natom, nr, nspins, quadrature
       INTEGER, DIMENSION(:), POINTER                     :: atom_list
       LOGICAL                                            :: paw_atom
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: rga
@@ -1028,6 +1028,17 @@ CONTAINS
 
 !   *** initialize the Lebedev grids ***
       CALL init_lebedev_grids()
+      IF (gapw_control%rotate_lebedev) THEN
+         ! Orient the octahedral symmetry of all atomic grids (QS%LEBEDEV_GRID_ROTATION). Grids,
+         ! harmonics and the native-grid composite points below are all built from these directions.
+         DO ilg = 1, SIZE(lebedev_grid)
+            IF (ASSOCIATED(lebedev_grid(ilg)%r)) THEN
+               lebedev_grid(ilg)%r(:, :) = MATMUL(gapw_control%lebedev_rotation, lebedev_grid(ilg)%r)
+               ! rounding can push a direction cosine past 1 (Legendre functions, ACOS)
+               lebedev_grid(ilg)%r(:, :) = MAX(-1.0_dp, MIN(1.0_dp, lebedev_grid(ilg)%r(:, :)))
+            END IF
+         END DO
+      END IF
       quadrature = gapw_control%quadrature
 
       DO ikind = 1, SIZE(atomic_kind_set)
