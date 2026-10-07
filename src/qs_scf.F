@@ -639,7 +639,6 @@ CONTAINS
 
             CALL timeset(routineN//"_inner_loop", handle2)
 
-            IF (.NOT. just_energy) scf_env%iter_count = scf_env%iter_count + 1
             iter_count = iter_count + 1
             CALL cp_iterate(logger%iter_info, last=.FALSE., iter_nr=iter_count)
 
@@ -647,6 +646,9 @@ CONTAINS
 
             total_steps = total_steps + 1
             just_energy = energy_only
+            ! Count the current KS build, not the preceding line-search build. The smeared
+            ! minimum and convergence gates require full-gradient evaluations.
+            IF (.NOT. just_energy) scf_env%iter_count = scf_env%iter_count + 1
 
             CALL qs_scf_full_bloch_initialize(qs_env, scf_env, full_bloch_changed)
             IF (full_bloch_changed) THEN

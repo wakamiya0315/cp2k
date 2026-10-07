@@ -3340,6 +3340,11 @@ CONTAINS
                'OT| Density residual reached EPS_SCF, but the inner eigensolver did not converge.'
          END IF
       END IF
+      IF (scf_env%method == ot_method_nr) THEN
+         ! An energy-only line-search trial still carries its origin's residual. It has
+         ! neither a current gradient nor the full H needed for the final force W matrix.
+         update_validated = update_validated .AND. .NOT. just_energy
+      END IF
 
       CALL external_control(should_stop, "SCF", target_time=qs_env%target_time, &
                             start_time=qs_env%start_time)
