@@ -114,6 +114,8 @@ MODULE scf_control_types
       REAL(KIND=dp)                         :: adiis_shift = 0.0_dp
       INTEGER                               :: max_iter = -1, nkrylov = -1, nblock_krylov = -1
       LOGICAL                               :: adiis_verbose = .FALSE.
+      ! Test-only gauge of the copied complex orbitals in k-point KS-DIIS (DIIS_TEST_GAUGE)
+      INTEGER                               :: diis_test_gauge = 0
       ! Maximum Overlap Method
       LOGICAL                               :: mom = .FALSE., mom_didguess = .FALSE.
       INTEGER                               :: mom_proj_formula = -1
@@ -413,6 +415,8 @@ CONTAINS
                                    i_val=scf_control%diagonalization%method)
          CALL section_vals_val_get(scf_section, "DIAGONALIZATION%UPDATE_METHOD", &
                                    i_val=scf_control%diagonalization%update_method)
+         CALL section_vals_val_get(scf_section, "DIAGONALIZATION%DIIS_TEST_GAUGE", &
+                                   i_val=scf_control%diagonalization%diis_test_gauge)
          CALL section_vals_val_get(scf_section, "DIAGONALIZATION%EPS_JACOBI", &
                                    r_val=scf_control%diagonalization%eps_jacobi)
          CALL section_vals_val_get(scf_section, "DIAGONALIZATION%JACOBI_THRESHOLD", &

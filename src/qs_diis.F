@@ -19,7 +19,9 @@
 !> \author Matthias Krack (28.06.2000)
 ! **************************************************************************************************
 MODULE qs_diis
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale_and_add_fm,&
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_column_scale,&
+                                              cp_cfm_rot_cols,&
+                                              cp_cfm_scale_and_add_fm,&
                                               cp_cfm_trace
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
@@ -54,9 +56,13 @@ MODULE qs_diis
                                               cp_print_key_unit_nr
    USE dm_ls_scf_types,                 ONLY: ls_scf_env_type
    USE input_section_types,             ONLY: section_vals_type
+   USE kahan_sum,                       ONLY: accurate_dot_product
    USE kinds,                           ONLY: default_string_length,&
                                               dp
    USE local_gemm_api,                  ONLY: local_gemm_ctxt_type
+   USE machine,                         ONLY: default_output_unit
+   USE mathconstants,                   ONLY: z_one,&
+                                              z_zero
    USE mathlib,                         ONLY: diag_complex,&
                                               diamat_all
    USE message_passing,                 ONLY: mp_para_env_type
@@ -1012,10 +1018,12 @@ CONTAINS
 !> \param real_wfn ...
 !> \param local use local GEMM on a one-rank k-point group
 !> \param gemm_ctx private local GEMM context, unused for distributed groups
+!> \param test_gauge test-only gauge of the copied complex orbitals (DIIS_TEST_GAUGE), default none
 !> \note We assume that we always have an overlap matrix.
 !> TODO: do we need to pass the kp weight for the back Fourier transform?
 ! **************************************************************************************************
-   SUBROUTINE qs_diis_b_calc_err_kp(diis_buffer, ib, mos, kc, sc, ispin, ikp, cmos, real_wfn, local, gemm_ctx)
+   SUBROUTINE qs_diis_b_calc_err_kp(diis_buffer, ib, mos, kc, sc, ispin, ikp, cmos, real_wfn, local, &
+                                    gemm_ctx, test_gauge)
       TYPE(qs_diis_buffer_type_kp), POINTER              :: diis_buffer
       INTEGER, INTENT(IN)                                :: ib
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
@@ -1024,12 +1032,16 @@ CONTAINS
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: cmos
       LOGICAL, INTENT(IN), OPTIONAL                      :: real_wfn, local
       TYPE(local_gemm_ctxt_type), INTENT(INOUT)          :: gemm_ctx
+      INTEGER, INTENT(IN), OPTIONAL                      :: test_gauge
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_diis_b_calc_err_kp'
 
-      INTEGER                                            :: handle, homo, nao
-      LOGICAL                                            :: my_real_wfn
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:, :)          :: reference_error
+      INTEGER                                            :: gauge_mode, handle, homo, nao, &
+                                                            ncol_local, nmo, nrow_local
+      LOGICAL                                            :: my_local, my_real_wfn, unitary_rotated
       REAL(dp)                                           :: maxocc
+      REAL(dp), DIMENSION(:), POINTER                    :: occupation_numbers
       TYPE(cp_cfm_type), POINTER                         :: new_errors, parameters, smat
       TYPE(cp_fm_type), POINTER                          :: rmos
 
@@ -1064,6 +1076,32 @@ CONTAINS
       !copy the KS and overlap matrices to the DIIS buffer
       CALL cp_cfm_to_cfm(kc, parameters)
       CALL cp_cfm_to_cfm(sc, smat)
+
+      IF (.NOT. my_real_wfn) THEN
+         ! Complex orbitals: S P K - K P S with P = C diag(f) C^H of the actual occupations,
+         ! including a fractional tail; homo and maxocc misweight smeared occupations.
+         gauge_mode = 0
+         IF (PRESENT(test_gauge)) gauge_mode = test_gauge
+         my_local = .FALSE.
+         IF (PRESENT(local)) my_local = local
+         CALL get_mo_set(mos(ispin), nmo=nmo, occupation_numbers=occupation_numbers)
+         CALL qs_diis_kp_commutator(cmos, occupation_numbers, parameters, smat, kc, sc, new_errors, &
+                                    nao, nmo, my_local, gemm_ctx)
+         IF (gauge_mode > 0) THEN
+            CALL cp_cfm_get_info(new_errors, nrow_local=nrow_local, ncol_local=ncol_local)
+            ALLOCATE (reference_error(nrow_local, ncol_local))
+            reference_error = new_errors%local_data(1:nrow_local, 1:ncol_local)
+            CALL qs_diis_kp_gauge_transform(cmos, occupation_numbers, ikp, ispin, gauge_mode, &
+                                            unitary_rotated)
+            CALL qs_diis_kp_commutator(cmos, occupation_numbers, parameters, smat, kc, sc, &
+                                       new_errors, nao, nmo, my_local, gemm_ctx)
+            CALL qs_diis_kp_gauge_check(new_errors, reference_error, ikp, ispin, gauge_mode, &
+                                        unitary_rotated, reduce=.NOT. my_local)
+            DEALLOCATE (reference_error)
+         END IF
+         CALL timestop(handle)
+         RETURN
+      END IF
 
       ! KC <- K*C; SC <- S*C. Retain the existing factor of two in SC.
       ! new_errors <- KC*(SC)^H - SC*(KC)^H.
@@ -1102,6 +1140,159 @@ CONTAINS
    END SUBROUTINE qs_diis_b_calc_err_kp
 
 ! **************************************************************************************************
+!> \brief Form S P K - K P S with P = C diag(f) C^H, retaining every actual occupation.
+!>        A common residual sign leaves the Hermitian Gram matrix and DIIS coefficients unchanged.
+!> \param cmos copied complex orbitals
+!> \param occupation_numbers actual occupations, including a fractional tail
+!> \param parameters Kohn-Sham matrix
+!> \param smat overlap matrix
+!> \param kc scratch for K C diag(f)
+!> \param sc scratch for S C
+!> \param error anti-Hermitian residual
+!> \param nao AO dimension
+!> \param nmo MO dimension
+!> \param local use local GEMM on a one-rank k-point group
+!> \param gemm_ctx private local GEMM context, unused for distributed groups
+! **************************************************************************************************
+   SUBROUTINE qs_diis_kp_commutator(cmos, occupation_numbers, parameters, smat, kc, sc, error, &
+                                    nao, nmo, local, gemm_ctx)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: cmos
+      REAL(dp), DIMENSION(:), INTENT(IN)                 :: occupation_numbers
+      TYPE(cp_cfm_type), INTENT(IN)                      :: parameters, smat
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: kc, sc, error
+      INTEGER, INTENT(IN)                                :: nao, nmo
+      LOGICAL, INTENT(IN)                                :: local
+      TYPE(local_gemm_ctxt_type), INTENT(INOUT)          :: gemm_ctx
+
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:)             :: weights
+      INTEGER                                            :: imo
+
+      CPASSERT(SIZE(occupation_numbers) >= nmo)
+      IF (local) THEN
+         CALL gemm_ctx%gemm("N", "N", nao, nmo, nao, z_one, &
+                            parameters%local_data, SIZE(parameters%local_data, 1), &
+                            cmos%local_data, SIZE(cmos%local_data, 1), z_zero, &
+                            kc%local_data, SIZE(kc%local_data, 1))
+         CALL gemm_ctx%gemm("N", "N", nao, nmo, nao, z_one, &
+                            smat%local_data, SIZE(smat%local_data, 1), &
+                            cmos%local_data, SIZE(cmos%local_data, 1), z_zero, &
+                            sc%local_data, SIZE(sc%local_data, 1))
+         DO imo = 1, nmo
+            kc%local_data(:, imo) = occupation_numbers(imo)*kc%local_data(:, imo)
+         END DO
+         CALL gemm_ctx%gemm("N", "C", nao, nao, nmo, z_one, &
+                            kc%local_data, SIZE(kc%local_data, 1), &
+                            sc%local_data, SIZE(sc%local_data, 1), z_zero, &
+                            error%local_data, SIZE(error%local_data, 1))
+         CALL gemm_ctx%gemm("N", "C", nao, nao, nmo, z_one, &
+                            sc%local_data, SIZE(sc%local_data, 1), &
+                            kc%local_data, SIZE(kc%local_data, 1), -z_one, &
+                            error%local_data, SIZE(error%local_data, 1))
+      ELSE
+         CALL parallel_gemm("N", "N", nao, nmo, nao, z_one, parameters, cmos, z_zero, kc)
+         CALL parallel_gemm("N", "N", nao, nmo, nao, z_one, smat, cmos, z_zero, sc)
+         ! The scratch is AO-square; a full-length scaling vector also covers distributed columns.
+         ALLOCATE (weights(nao))
+         weights = z_zero
+         weights(1:nmo) = CMPLX(occupation_numbers(1:nmo), 0.0_dp, KIND=dp)
+         CALL cp_cfm_column_scale(kc, weights)
+         DEALLOCATE (weights)
+         CALL parallel_gemm("N", "C", nao, nao, nmo, z_one, kc, sc, z_zero, error)
+         CALL parallel_gemm("N", "C", nao, nao, nmo, z_one, sc, kc, -z_one, error)
+      END IF
+   END SUBROUTINE qs_diis_kp_commutator
+
+! **************************************************************************************************
+!> \brief Apply a test gauge to copied orbitals, preserving C diag(f) C^H.
+!> \param cmos copied orbitals, never the stored MO coefficients
+!> \param occupations occupations are unchanged; only an exactly equal positive pair may rotate
+!> \param ikp k-point index for deterministic phases
+!> \param ispin spin index
+!> \param mode 1 phases, 2 unitary rotation, 3 both
+!> \param rotated whether a positive-occupation pair was rotated
+! **************************************************************************************************
+   SUBROUTINE qs_diis_kp_gauge_transform(cmos, occupations, ikp, ispin, mode, rotated)
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cmos
+      REAL(dp), DIMENSION(:), INTENT(IN)                 :: occupations
+      INTEGER, INTENT(IN)                                :: ikp, ispin, mode
+      LOGICAL, INTENT(OUT)                               :: rotated
+
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:)             :: phases
+      INTEGER                                            :: i, j, nmo
+      REAL(dp)                                           :: angle
+
+      CALL cp_cfm_get_info(cmos, ncol_global=nmo)
+      CPASSERT(SIZE(occupations) >= nmo)
+      rotated = .FALSE.
+      IF (mode == 1 .OR. mode == 3) THEN
+         ALLOCATE (phases(nmo))
+         phases = z_one
+         DO j = 1, nmo
+            IF (occupations(j) /= 0.0_dp) THEN
+               angle = 0.37_dp*REAL(ikp, dp) + 0.53_dp*REAL(ispin, dp) + 0.71_dp*REAL(j, dp)
+               phases(j) = CMPLX(COS(angle), SIN(angle), KIND=dp)
+            END IF
+         END DO
+         CALL cp_cfm_column_scale(cmos, phases)
+         DEALLOCATE (phases)
+      END IF
+      IF (mode == 2 .OR. mode == 3) THEN
+         occupied_pair: DO i = 1, nmo - 1
+            DO j = i + 1, nmo
+               IF (occupations(i) > 0.0_dp .AND. occupations(i) == occupations(j)) THEN
+                  CALL cp_cfm_rot_cols(cmos, i, j, 0.8_dp, 0.6_dp)
+                  rotated = .TRUE.
+                  EXIT occupied_pair
+               END IF
+            END DO
+         END DO occupied_pair
+      END IF
+   END SUBROUTINE qs_diis_kp_gauge_transform
+
+! **************************************************************************************************
+!> \brief Verify the full residual and its Hermitian squared norm after an explicit test gauge.
+!> \param error transformed residual
+!> \param reference original local residual, excluding matrix padding
+!> \param ikp k-point index
+!> \param ispin spin index
+!> \param mode test mode
+!> \param rotated whether the equal-occupation rotation was exercised
+!> \param reduce true for distributed matrices, false for one-rank k-point groups
+! **************************************************************************************************
+   SUBROUTINE qs_diis_kp_gauge_check(error, reference, ikp, ispin, mode, rotated, reduce)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: error
+      COMPLEX(dp), DIMENSION(:, :), INTENT(IN)           :: reference
+      INTEGER, INTENT(IN)                                :: ikp, ispin, mode
+      LOGICAL, INTENT(IN)                                :: rotated, reduce
+
+      COMPLEX(dp)                                        :: norm_after, norm_before
+      INTEGER                                            :: nc, nr
+      REAL(dp)                                           :: difference, scale
+
+      nr = SIZE(reference, 1)
+      nc = SIZE(reference, 2)
+      difference = MAX(0.0_dp, MAXVAL(ABS(error%local_data(1:nr, 1:nc) - reference)))
+      scale = MAX(1.0_dp, MAXVAL(ABS(reference)))
+      norm_before = accurate_dot_product(CONJG(reference), reference)
+      norm_after = accurate_dot_product(CONJG(error%local_data(1:nr, 1:nc)), error%local_data(1:nr, 1:nc))
+      IF (reduce) THEN
+         CALL error%matrix_struct%para_env%max(difference)
+         CALL error%matrix_struct%para_env%max(scale)
+         CALL error%matrix_struct%para_env%sum(norm_before)
+         CALL error%matrix_struct%para_env%sum(norm_after)
+      END IF
+      CPASSERT(difference <= 1.0E-10_dp*scale)
+      CPASSERT(ABS(norm_after - norm_before) <= 1.0E-10_dp*MAX(1.0_dp, ABS(norm_before)))
+      IF (error%matrix_struct%para_env%mepos == 0) THEN
+!$OMP CRITICAL(diis_gauge_output)
+         WRITE (default_output_unit, '(A,3I7,L3,3ES23.14)') &
+            " DIIS_GAUGE| mode,k,spin,rotated,max-error,norm2,norm2-error ", &
+            mode, ikp, ispin, rotated, difference, REAL(norm_after, dp), ABS(norm_after - norm_before)
+!$OMP END CRITICAL(diis_gauge_output)
+      END IF
+   END SUBROUTINE qs_diis_kp_gauge_check
+
+! **************************************************************************************************
 !> \brief Update the SCF DIIS buffer, and if appropriate does a diis step, for k-points
 !> \param diis_buffer ...
 !> \param coeffs ...
@@ -1117,9 +1308,11 @@ CONTAINS
 !> \param nmixing ...
 !> \param scf_section ...
 !> \param para_env_inter_kp communicator connecting the k-point groups
+!> \param test_gauge test-only gauge mode (DIIS_TEST_GAUGE); when set, the Gram matrix and the
+!>        coefficients are printed for an independent replay
 ! **************************************************************************************************
    SUBROUTINE qs_diis_b_step_kp(diis_buffer, coeffs, ib, nb, delta, error_max, diis_step, eps_diis, &
-                                nspin, nkp, nkp_local, nmixing, scf_section, para_env_inter_kp)
+                                nspin, nkp, nkp_local, nmixing, scf_section, para_env_inter_kp, test_gauge)
 
       TYPE(qs_diis_buffer_type_kp), POINTER              :: diis_buffer
       COMPLEX(KIND=dp), DIMENSION(:), INTENT(INOUT)      :: coeffs
@@ -1132,6 +1325,7 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: nmixing
       TYPE(section_vals_type), POINTER                   :: scf_section
       TYPE(mp_para_env_type), POINTER                    :: para_env_inter_kp
+      INTEGER, INTENT(IN), OPTIONAL                      :: test_gauge
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'qs_diis_b_step_kp'
       REAL(KIND=dp), PARAMETER :: eigenvalue_threshold = 1.0E-12_dp
@@ -1139,8 +1333,8 @@ CONTAINS
       CHARACTER(LEN=2*default_string_length)             :: message
       COMPLEX(KIND=dp)                                   :: tmp
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: a, b
-      INTEGER                                            :: handle, ikp, ispin, jb, my_nmixing, nb1, &
-                                                            output_unit
+      INTEGER                                            :: gauge_mode, handle, ikp, ispin, jb, kb, &
+                                                            my_nmixing, nb1, output_unit
       LOGICAL                                            :: eigenvectors_discarded
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ev
       TYPE(cp_cfm_type)                                  :: old_errors
@@ -1289,6 +1483,24 @@ CONTAINS
 
          coeffs(:) = 0.0_dp
          coeffs(ib) = 1.0_dp
+      END IF
+
+      gauge_mode = 0
+      IF (PRESENT(test_gauge)) gauge_mode = test_gauge
+      IF (gauge_mode > 0) THEN
+         ! Test output for an independent high-precision replay of the DIIS Gram system,
+         ! printed once: by the first rank of the first k-point group.
+         IF (matrix_struct%para_env%mepos == 0 .AND. para_env_inter_kp%mepos == 0) THEN
+            DO jb = 1, nb
+               DO kb = 1, nb
+                  WRITE (default_output_unit, '(A,4I7,2ES23.14)') " DIIS_GRAM| ncall,nb,row,col,re,im ", &
+                     diis_buffer%ncall, nb, jb, kb, REAL(diis_buffer%b_matrix(jb, kb), dp), &
+                     AIMAG(diis_buffer%b_matrix(jb, kb))
+               END DO
+               WRITE (default_output_unit, '(A,3I7,L3,2ES23.14)') " DIIS_COEFF| ncall,nb,row,diis,re,im ", &
+                  diis_buffer%ncall, nb, jb, diis_step, REAL(coeffs(jb), dp), AIMAG(coeffs(jb))
+            END DO
+         END IF
       END IF
 
       CALL cp_print_key_finished_output(output_unit, logger, scf_section, &
