@@ -52,6 +52,7 @@ MODULE qs_scf
         dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_get_info, &
         dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, dbcsr_release_p, dbcsr_set, dbcsr_type, &
         dbcsr_type_no_symmetry
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
                                               cp_dbcsr_m_by_n_from_row_template,&
@@ -68,6 +69,7 @@ MODULE qs_scf
                                               cp_fm_type
    USE cp_log_handling,                 ONLY: cp_add_default_logger,&
                                               cp_get_default_logger,&
+                                              cp_logger_get_default_io_unit,&
                                               cp_logger_release,&
                                               cp_logger_type,&
                                               cp_rm_default_logger,&
@@ -166,7 +168,9 @@ MODULE qs_scf
    USE qs_mo_io,                        ONLY: write_mo_set_to_restart
    USE qs_mo_methods,                   ONLY: make_basis_simple,&
                                               make_basis_sm
-   USE qs_mo_occupation,                ONLY: set_mo_occupation
+   USE qs_mo_occupation,                ONLY: fixed_spin_targets,&
+                                              separate_smear_spins,&
+                                              set_mo_occupation
    USE qs_mo_types,                     ONLY: allocate_mo_set,&
                                               deallocate_mo_set,&
                                               duplicate_mo_set,&
@@ -361,6 +365,8 @@ CONTAINS
             scf_control%outer_scf%have_scf = outer_scf_loop
             first_step_flag = .FALSE.
          END IF
+
+         IF (converged) CALL qs_scf_check_fixed_spin_populations(qs_env)
 
          ! *** compute properties that depend on the converged wavefunction
          IF (.NOT. (should_stop)) CALL qs_scf_compute_properties(qs_env)
@@ -3288,5 +3294,81 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE qs_cdft_line_search
+
+! **************************************************************************************************
+!> \brief Check the fixed spin target against occupations, Tr(PS), and the grid integral.
+!> \param qs_env ...
+   SUBROUTINE qs_scf_check_fixed_spin_populations(qs_env)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+
+      INTEGER                                            :: ic, ikp, ispin, iw, ne_a, ne_b
+      LOGICAL                                            :: do_kpoints
+      REAL(KIND=dp)                                      :: dot, grid_count, nel_spin(2), &
+                                                            occupation_count(2), tolerance, &
+                                                            trace_count(2)
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: tot_rho_r, wkp
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s, rho_ao
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(qs_charges_type), POINTER                     :: qs_charges
+      TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(scf_control_type), POINTER                    :: scf_control
+
+      CALL get_qs_env(qs_env, dft_control=dft_control, scf_control=scf_control)
+      IF (dft_control%nspins /= 2 .OR. dft_control%roks) RETURN
+      IF (.NOT. scf_control%smear%do_smear) RETURN
+      IF (.NOT. separate_smear_spins(scf_control%smear)) RETURN
+      CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, mos=mos, matrix_s_kp=matrix_s, do_kpoints=do_kpoints, qs_charges=qs_charges)
+      CALL qs_rho_get(rho, rho_ao_kp=rho_ao, tot_rho_r=tot_rho_r)
+      occupation_count = 0.0_dp
+      IF (do_kpoints) THEN
+         CALL get_mo_set(kpoints%kp_env(1)%kpoint_env%mos(1, 1), nelectron=ne_a)
+         CALL get_mo_set(kpoints%kp_env(1)%kpoint_env%mos(1, 2), nelectron=ne_b)
+         CALL get_kpoint_info(kpoints, wkp=wkp)
+         DO ikp = 1, SIZE(kpoints%kp_env)
+            DO ispin = 1, 2
+               occupation_count(ispin) = occupation_count(ispin) + &
+                                         wkp(kpoints%kp_env(ikp)%kpoint_env%nkpoint)* &
+                                         SUM(kpoints%kp_env(ikp)%kpoint_env%mos(1, ispin)%occupation_numbers)
+            END DO
+         END DO
+         CALL kpoints%para_env_inter_kp%sum(occupation_count)
+      ELSE
+         ne_a = mos(1)%nelectron
+         ne_b = mos(2)%nelectron
+         DO ispin = 1, 2
+            occupation_count(ispin) = SUM(mos(ispin)%occupation_numbers)
+         END DO
+      END IF
+      CALL fixed_spin_targets(scf_control%smear, ne_a, ne_b, nel_spin)
+      trace_count = 0.0_dp
+      DO ic = 1, SIZE(rho_ao, 2)
+         DO ispin = 1, 2
+            CALL dbcsr_dot(rho_ao(ispin, ic)%matrix, matrix_s(1, ic)%matrix, dot)
+            trace_count(ispin) = trace_count(ispin) + dot
+         END DO
+      END DO
+      iw = cp_logger_get_default_io_unit()
+      DO ispin = 1, 2
+         tolerance = MAX(1.0E-6_dp, &
+                         10.0_dp*scf_control%smear%eps_fermi_dirac*MAX(1.0_dp, nel_spin(ispin)))
+         ! GAPW's regular grid is the soft density; add the spin-resolved one-center correction.
+         ! GAPW_XC and GPW keep the physical electronic density on the regular grid.
+         grid_count = tot_rho_r(ispin)
+         IF (dft_control%qs_control%gapw) grid_count = grid_count + &
+                                                       qs_charges%total_rho1_hard(ispin) - qs_charges%total_rho1_soft(ispin)
+         grid_count = ABS(grid_count)
+         IF (iw > 0) WRITE (iw, '(T2,A,I2,4ES22.12)') &
+            "FIXED_MOMENT| spin,target,occupation,Tr(PS),grid ", ispin, nel_spin(ispin), &
+            occupation_count(ispin), trace_count(ispin), grid_count
+         IF (ABS(occupation_count(ispin) - nel_spin(ispin)) > tolerance) CALL cp_warn(__LOCATION__, &
+                                                                              "Fixed-moment occupation sum differs from its target")
+         IF (ABS(trace_count(ispin) - nel_spin(ispin)) > tolerance) CALL cp_warn(__LOCATION__, &
+                                                                                 "Fixed-moment Tr(PS) differs from its target")
+         IF (ABS(grid_count - nel_spin(ispin)) > tolerance) CALL cp_warn(__LOCATION__, &
+                                                                         "Fixed-moment grid integral differs from its target")
+      END DO
+   END SUBROUTINE qs_scf_check_fixed_spin_populations
 
 END MODULE qs_scf
