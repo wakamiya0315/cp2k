@@ -211,6 +211,7 @@ MODULE qs_scf
    USE qs_scf_loop_utils,               ONLY: &
         qs_scf_candidate_density_delta, qs_scf_check_inner_exit, qs_scf_check_outer_exit, &
         qs_scf_commit_density_candidate, qs_scf_density_mixing, qs_scf_inner_finalize, &
+        qs_scf_dump_ot_rebase_state, &
         qs_scf_kp_search_endpoint, qs_scf_new_mos, qs_scf_new_mos_kp, qs_scf_rho_update, &
         qs_scf_set_loop_flags
    USE qs_scf_oda,                      ONLY: qs_scf_oda_apply
@@ -881,6 +882,9 @@ CONTAINS
                      "K-point OT: rebasing reference chart while preserving the current electronic state."
                END IF
                CALL qs_kpoint_state_commit(qs_env, update_occupations=.FALSE.)
+               IF (scf_env%qs_ot_env(1)%settings%diagnostics_state) THEN
+                  CALL qs_scf_dump_ot_rebase_state(qs_env, scf_env%ot_diagnostic_evaluations, 1)
+               END IF
                IF (ASSOCIATED(scf_env%qs_ot_env)) THEN
                   DO ispin = 1, SIZE(scf_env%qs_ot_env)
                      CALL ot_scf_destroy(scf_env%qs_ot_env(ispin))
@@ -1731,6 +1735,10 @@ CONTAINS
                                                 matrix_s_kp=matrix_s_kp, &
                                                 matrix_t_kp=matrix_t_kp, &
                                                 nspin_ot=nspin_ot)
+               IF (entry_reason == kp_ot_entry_refresh .AND. &
+                   scf_env%qs_ot_env(1)%settings%diagnostics_state) THEN
+                  CALL qs_scf_dump_ot_rebase_state(qs_env, scf_env%ot_diagnostic_evaluations, 2)
+               END IF
             END IF
 
             CALL timestop(handle)

@@ -137,6 +137,7 @@ MODULE qs_scf_loop_utils
 
    PUBLIC :: qs_scf_set_loop_flags, &
              qs_scf_new_mos, qs_scf_new_mos_kp, &
+             qs_scf_dump_ot_rebase_state, &
              qs_scf_kp_ref_refresh_ready, qs_scf_kp_search_endpoint, &
              qs_scf_candidate_density_delta, qs_scf_commit_density_candidate, &
              qs_scf_density_mixing, qs_scf_check_inner_exit, &
@@ -2905,6 +2906,59 @@ CONTAINS
       DEALLOCATE (dense)
       IF (ionode) CLOSE (unit)
    END SUBROUTINE qs_scf_dump_ot_current_state
+
+! **************************************************************************************************
+!> \brief Read-only actual C/f capture bracketing a reference-chart refresh.
+!> \param qs_env Current physical QS state, after its density has been committed.
+!> \param evaluation Unchanged diagnostic evaluation identity across the refresh.
+!> \param phase One before workspace destruction, two after workspace allocation.
+! **************************************************************************************************
+   SUBROUTINE qs_scf_dump_ot_rebase_state(qs_env, evaluation, phase)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER, INTENT(IN)                                :: evaluation, phase
+
+      CHARACTER(LEN=128)                                 :: filename
+      INTEGER                                            :: local_kpoint, ispin, nao, nmo, unit
+      LOGICAL                                            :: ionode
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation, eigenvalues, weights
+      TYPE(cp_fm_type), POINTER                          :: coeff
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+      NULLIFY (coeff, eigenvalues, energy, kp, kpoints, occupation, weights)
+      CPASSERT(phase == 1 .OR. phase == 2)
+      CALL get_qs_env(qs_env, kpoints=kpoints, energy=energy)
+      CALL get_kpoint_info(kpoints, wkp=weights)
+      DO local_kpoint = 1, SIZE(kpoints%kp_env)
+         kp => kpoints%kp_env(local_kpoint)%kpoint_env
+         DO ispin = 1, SIZE(kp%mos, 2)
+            CALL get_mo_set(kp%mos(1, ispin), nao=nao, nmo=nmo, &
+                            occupation_numbers=occupation, eigenvalues=eigenvalues, mo_coeff=coeff)
+            ionode = coeff%matrix_struct%para_env%is_source()
+            WRITE (filename, '(A,I0,A,I0,A,I0,A,I0,A)') &
+               'ot-rebase-e', evaluation, '-p', phase, '-k', kp%nkpoint, '-s', ispin, '.bin'
+            IF (ionode) THEN
+               OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='NEW', ACCESS='STREAM', FORM='UNFORMATTED')
+               WRITE (unit) 'OTRBAS01'
+               WRITE (unit) evaluation, phase, kp%nkpoint, ispin, nao, nmo
+               WRITE (unit) weights(kp%nkpoint), energy%total, energy%kTS
+               WRITE (unit) occupation, eigenvalues
+            END IF
+            ALLOCATE (dense(nao, nmo))
+            CALL cp_fm_get_submatrix(coeff, dense, n_rows=nao, n_cols=nmo)
+            IF (ionode) WRITE (unit) dense
+            CALL get_mo_set(kp%mos(2, ispin), mo_coeff=coeff)
+            CALL cp_fm_get_submatrix(coeff, dense, n_rows=nao, n_cols=nmo)
+            IF (ionode) THEN
+               WRITE (unit) dense
+               CLOSE (unit)
+            END IF
+            DEALLOCATE (dense)
+         END DO
+      END DO
+   END SUBROUTINE qs_scf_dump_ot_rebase_state
 
 ! **************************************************************************************************
 !> \brief copy a distributed OT matrix to a replicated dense matrix
