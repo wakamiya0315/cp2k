@@ -4680,7 +4680,7 @@ CONTAINS
       WRITE (unit) SIZE(kinetic, 1), SIZE(kinetic, 2)
       CALL free_diag_write_sparse_set(unit, kinetic, 2)
       CLOSE (unit)
-      CALL cp_cfm_release(matrix); CALL kp_transform_plan_release(plan)
+      CALL cp_cfm_release(matrix)
       DEALLOCATE (basis_map, gradient, physical_gradient, work, mask, block_size)
    END SUBROUTINE qs_scf_free_symmetry_snapshot
 
