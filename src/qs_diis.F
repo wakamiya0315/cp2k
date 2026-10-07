@@ -19,7 +19,9 @@
 !> \author Matthias Krack (28.06.2000)
 ! **************************************************************************************************
 MODULE qs_diis
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale_and_add_fm,&
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_column_scale,&
+                                              cp_cfm_rot_cols,&
+                                              cp_cfm_scale_and_add_fm,&
                                               cp_cfm_trace
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
@@ -53,9 +55,13 @@ MODULE qs_diis
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
    USE dm_ls_scf_types,                 ONLY: ls_scf_env_type
-   USE input_section_types,             ONLY: section_vals_type
+   USE input_section_types,             ONLY: section_vals_type,&
+                                              section_vals_val_get
+   USE kahan_sum,                       ONLY: accurate_dot_product
    USE kinds,                           ONLY: default_string_length,&
                                               dp
+   USE mathconstants,                   ONLY: z_one,&
+                                              z_zero
    USE mathlib,                         ONLY: diag_complex,&
                                               diamat_all
    USE message_passing,                 ONLY: mp_para_env_type
@@ -89,7 +95,9 @@ MODULE qs_diis
              qs_diis_b_create_kp, &
              qs_diis_b_step_kp, &
              qs_diis_b_calc_err_kp, &
-             qs_diis_b_info_kp
+             qs_diis_b_info_kp, &
+             qs_diis_kp_gauge_transform, &
+             qs_diis_kp_gauge_check
 
 CONTAINS
 
@@ -1027,9 +1035,12 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_diis_b_calc_err_kp'
 
-      INTEGER                                            :: handle, homo, nao, nmo, nspin
-      LOGICAL                                            :: my_real_wfn
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:, :)          :: reference_error
+      INTEGER                                            :: gauge_mode, handle, homo, nao, &
+                                                            ncol_local, nmo, nrow_local, nspin
+      LOGICAL                                            :: my_real_wfn, unitary_rotated
       REAL(dp)                                           :: maxocc
+      REAL(dp), DIMENSION(:), POINTER                    :: occupation_numbers
       TYPE(cp_cfm_type)                                  :: cmos
       TYPE(cp_cfm_type), POINTER                         :: new_errors, parameters, smat
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
@@ -1058,7 +1069,8 @@ CONTAINS
                                       scf_section=scf_section)
 
       !We calculate: e(ikp) = F(ikp)*P(ikp)*S(ikp) - S(ikp)*P(ikp)*F(ikp)
-      CALL get_mo_set(mos(1, ispin), nao=nao, nmo=nmo, homo=homo, mo_coeff=rmos, maxocc=maxocc)
+      CALL get_mo_set(mos(1, ispin), nao=nao, nmo=nmo, homo=homo, mo_coeff=rmos, maxocc=maxocc, &
+                      occupation_numbers=occupation_numbers)
       NULLIFY (matrix_struct)
       CALL cp_fm_get_info(rmos, matrix_struct=matrix_struct)
       CALL cp_cfm_create(cmos, matrix_struct)
@@ -1078,14 +1090,27 @@ CONTAINS
       CALL cp_cfm_to_cfm(kc, parameters)
       CALL cp_cfm_to_cfm(sc, smat)
 
-      ! KC <- K*C
-      CALL parallel_gemm("N", "N", nao, homo, nao, CMPLX(maxocc, KIND=dp), parameters, cmos, (0.0_dp, 0.0_dp), kc)
-      ! SC <- S*C
-      CALL parallel_gemm("N", "N", nao, homo, nao, (2.0_dp, 0.0_dp), smat, cmos, (0.0_dp, 0.0_dp), sc)
-
-      ! new_errors <- KC*(SC)^T - (SC)*(KC)^T = K*P*S - S*P*K
-      CALL parallel_gemm("N", "T", nao, nao, homo, (1.0_dp, 0.0_dp), sc, kc, (0.0_dp, 0.0_dp), new_errors)
-      CALL parallel_gemm("N", "T", nao, nao, homo, (1.0_dp, 0.0_dp), kc, sc, (-1.0_dp, 0.0_dp), new_errors)
+      IF (my_real_wfn) THEN
+         ! Preserve the existing real-wavefunction route; the repair is for complex KS-DIIS.
+         CALL parallel_gemm("N", "N", nao, homo, nao, CMPLX(maxocc, KIND=dp), &
+                            parameters, cmos, z_zero, kc)
+         CALL parallel_gemm("N", "N", nao, homo, nao, CMPLX(2.0_dp, KIND=dp), smat, cmos, z_zero, sc)
+         CALL parallel_gemm("N", "T", nao, nao, homo, z_one, sc, kc, z_zero, new_errors)
+         CALL parallel_gemm("N", "T", nao, nao, homo, z_one, kc, sc, -z_one, new_errors)
+      ELSE
+         CALL section_vals_val_get(scf_section, "DIAGONALIZATION%DIIS_TEST_GAUGE", i_val=gauge_mode)
+         CALL qs_diis_kp_commutator(cmos, occupation_numbers, parameters, smat, kc, sc, new_errors, nao, nmo)
+         IF (gauge_mode > 0) THEN
+            CALL cp_cfm_get_info(new_errors, nrow_local=nrow_local, ncol_local=ncol_local)
+            ALLOCATE (reference_error(nrow_local, ncol_local))
+            reference_error = new_errors%local_data(1:nrow_local, 1:ncol_local)
+            CALL qs_diis_kp_gauge_transform(cmos, occupation_numbers, ikp, ispin, gauge_mode, unitary_rotated)
+            CALL qs_diis_kp_commutator(cmos, occupation_numbers, parameters, smat, kc, sc, new_errors, nao, nmo)
+            CALL qs_diis_kp_gauge_check(new_errors, reference_error, ikp, ispin, gauge_mode, &
+                                        unitary_rotated, reduce=.TRUE.)
+            DEALLOCATE (reference_error)
+         END IF
+      END IF
 
       !clean-up
       CALL cp_cfm_release(cmos)
@@ -1093,6 +1118,130 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE qs_diis_b_calc_err_kp
+
+! **************************************************************************************************
+!> \brief Form K P S - S P K with P = C diag(f) C^H, retaining every actual occupation.
+!> \param cmos Copied complex orbitals.
+!> \param occupation_numbers Actual occupations, including a fractional tail.
+!> \param parameters Kohn-Sham matrix.
+!> \param smat Overlap matrix.
+!> \param kc Scratch for K C diag(f).
+!> \param sc Scratch for S C.
+!> \param error Anti-Hermitian residual.
+!> \param nao AO dimension.
+!> \param nmo MO dimension.
+! **************************************************************************************************
+   SUBROUTINE qs_diis_kp_commutator(cmos, occupation_numbers, parameters, smat, kc, sc, error, nao, nmo)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: cmos
+      REAL(dp), DIMENSION(:), INTENT(IN)                 :: occupation_numbers
+      TYPE(cp_cfm_type), INTENT(IN)                      :: parameters, smat
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: kc, sc, error
+      INTEGER, INTENT(IN)                                :: nao, nmo
+
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:)             :: weights
+
+      CPASSERT(SIZE(occupation_numbers) >= nmo)
+      CALL parallel_gemm("N", "N", nao, nmo, nao, z_one, parameters, cmos, z_zero, kc)
+      CALL parallel_gemm("N", "N", nao, nmo, nao, z_one, smat, cmos, z_zero, sc)
+      ! Scratch is AO-square. A full-length scaling vector also covers distributed columns.
+      ALLOCATE (weights(nao))
+      weights = z_zero
+      weights(1:nmo) = CMPLX(occupation_numbers(1:nmo), 0.0_dp, KIND=dp)
+      CALL cp_cfm_column_scale(kc, weights)
+      DEALLOCATE (weights)
+      CALL parallel_gemm("N", "C", nao, nao, nmo, z_one, kc, sc, z_zero, error)
+      CALL parallel_gemm("N", "C", nao, nao, nmo, z_one, sc, kc, -z_one, error)
+   END SUBROUTINE qs_diis_kp_commutator
+
+! **************************************************************************************************
+!> \brief Apply a test gauge to copied orbitals, preserving C diag(f) C^H.
+!> \param cmos Copied orbitals, never the stored MO coefficients.
+!> \param occupations Occupations are unchanged; only an exactly equal positive pair may rotate.
+!> \param ikp K-point index for deterministic phases.
+!> \param ispin Spin index.
+!> \param mode 1 phases, 2 unitary, 3 both.
+!> \param rotated Whether a positive-occupation pair was rotated.
+! **************************************************************************************************
+   SUBROUTINE qs_diis_kp_gauge_transform(cmos, occupations, ikp, ispin, mode, rotated)
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cmos
+      REAL(dp), DIMENSION(:), INTENT(IN)                 :: occupations
+      INTEGER, INTENT(IN)                                :: ikp, ispin, mode
+      LOGICAL, INTENT(OUT)                               :: rotated
+
+      COMPLEX(dp), ALLOCATABLE, DIMENSION(:)             :: phases
+      INTEGER                                            :: i, j, nmo
+      REAL(dp)                                           :: angle
+
+      CALL cp_cfm_get_info(cmos, ncol_global=nmo)
+      CPASSERT(SIZE(occupations) >= nmo)
+      rotated = .FALSE.
+      IF (mode == 1 .OR. mode == 3) THEN
+         ALLOCATE (phases(nmo))
+         phases = z_one
+         DO j = 1, nmo
+            IF (occupations(j) /= 0.0_dp) THEN
+               angle = 0.37_dp*REAL(ikp, dp) + 0.53_dp*REAL(ispin, dp) + 0.71_dp*REAL(j, dp)
+               phases(j) = CMPLX(COS(angle), SIN(angle), KIND=dp)
+            END IF
+         END DO
+         CALL cp_cfm_column_scale(cmos, phases)
+         DEALLOCATE (phases)
+      END IF
+      IF (mode == 2 .OR. mode == 3) THEN
+         occupied_pair: DO i = 1, nmo - 1
+            DO j = i + 1, nmo
+               IF (occupations(i) > 0.0_dp .AND. occupations(i) == occupations(j)) THEN
+                  CALL cp_cfm_rot_cols(cmos, i, j, 0.8_dp, 0.6_dp)
+                  rotated = .TRUE.
+                  EXIT occupied_pair
+               END IF
+            END DO
+         END DO occupied_pair
+      END IF
+   END SUBROUTINE qs_diis_kp_gauge_transform
+
+! **************************************************************************************************
+!> \brief Verify the full residual and its Hermitian squared norm after an explicit test gauge.
+!> \param error Transformed residual.
+!> \param reference Original local residual, excluding matrix padding.
+!> \param ikp K-point index.
+!> \param ispin Spin index.
+!> \param mode Test mode.
+!> \param rotated Whether the equal-occupation rotation was exercised.
+!> \param reduce True for distributed matrices, false inside the one-MPI OpenMP path.
+! **************************************************************************************************
+   SUBROUTINE qs_diis_kp_gauge_check(error, reference, ikp, ispin, mode, rotated, reduce)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: error
+      COMPLEX(dp), DIMENSION(:, :), INTENT(IN)           :: reference
+      INTEGER, INTENT(IN)                                :: ikp, ispin, mode
+      LOGICAL, INTENT(IN)                                :: rotated, reduce
+
+      COMPLEX(dp)                                        :: norm_after, norm_before
+      INTEGER                                            :: nc, nr
+      REAL(dp)                                           :: difference, scale
+
+      nr = SIZE(reference, 1)
+      nc = SIZE(reference, 2)
+      difference = MAX(0.0_dp, MAXVAL(ABS(error%local_data(1:nr, 1:nc) - reference)))
+      scale = MAX(1.0_dp, MAXVAL(ABS(reference)))
+      norm_before = accurate_dot_product(CONJG(reference), reference)
+      norm_after = accurate_dot_product(CONJG(error%local_data(1:nr, 1:nc)), error%local_data(1:nr, 1:nc))
+      IF (reduce) THEN
+         CALL error%matrix_struct%para_env%max(difference)
+         CALL error%matrix_struct%para_env%max(scale)
+         CALL error%matrix_struct%para_env%sum(norm_before)
+         CALL error%matrix_struct%para_env%sum(norm_after)
+      END IF
+      CPASSERT(difference <= 1.0E-10_dp*scale)
+      CPASSERT(ABS(norm_after - norm_before) <= 1.0E-10_dp*MAX(1.0_dp, ABS(norm_before)))
+      IF (error%matrix_struct%para_env%mepos == 0) THEN
+!$OMP CRITICAL(diis_gauge_output)
+         WRITE (*, '(A,3I7,L3,3ES23.14)') &
+            " DIIS_GAUGE| mode,k,spin,rotated,max-error,norm2,norm2-error ", &
+            mode, ikp, ispin, rotated, difference, REAL(norm_after, dp), ABS(norm_after - norm_before)
+!$OMP END CRITICAL(diis_gauge_output)
+      END IF
+   END SUBROUTINE qs_diis_kp_gauge_check
 
 ! **************************************************************************************************
 !> \brief Update the SCF DIIS buffer, and if appropriate does a diis step, for k-points
@@ -1174,6 +1323,7 @@ CONTAINS
             DO ispin = 1, nspin
                new_errors => diis_buffer%error(ib, ispin, ikp)
                CALL cp_cfm_to_fm(diis_buffer%error(jb, ispin, ikp), rerr, ierr)
+               ! cp_cfm_trace is bilinear: conjugate the first error for the Hermitian Gram product.
                CALL cp_fm_scale(-1.0_dp, ierr)
                CALL cp_fm_to_cfm(rerr, ierr, old_errors)
                CALL cp_cfm_trace(old_errors, new_errors, tmp)
