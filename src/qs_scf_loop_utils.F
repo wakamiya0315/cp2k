@@ -3099,7 +3099,10 @@ CONTAINS
 
       CALL external_control(should_stop, "SCF", target_time=qs_env%target_time, &
                             start_time=qs_env%start_time)
-      IF (scf_env%iter_delta < scf_control%eps_scf .AND. update_validated) THEN
+      ! The first KS build precedes the new smeared occupations and their entropy.
+      ! Require another build before accepting or printing a converged free energy.
+      IF (scf_env%iter_delta < scf_control%eps_scf .AND. update_validated .AND. &
+          (.NOT. scf_control%smear%do_smear .OR. scf_env%iter_count > 1)) THEN
          ! nested IFs on purpose: a .AND. chain leaves the evaluation order
          ! unspecified. On non-Davidson runs the env array has size zero
          ! while the tightening test below indexes its first channel
