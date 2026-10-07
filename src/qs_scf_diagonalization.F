@@ -36,6 +36,9 @@ MODULE qs_scf_diagonalization
       dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
       dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, &
       dbcsr_type_symmetric
+   USE cp_dbcsr_api, ONLY: dbcsr_has_symmetry, dbcsr_iterator_blocks_left, &
+                           dbcsr_iterator_next_block, dbcsr_iterator_readonly_start, dbcsr_iterator_stop, &
+                           dbcsr_iterator_type
    USE cp_dbcsr_contrib, ONLY: dbcsr_dot, dbcsr_maxabs
    USE cp_dbcsr_cp2k_link, ONLY: cp_dbcsr_alloc_block_from_nbl
    USE cp_dbcsr_operations, ONLY: copy_dbcsr_to_fm, &
@@ -4768,13 +4771,16 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Independent weighted Bloch contractions; private full-state export for external checks.
-   SUBROUTINE qs_scf_free_operator_snapshot(qs_env, scf_env, initial, proposal, lambda, derivative, filename)
+   SUBROUTINE qs_scf_free_operator_snapshot(qs_env, scf_env, initial, proposal, initial_rs, proposal_rs, &
+                                            direction_rs, lambda, derivative, filename)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       COMPLEX(dp), INTENT(IN)                            :: initial(:, :, :, :), proposal(:, :, :, :)
       REAL(dp), INTENT(IN)                               :: lambda
       REAL(dp), INTENT(OUT)                              :: derivative(3)
       CHARACTER(LEN=*), INTENT(IN)                       :: filename
+
+      TYPE(dbcsr_p_type), POINTER                        :: initial_rs(:, :), proposal_rs(:, :), direction_rs(:, :)
 
       CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_STATE_V1"
 
@@ -4829,7 +4835,139 @@ CONTAINS
          END DO
       END DO
       CLOSE (unit)
+      CALL qs_scf_free_linear_snapshot(qs_env, scf_env, initial, proposal, initial_rs, proposal_rs, &
+                                       direction_rs, ks, overlap, plan, wkp, xkp, TRIM(filename)//".linear")
       CALL cp_cfm_release(matrix); CALL kp_transform_plan_release(plan)
    END SUBROUTINE qs_scf_free_operator_snapshot
+
+! **************************************************************************************************
+!> \brief Read-only sparse captures and linear density-transform replay; no additional energy evaluation.
+   SUBROUTINE qs_scf_free_linear_snapshot(qs_env, scf_env, initial, proposal, initial_rs, proposal_rs, &
+                                          direction_rs, ks, overlap, plan, weights, xkp, filename)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      COMPLEX(dp), INTENT(IN)                            :: initial(:, :, :, :), proposal(:, :, :, :)
+      TYPE(dbcsr_p_type), POINTER                        :: initial_rs(:, :), proposal_rs(:, :), direction_rs(:, :), &
+                                                            ks(:, :), overlap(:, :)
+      TYPE(kp_transform_plan_type), INTENT(IN)            :: plan
+      REAL(dp), INTENT(IN)                               :: weights(:), xkp(:, :)
+      CHARACTER(LEN=*), INTENT(IN)                       :: filename
+
+      CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_REAL_V1"
+      INTEGER                                            :: ic, ik, ispin, nao, nkp, nspin, unit
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(cp_fm_type), ALLOCATABLE                      :: ext(:, :, :)
+      TYPE(dbcsr_p_type), POINTER                        :: reconstructed(:, :)
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+
+      nao = SIZE(initial, 1); nspin = SIZE(initial, 3); nkp = SIZE(initial, 4)
+      CALL get_qs_env(qs_env, kpoints=kpoints)
+      CALL get_kpoint_info(kpoints, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      OPEN (NEWUNIT=unit, FILE=filename, ACCESS="STREAM", FORM="UNFORMATTED", STATUS="NEW", ACTION="WRITE")
+      WRITE (unit) magic, 1, nao, nspin, nkp, SIZE(initial_rs, 2), plan%nentry, &
+         MERGE(1, 0, plan%symmetric), 7 + nkp
+      WRITE (unit) weights, xkp
+      DO ik = 1, nkp
+         WRITE (unit) MERGE(1, 0, kpoints%kp_sym(ik)%kpoint_sym%apply_symmetry), &
+            kpoints%kp_sym(ik)%kpoint_sym%nwght
+      END DO
+      WRITE (unit) plan%row, plan%col, plan%image, plan%row_offset, plan%col_offset, &
+         plan%cell, plan%symmetry_sign
+      CALL write_set(initial_rs, 1)
+      CALL write_set(proposal_rs, 2)
+      CALL write_set(direction_rs, 3)
+      CALL write_set(ks, 4)
+
+      ALLOCATE (ext(nkp, 2, nspin), reconstructed(nspin, SIZE(initial_rs, 2)))
+      DO ispin = 1, nspin
+         DO ik = 1, nkp
+            DO ic = 1, 2
+               CALL cp_fm_create(ext(ik, ic, ispin), fmstruct)
+            END DO
+         END DO
+         DO ic = 1, SIZE(initial_rs, 2)
+            ALLOCATE (reconstructed(ispin, ic)%matrix)
+            CALL dbcsr_create(reconstructed(ispin, ic)%matrix, template=initial_rs(ispin, ic)%matrix)
+            CALL dbcsr_copy(reconstructed(ispin, ic)%matrix, initial_rs(ispin, ic)%matrix)
+         END DO
+      END DO
+      CALL replay(initial, 5, 0)
+      CALL replay(proposal, 6, 0)
+      CALL replay(proposal - initial, 7, 0)
+      DO ik = 1, nkp
+         CALL replay(proposal - initial, 7 + ik, ik)
+      END DO
+      CLOSE (unit)
+      DO ispin = 1, nspin
+         DO ik = 1, nkp
+            DO ic = 1, 2
+               CALL cp_fm_release(ext(ik, ic, ispin))
+            END DO
+         END DO
+         DO ic = 1, SIZE(initial_rs, 2)
+            CALL dbcsr_deallocate_matrix(reconstructed(ispin, ic)%matrix)
+         END DO
+      END DO
+      DEALLOCATE (ext, reconstructed)
+
+   CONTAINS
+
+      SUBROUTINE replay(value, id, only_k)
+         COMPLEX(dp), INTENT(IN)                         :: value(:, :, :, :)
+         INTEGER, INTENT(IN)                             :: id, only_k
+
+         INTEGER                                         :: component, image, k, spin
+
+         DO spin = 1, nspin
+            DO k = 1, nkp
+               DO component = 1, 2
+                  ext(k, component, spin)%local_data = 0.0_dp
+               END DO
+               IF (only_k > 0 .AND. only_k /= k) CYCLE
+               ext(k, 1, spin)%local_data(1:nao, 1:nao) = REAL(value(:, :, spin, k), dp)
+               ext(k, 2, spin)%local_data(1:nao, 1:nao) = AIMAG(value(:, :, spin, k))
+            END DO
+            DO image = 1, SIZE(initial_rs, 2)
+               CALL dbcsr_copy(reconstructed(spin, image)%matrix, initial_rs(spin, image)%matrix)
+            END DO
+         END DO
+         ! Symmetry phases were certified by the preceding evaluator. Do not recalibrate them here.
+         CALL kpoint_density_transform(kpoints, reconstructed, .FALSE., overlap(1, 1)%matrix, &
+                                       sab_nl, scf_env%scf_work1, pmat_ext=ext)
+         CALL write_set(reconstructed, id)
+      END SUBROUTINE replay
+
+      SUBROUTINE write_set(matrices, id)
+         TYPE(dbcsr_p_type), POINTER                     :: matrices(:, :)
+         INTEGER, INTENT(IN)                             :: id
+
+         INTEGER                                         :: col, col_offset, image, nblock, row, row_offset, spin
+         REAL(dp), POINTER                               :: block(:, :)
+         TYPE(dbcsr_iterator_type)                       :: iterator
+
+         DO image = 1, SIZE(matrices, 2)
+            DO spin = 1, SIZE(matrices, 1)
+               nblock = 0
+               CALL dbcsr_iterator_readonly_start(iterator, matrices(spin, image)%matrix)
+               DO WHILE (dbcsr_iterator_blocks_left(iterator))
+                  CALL dbcsr_iterator_next_block(iterator, row, col, block)
+                  nblock = nblock + 1
+               END DO
+               CALL dbcsr_iterator_stop(iterator)
+               WRITE (unit) id, spin, image, MERGE(1, 0, dbcsr_has_symmetry(matrices(spin, image)%matrix)), nblock
+               CALL dbcsr_iterator_readonly_start(iterator, matrices(spin, image)%matrix)
+               DO WHILE (dbcsr_iterator_blocks_left(iterator))
+                  CALL dbcsr_iterator_next_block(iterator, row, col, block, &
+                                                 row_offset=row_offset, col_offset=col_offset)
+                  WRITE (unit) row, col, row_offset, col_offset, SIZE(block, 1), SIZE(block, 2)
+                  WRITE (unit) block
+               END DO
+               CALL dbcsr_iterator_stop(iterator)
+            END DO
+         END DO
+      END SUBROUTINE write_set
+   END SUBROUTINE qs_scf_free_linear_snapshot
 
 END MODULE qs_scf_diagonalization

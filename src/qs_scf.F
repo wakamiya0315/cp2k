@@ -3710,7 +3710,8 @@ CONTAINS
       DO base = 0, 1
          lambda = 0.5_dp*REAL(base, dp)
          CALL evaluate_sample(lambda, 0, 0, base)
-         CALL qs_scf_free_operator_snapshot(qs_env, scf_env, initial_k, proposal_k, lambda, derivative, &
+         CALL qs_scf_free_operator_snapshot(qs_env, scf_env, initial_k, proposal_k, initial, proposal, &
+                                             direction_rs, lambda, derivative, &
                                             TRIM(store%dm_trial_free_diag_file)//MERGE(".midpoint.bin", ".input000.bin", base == 1))
          real_derivative = 0.0_dp
          CALL get_qs_env(qs_env, matrix_ks_kp=ks)
