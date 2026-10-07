@@ -380,6 +380,18 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="LEBEDEV_GRID_ROTATION", &
+                          description="GAPW: rotation matrix R, given by rows, applied to the directions u "// &
+                          "of all Lebedev grids (u' = R u) before the atomic grids are built. The atomic "// &
+                          "grids carry the octahedral symmetry of the Lebedev grids along the Cartesian "// &
+                          "axes; rotating it onto the point group of the structure removes the symmetry "// &
+                          "breaking of the angular quadrature (for example for native-grid functionals). "// &
+                          "R must be a proper rotation. Without the keyword the grids are not rotated.", &
+                          usage="LEBEDEV_GRID_ROTATION 1 0 0 0 1 0 0 0 1", &
+                          n_var=9, type_of_var=real_t)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="PW_GRID", &
                           description="What kind of PW_GRID should be employed", &
                           usage="PW_GRID NS-FULLSPACE", &

@@ -382,6 +382,9 @@ MODULE cp_control_types
                                               nopaw_as_gpw = .FALSE.
       REAL(KIND=dp)                        :: alpha0_hard = 0.0_dp
       REAL(KIND=dp)                        :: max_rad_local = 0.0_dp
+      ! rotation u' = R u of the directions of all Lebedev grids (&QS LEBEDEV_GRID_ROTATION)
+      LOGICAL                              :: rotate_lebedev = .FALSE.
+      REAL(KIND=dp), DIMENSION(3, 3)       :: lebedev_rotation = 0.0_dp
    END TYPE gapw_control_type
 
 ! **************************************************************************************************

@@ -1012,7 +1012,8 @@ CONTAINS
          tblite_reference_cli, tblite_reference_cli_section, tblite_section_active, was_present, &
          xtb_scc_mixer_explicit, xtb_tblite_mixer_explicit
       REAL(dp)                                           :: tmp, tmpsqrt, value
-      REAL(dp), POINTER                                  :: scal(:)
+      REAL(dp), DIMENSION(3, 3)                          :: rotation
+      REAL(dp), POINTER                                  :: rotation_vals(:), scal(:)
       TYPE(section_vals_type), POINTER :: cdft_control_section, ddapc_restraint_section, &
          dftb_parameter, dftb_section, dftb_tblite_mixer, eeq_section, genpot_section, &
          lri_optbas_section, mull_section, nonbonded_section, s2_restraint_section, se_section, &
@@ -1142,6 +1143,20 @@ CONTAINS
       CALL section_vals_val_get(qs_section, "LMAXN0", i_val=qs_control%gapw_control%lmax_rho0)
       CALL section_vals_val_get(qs_section, "LADDN0", i_val=qs_control%gapw_control%ladd_rho0)
       CALL section_vals_val_get(qs_section, "QUADRATURE", i_val=qs_control%gapw_control%quadrature)
+      CALL section_vals_val_get(qs_section, "LEBEDEV_GRID_ROTATION", explicit=explicit)
+      IF (explicit) THEN
+         CALL section_vals_val_get(qs_section, "LEBEDEV_GRID_ROTATION", r_vals=rotation_vals)
+         rotation = TRANSPOSE(RESHAPE(rotation_vals, [3, 3]))
+         tmp = rotation(1, 1)*(rotation(2, 2)*rotation(3, 3) - rotation(2, 3)*rotation(3, 2)) - &
+               rotation(1, 2)*(rotation(2, 1)*rotation(3, 3) - rotation(2, 3)*rotation(3, 1)) + &
+               rotation(1, 3)*(rotation(2, 1)*rotation(3, 2) - rotation(2, 2)*rotation(3, 1))
+         value = MAXVAL(ABS(MATMUL(TRANSPOSE(rotation), rotation) - &
+                            RESHAPE([1.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 1.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 1.0_dp], [3, 3])))
+         IF (value > 1.0E-8_dp .OR. ABS(tmp - 1.0_dp) > 1.0E-8_dp) &
+            CPABORT("QS%LEBEDEV_GRID_ROTATION must be a proper rotation matrix")
+         qs_control%gapw_control%lebedev_rotation = rotation
+         qs_control%gapw_control%rotate_lebedev = .TRUE.
+      END IF
       ! GAPW 1c basis
       CALL section_vals_val_get(qs_section, "GAPW_1C_BASIS", i_val=qs_control%gapw_control%basis_1c)
       IF (qs_control%gapw_control%basis_1c /= gapw_1c_orb) THEN
