@@ -46,6 +46,7 @@ MODULE qs_ot_minimizer
    PRIVATE
 
    PUBLIC  :: broyden_history_restart_required, &
+              do_line_search_3pnt, &
               cg_history_restart_required, &
               lbfgs_curvature_damping_shift, &
               lbfgs_history_restart_required, &
@@ -1273,13 +1274,19 @@ CONTAINS
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
 
       CHARACTER(len=*), PARAMETER :: routineN = 'do_line_search_3pnt'
+      CHARACTER(LEN=9)                                  :: decision
 
-      INTEGER                                            :: best_index, count, handle, i
+      INTEGER                                            :: best_index, count, handle, i, output_unit
+      LOGICAL                                            :: guarded_mermin
       REAL(KIND=dp)                                      :: best_energy, denom, ds, fa, fb, fc, nom, &
                                                             pos, tol, val, xa, xb, xc
 
       CALL timeset(routineN, handle)
 
+      guarded_mermin = use_three_point_mermin_search(qs_ot_env)
+      IF (guarded_mermin .AND. .NOT. ieee_is_finite(qs_ot_env(1)%etotal)) THEN
+         CPABORT("Nonfinite actual Mermin free energy during OT line search.")
+      END IF
       qs_ot_env(1)%line_search_might_be_done = .FALSE.
       qs_ot_env(1)%energy_only = .TRUE.
 
@@ -1332,6 +1339,50 @@ CONTAINS
          END IF
          qs_ot_env(1)%energy_only = .FALSE.
          qs_ot_env(1)%line_search_might_be_done = .TRUE.
+         IF (guarded_mermin) THEN
+            ! The parabola predicts a point; it cannot certify the actual nonlinear Mermin F.
+            ! Keep this point out of physical secant/history storage until its F is evaluated.
+            qs_ot_env(1)%energy_only = .TRUE.
+            qs_ot_env(1)%line_search_might_be_done = .FALSE.
+         END IF
+      CASE (4:12)
+         CPASSERT(guarded_mermin)
+         best_index = MINLOC(qs_ot_env(1)%OT_energy(1:count - 1), DIM=1)
+         best_energy = qs_ot_env(1)%OT_energy(best_index)
+         tol = 10.0_dp*EPSILON(1.0_dp)*MAX(1.0_dp, ABS(best_energy))
+         IF (ieee_is_finite(qs_ot_env(1)%etotal) .AND. &
+             qs_ot_env(1)%etotal <= best_energy + tol) THEN
+            decision = 'ACCEPT'
+            qs_ot_env(1)%OT_pos(count + 1) = qs_ot_env(1)%OT_pos(count)
+            qs_ot_env(1)%energy_only = .FALSE.
+            qs_ot_env(1)%line_search_might_be_done = .TRUE.
+         ELSE IF (best_index /= 1 .AND. &
+                  best_energy < qs_ot_env(1)%OT_energy(1) - tol) THEN
+            decision = 'RESTORE'
+            ! take_step reverses every orbital, rotation and auxiliary block on the same
+            ! stored direction. The next full-gradient call rebuilds C/f/P/H at that endpoint.
+            qs_ot_env(1)%OT_pos(count + 1) = qs_ot_env(1)%OT_pos(best_index)
+            qs_ot_env(1)%energy_only = .FALSE.
+            qs_ot_env(1)%line_search_might_be_done = .TRUE.
+         ELSE IF (count < 12) THEN
+            decision = 'BACKTRACK'
+            ! No evaluated positive step lowered actual F; do not accept the origin or an
+            ! uphill parabola. Retain the direction and shrink the smallest tried positive step.
+            pos = MINVAL(qs_ot_env(1)%OT_pos(2:count), MASK=qs_ot_env(1)%OT_pos(2:count) > 0.0_dp)
+            qs_ot_env(1)%OT_pos(count + 1) = 0.5_dp*pos
+         ELSE
+            CPABORT("Mermin OT line search found no actual free-energy descent in 12 evaluations.")
+         END IF
+         IF (qs_ot_env(1)%settings%diagnostics) THEN
+            output_unit = cp_logger_get_default_io_unit()
+            IF (output_unit > 0) THEN
+               WRITE (output_unit, '(A,4(1X,ES23.15),1X,A)') &
+                  'OT| ACTUAL position F selected-position best-tested-F decision:', &
+                  qs_ot_env(1)%OT_pos(count), qs_ot_env(1)%etotal, &
+                  qs_ot_env(1)%OT_pos(count + 1), best_energy, &
+                  TRIM(decision)
+            END IF
+         END IF
       CASE DEFAULT
          CPABORT("NYI")
       END SELECT

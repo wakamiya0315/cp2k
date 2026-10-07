@@ -74,6 +74,7 @@ PROGRAM qs_ot_complex_ref_unittest
                                               qs_ot_kpoint_preconditioner_solver_supported,&
                                               qs_ot_kpoint_preconditioner_supported,&
                                               qs_ot_type
+   USE qs_ot_minimizer,                 ONLY: do_line_search_3pnt
    USE reference_manager,               ONLY: remove_all_references
 
    IMPLICIT NONE
@@ -169,6 +170,7 @@ PROGRAM qs_ot_complex_ref_unittest
    CALL dbcsr_distribution_new(dist_kk, group=mp_comm_self%get_handle(), pgrid=pgrid, &
                                row_dist=row_dist, col_dist=col_dist)
    CALL test_complex_strict_derivative(dist_nk, dist_kk, row_n, row_k, col_k, para_env, nfail)
+   CALL test_mermin_line_search_rollback(dist_nk, dist_kk, row_n, row_k, col_k, nfail)
 
    CALL create_one_block(x_re, "complex_ref_x_re", dist_nk, row_n, col_k)
    CALL create_one_block(x_im, "complex_ref_x_im", dist_nk, row_n, col_k)
@@ -263,6 +265,181 @@ PROGRAM qs_ot_complex_ref_unittest
    IF (nfail > 0) ERROR STOP "qs_ot_complex_ref_unittest failed"
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Exercise actual search/take_step rejection on every complex product block.
+!> \param dist_nk Orbital matrix distribution.
+!> \param dist_kk Rotation matrix distribution.
+!> \param row_n Orbital row block size.
+!> \param row_k Rotation row block size.
+!> \param col_k Product column block size.
+!> \param nfail Failure count.
+! **************************************************************************************************
+   SUBROUTINE test_mermin_line_search_rollback(dist_nk, dist_kk, row_n, row_k, col_k, nfail)
+      TYPE(dbcsr_distribution_type), INTENT(IN)          :: dist_nk, dist_kk
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: row_n, row_k, col_k
+      INTEGER, INTENT(INOUT)                             :: nfail
+
+      COMPLEX(KIND=dp), DIMENSION(n, k, 2)               :: actual_c, actual_x, base_x, dx, expected_c
+      COMPLEX(KIND=dp), DIMENSION(k, k, 2)               :: actual_a, base_a, da
+      COMPLEX(KIND=dp), DIMENSION(n, n)                  :: actual_p, expected_p
+      INTEGER                                            :: channel, component, sample, scenario
+      REAL(KIND=dp)                                      :: actual_kts, expected_kts, position
+      REAL(KIND=dp), DIMENSION(4)                       :: actual_f, actual_labels, base_labels, &
+                                                            de, expected_f
+      REAL(KIND=dp), DIMENSION(4), PARAMETER             :: energy_samples = &
+                                                            [-2.0_dp, -2.03_dp, -2.04_dp, -1.9_dp]
+      TYPE(dbcsr_type), TARGET                           :: coordinate(2, 2), direction(2, 2), &
+                                                            rotation(2, 2), rotation_direction(2, 2)
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: search
+
+      ALLOCATE (search(2))
+      base_x(:, 1, 1) = [CMPLX(1.0_dp, 0.1_dp, dp), CMPLX(0.1_dp, -0.2_dp, dp), &
+                         CMPLX(0.2_dp, 0.1_dp, dp)]
+      base_x(:, 2, 1) = [CMPLX(0.1_dp, 0.2_dp, dp), CMPLX(1.0_dp, 0.1_dp, dp), &
+                         CMPLX(-0.1_dp, 0.2_dp, dp)]
+      base_x(:, :, 2) = CONJG(base_x(:, :, 1))
+      dx = 0.2_dp*CONJG(base_x)
+      base_a = CMPLX(0.0_dp, 0.0_dp, dp)
+      base_a(1, 2, :) = CMPLX(0.02_dp, 0.03_dp, dp)
+      base_a(2, 1, :) = -CONJG(base_a(1, 2, :))
+      da = 2.0_dp*base_a
+      base_labels = [-0.2_dp, 0.1_dp, -0.1_dp, 0.15_dp]
+      de = [0.1_dp, -0.08_dp, 0.06_dp, -0.12_dp]
+      DO channel = 1, 2
+         DO component = 1, 2
+            CALL create_one_block(coordinate(component, channel), 'search_coordinate', dist_nk, row_n, col_k)
+            CALL create_one_block(direction(component, channel), 'search_direction', dist_nk, row_n, col_k)
+            CALL create_one_block(rotation(component, channel), 'search_rotation', dist_kk, row_k, col_k)
+            CALL create_one_block(rotation_direction(component, channel), 'search_rotation_direction', &
+                                   dist_kk, row_k, col_k)
+         END DO
+         search(channel)%settings%ks = .TRUE.
+         search(channel)%settings%do_ener = .TRUE.
+         search(channel)%settings%do_rotation = .TRUE.
+         search(channel)%settings%occupation_preconditioner = .TRUE.
+         search(channel)%has_complex_kpoint_state = .TRUE.
+         search(channel)%use_dx = .TRUE.
+         search(channel)%matrix_x => coordinate(1, channel)
+         search(channel)%matrix_x_im => coordinate(2, channel)
+         search(channel)%matrix_dx => direction(1, channel)
+         search(channel)%matrix_dx_im => direction(2, channel)
+         search(channel)%rot_mat_x => rotation(1, channel)
+         search(channel)%rot_mat_x_im => rotation(2, channel)
+         search(channel)%rot_mat_dx => rotation_direction(1, channel)
+         search(channel)%rot_mat_dx_im => rotation_direction(2, channel)
+         ALLOCATE (search(channel)%ener_x(k), search(channel)%ener_dx(k))
+         search(channel)%ener_dx = de((channel - 1)*k + 1:channel*k)
+         CALL put_complex_pair(direction(1, channel), direction(2, channel), dx(:, :, channel))
+         CALL put_complex_pair(rotation_direction(1, channel), rotation_direction(2, channel), da(:, :, channel))
+      END DO
+
+      DO scenario = 1, 2
+         search(1)%line_search_count = 0
+         search(1)%ds_min = 0.15_dp
+         DO channel = 1, 2
+            CALL put_complex_pair(coordinate(1, channel), coordinate(2, channel), base_x(:, :, channel))
+            CALL put_complex_pair(rotation(1, channel), rotation(2, channel), base_a(:, :, channel))
+            search(channel)%ener_x = base_labels((channel - 1)*k + 1:channel*k)
+         END DO
+         DO sample = 1, 4
+            IF (scenario == 1) THEN
+               ! The actual fourth-point F is above two already evaluated lower samples.
+               search(1)%etotal = energy_samples(sample)
+            ELSE
+               ! No positive sample lowers actual F; retain the direction and backtrack.
+               search(1)%etotal = -2.0_dp + 0.01_dp*REAL(sample - 1, dp)
+            END IF
+            CALL do_line_search_3pnt(search)
+            IF (sample == 3) THEN
+               IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done) nfail = nfail + 1
+            END IF
+         END DO
+         IF (scenario == 1) THEN
+            position = search(1)%ot_pos(3)
+            IF (ABS(search(1)%ot_pos(5) - position) > 1.0E-14_dp) nfail = nfail + 1
+         ELSE
+            position = 0.03_dp
+            IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done .OR. &
+                ABS(search(1)%ot_pos(5) - position) > 1.0E-14_dp) nfail = nfail + 1
+            search(1)%etotal = -2.001_dp
+            CALL do_line_search_3pnt(search)
+         END IF
+         IF (search(1)%energy_only .OR. .NOT. search(1)%line_search_might_be_done) nfail = nfail + 1
+         DO channel = 1, 2
+            CALL get_complex_pair(coordinate(1, channel), coordinate(2, channel), actual_x(:, :, channel))
+            CALL get_complex_pair(rotation(1, channel), rotation(2, channel), actual_a(:, :, channel))
+            actual_labels((channel - 1)*k + 1:channel*k) = search(channel)%ener_x
+         END DO
+         IF (MAXVAL(ABS(actual_x - base_x - position*dx)) > 1.0E-13_dp .OR. &
+             MAXVAL(ABS(actual_a - base_a - position*da)) > 1.0E-13_dp .OR. &
+             MAXVAL(ABS(actual_labels - base_labels - position*de)) > 1.0E-13_dp) nfail = nfail + 1
+         CALL mermin_test_state(actual_x, actual_a, actual_labels, actual_c, actual_f, actual_p, actual_kts)
+         CALL mermin_test_state(base_x + position*dx, base_a + position*da, base_labels + position*de, &
+                                 expected_c, expected_f, expected_p, expected_kts)
+         IF (MAXVAL(ABS(actual_c - expected_c)) > 1.0E-12_dp .OR. &
+             MAXVAL(ABS(actual_f - expected_f)) > 1.0E-12_dp .OR. &
+             ABS(DOT_PRODUCT([0.4_dp, 0.4_dp, 0.6_dp, 0.6_dp], actual_f) - 1.7_dp) > 1.0E-12_dp .OR. &
+             MAXVAL(ABS(actual_p - expected_p)) > 1.0E-12_dp .OR. &
+             ABS(actual_kts - expected_kts) > 1.0E-13_dp) nfail = nfail + 1
+      END DO
+
+      DO channel = 1, 2
+         DEALLOCATE (search(channel)%ener_x, search(channel)%ener_dx)
+         DO component = 1, 2
+            CALL dbcsr_release(coordinate(component, channel))
+            CALL dbcsr_release(direction(component, channel))
+            CALL dbcsr_release(rotation(component, channel))
+            CALL dbcsr_release(rotation_direction(component, channel))
+         END DO
+      END DO
+      DEALLOCATE (search)
+
+   END SUBROUTINE test_mermin_line_search_rollback
+
+! **************************************************************************************************
+!> \brief Independent dense C/f/P/entropy reconstruction for the rollback regression.
+!> \param coordinate Orbital coordinates.
+!> \param generator Rotation generators.
+!> \param labels Fixed-N auxiliary labels.
+!> \param c Physical orbitals.
+!> \param occupation Physical occupations.
+!> \param density Weighted density.
+!> \param kts Negative entropy contribution.
+! **************************************************************************************************
+   SUBROUTINE mermin_test_state(coordinate, generator, labels, c, occupation, density, kts)
+      COMPLEX(KIND=dp), DIMENSION(n, k, 2), INTENT(IN)    :: coordinate
+      COMPLEX(KIND=dp), DIMENSION(k, k, 2), INTENT(IN)    :: generator
+      REAL(KIND=dp), DIMENSION(4), INTENT(IN)             :: labels
+      COMPLEX(KIND=dp), DIMENSION(n, k, 2), INTENT(OUT)   :: c
+      REAL(KIND=dp), DIMENSION(4), INTENT(OUT)            :: occupation
+      COMPLEX(KIND=dp), DIMENSION(n, n), INTENT(OUT)      :: density
+      REAL(KIND=dp), INTENT(OUT)                         :: kts
+
+      COMPLEX(KIND=dp), DIMENSION(k, k)                  :: inverse_sqrt
+      INTEGER                                            :: channel, orbital, offset
+      REAL(KIND=dp)                                      :: mu, probability
+      REAL(KIND=dp), DIMENSION(4), PARAMETER             :: weights = [0.4_dp, 0.4_dp, 0.6_dp, 0.6_dp]
+
+      CALL fixed_n_fermi_occupations(labels, weights, 1.7_dp, 0.12_dp, 2.0_dp, occupation, mu)
+      density = CMPLX(0.0_dp, 0.0_dp, dp)
+      kts = 0.0_dp
+      DO channel = 1, 2
+         CALL dense_inverse_sqrt(MATMUL(CONJG(TRANSPOSE(coordinate(:, :, channel))), &
+                                        coordinate(:, :, channel)), inverse_sqrt)
+         c(:, :, channel) = MATMUL(MATMUL(coordinate(:, :, channel), inverse_sqrt), &
+                                     dense_antihermitian_exp(generator(:, :, channel)))
+         DO orbital = 1, k
+            offset = (channel - 1)*k + orbital
+            density = density + weights(offset)*occupation(offset)* &
+                      MATMUL(RESHAPE(c(:, orbital, channel), [n, 1]), &
+                             RESHAPE(CONJG(c(:, orbital, channel)), [1, n]))
+            probability = occupation(offset)/2.0_dp
+            kts = kts + weights(offset)*0.12_dp*2.0_dp* &
+                  (probability*LOG(probability) + (1.0_dp - probability)*LOG(1.0_dp - probability))
+         END DO
+      END DO
+   END SUBROUTINE mermin_test_state
 
 ! **************************************************************************************************
 !> \brief Check split-complex full-matrix multiplication including adjoints.
