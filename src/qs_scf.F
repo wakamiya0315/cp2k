@@ -3684,7 +3684,7 @@ CONTAINS
       REAL(dp) :: lambda, h(6), derivative(3), real_derivative, dot, f, eks
       LOGICAL :: valid
       COMPLEX(dp), ALLOCATABLE :: candidate(:, :, :, :)
-      TYPE(dbcsr_p_type), POINTER :: ks(:, :)
+      TYPE(dbcsr_p_type), POINTER :: ks(:, :), ref0(:, :), ref1(:, :), reference(:, :), direction_rs(:, :)
       TYPE(dbcsr_type) :: delta
       TYPE(mixing_storage_type), POINTER :: store
 
@@ -3695,6 +3695,16 @@ CONTAINS
       ELSE
          nh = 6; h = [8.0E-3_dp, 4.0E-3_dp, 2.0E-3_dp, 1.0E-3_dp, 5.0E-4_dp, 2.5E-4_dp]
       END IF
+      NULLIFY(ref0, ref1, reference, direction_rs)
+      CALL dbcsr_allocate_matrix_set(direction_rs, SIZE(initial, 1), SIZE(initial, 2))
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            ALLOCATE(direction_rs(ispin, ic)%matrix)
+            CALL dbcsr_create(direction_rs(ispin, ic)%matrix, template=initial(ispin, ic)%matrix)
+            CALL dbcsr_copy(direction_rs(ispin, ic)%matrix, proposal(ispin, ic)%matrix)
+            CALL dbcsr_add(direction_rs(ispin, ic)%matrix, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+         END DO
+      END DO
       sample = 0
       ! Both bases belong to the original physical segment. Negative endpoint extrapolation is excluded.
       DO base = 0, 1
@@ -3736,6 +3746,9 @@ CONTAINS
       END DO
       CALL evaluate_sample(0.0_dp, 3, 0, 0)
       IF (ALLOCATED(candidate)) DEALLOCATE (candidate)
+      CALL dbcsr_deallocate_matrix_set(direction_rs)
+      CALL dbcsr_deallocate_matrix_set(ref0)
+      CALL dbcsr_deallocate_matrix_set(ref1)
 
    CONTAINS
 
@@ -3744,6 +3757,9 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: repetition, index, origin
 
       REAL(dp)                                           :: component_error, other, values(11)
+      REAL(dp) :: ks_directional, ks_repeat_error
+      TYPE(dbcsr_type) :: difference
+      LOGICAL :: repeat_checked
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(qs_energy_type), POINTER                      :: energy
 
@@ -3762,7 +3778,48 @@ CONTAINS
          CALL qs_scf_free_evaluate(qs_env, scf_env, control, candidate, f, eks, valid)
          IF (.NOT. valid) CALL cp_abort(__LOCATION__, &
                                         "Invalid F diagnostic ensemble/state; no further probes")
-         CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control)
+         CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control, matrix_ks_kp=ks)
+         ks_directional = 0.0_dp; ks_repeat_error = 0.0_dp
+         repeat_checked = index == 0 .AND. repetition > 0
+         IF (origin == 0) THEN
+            reference => ref0
+         ELSE
+            reference => ref1
+         END IF
+         IF (index == 0 .AND. repetition == 0 .AND. .NOT. ASSOCIATED(reference)) THEN
+            CALL dbcsr_allocate_matrix_set(reference, SIZE(ks, 1), SIZE(ks, 2))
+            DO ic = 1, SIZE(ks, 2)
+               DO ispin = 1, SIZE(ks, 1)
+                  ALLOCATE(reference(ispin, ic)%matrix)
+                  CALL dbcsr_create(reference(ispin, ic)%matrix, template=ks(ispin, ic)%matrix)
+               END DO
+            END DO
+            IF (origin == 0) THEN
+               ref0 => reference
+            ELSE
+               ref1 => reference
+            END IF
+         END IF
+         DO ic = 1, SIZE(ks, 2)
+            DO ispin = 1, SIZE(ks, 1)
+               CALL dbcsr_dot(direction_rs(ispin, ic)%matrix, ks(ispin, ic)%matrix, dot)
+               ks_directional = ks_directional + dot
+               IF (index == 0 .AND. repetition == 0) THEN
+                  CALL dbcsr_copy(reference(ispin, ic)%matrix, ks(ispin, ic)%matrix)
+               ELSE IF (repeat_checked) THEN
+                  CALL dbcsr_create(difference, template=ks(ispin, ic)%matrix)
+                  CALL dbcsr_copy(difference, reference(ispin, ic)%matrix)
+                  CALL dbcsr_add(difference, ks(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+                  ks_repeat_error = MAX(ks_repeat_error, dbcsr_maxabs(difference))
+                  CALL dbcsr_release(difference)
+               END IF
+            END DO
+         END DO
+         IF (iw > 0) WRITE(iw, '(A,I6,ES26.17E3,L3,ES26.17E3)') &
+            "F_DIAG_CONTRACTION| sample,KS-direction,repeat-checked,repeat-KS-error ", &
+            sample, ks_directional, repeat_checked, ks_repeat_error
+         CPASSERT(ks_repeat_error <= 1.0E-10_dp)
+
          other = energy%gcp + energy%qmmm_el + energy%mulliken + SUM(energy%ddapc_restraint) + &
                  energy%s2_restraint + energy%dft_plus_u + energy%efield + energy%efield_core + &
                  energy%ee + energy%ee_core + energy%exc_aux_fit + energy%image_charge + &
