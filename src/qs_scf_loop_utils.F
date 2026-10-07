@@ -3144,12 +3144,11 @@ CONTAINS
       REAL(KIND=dp)                                      :: maxocc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
       REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation, eigenvalues
-      TYPE(cp_fm_type), POINTER                          :: coeff
       TYPE(dbcsr_type), POINTER                          :: s_re, s_im
 
-      NULLIFY (occupation, eigenvalues, coeff, s_re, s_im)
-      CALL get_mo_set(kp%mos(1, ispin), nao=nao, nmo=nmo, occupation_numbers=occupation, &
-                      eigenvalues=eigenvalues, mo_coeff=coeff, maxocc=maxocc)
+      NULLIFY (occupation, eigenvalues, s_re, s_im)
+      CALL get_mo_set(kp%mos(ispin), nao=nao, nmo=nmo, occupation_numbers=occupation, &
+                      eigenvalues=eigenvalues, maxocc=maxocc)
       ionode = ot_env%para_env%is_source()
       WRITE (filename, '(A,I0,A,I0,A,I0,A)') 'ot-state-e', evaluation, '-k', kp%nkpoint, '-s', ispin, '.bin'
       IF (ionode) THEN
@@ -3159,15 +3158,9 @@ CONTAINS
          WRITE (unit) weight, native_f, chart_f, native_kts, trial_kts, mu, sigma, maxocc
          WRITE (unit) occupation, trial_occupation, eigenvalues, ot_env%ener_x, ot_env%ener_gx
       END IF
-      ALLOCATE (dense(nao, nmo))
-      CALL cp_fm_get_submatrix(coeff, dense, n_rows=nao, n_cols=nmo)
-      IF (ionode) WRITE (unit) dense
-      CALL get_mo_set(kp%mos(2, ispin), mo_coeff=coeff)
-      CALL cp_fm_get_submatrix(coeff, dense, n_rows=nao, n_cols=nmo)
-      IF (ionode) WRITE (unit) dense
-      DEALLOCATE (dense)
-      CALL qs_scf_get_ot_kpoint_operator(matrix_s, kpoints, kp, 1, &
-                                         kp%ot_smat(1), kp%ot_smat(2), s_re, s_im)
+      CALL qs_scf_dump_ot_mo_coefficients(kp%mos(ispin), nao, nmo, ionode, unit)
+      CALL kpoint_operator_get_local(matrix_s, kpoints, kp, 1, &
+                                     kp%ot_smat(1), kp%ot_smat(2), s_re, s_im)
       CALL qs_scf_loop_ot_matrix_to_dense(s_re, ot_env, dense)
       IF (ionode) WRITE (unit) dense
       CALL qs_scf_loop_ot_matrix_to_dense(s_im, ot_env, dense)
@@ -3231,7 +3224,7 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
 
       CPASSERT(ot_env%use_dx)
-      CALL get_mo_set(kp%mos(1, ispin), nao=nao, nmo=nmo)
+      CALL get_mo_set(kp%mos(ispin), nao=nao, nmo=nmo)
       ionode = ot_env%para_env%is_source()
       WRITE (filename, '(A,I0,A,I0,A,I0,A)') 'ot-direction-e', evaluation, '-k', kp%nkpoint, '-s', ispin, '.bin'
       IF (ionode) THEN
@@ -3274,23 +3267,25 @@ CONTAINS
       CHARACTER(LEN=128)                                 :: filename
       INTEGER                                            :: local_kpoint, ispin, nao, nmo, unit
       LOGICAL                                            :: ionode
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
       REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation, eigenvalues, weights
-      TYPE(cp_fm_type), POINTER                          :: coeff
       TYPE(kpoint_env_type), POINTER                     :: kp
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(qs_energy_type), POINTER                      :: energy
 
-      NULLIFY (coeff, eigenvalues, energy, kp, kpoints, occupation, weights)
+      NULLIFY (eigenvalues, energy, kp, kpoints, occupation, weights)
       CPASSERT(phase == 1 .OR. phase == 2)
       CALL get_qs_env(qs_env, kpoints=kpoints, energy=energy)
       CALL get_kpoint_info(kpoints, wkp=weights)
       DO local_kpoint = 1, SIZE(kpoints%kp_env)
          kp => kpoints%kp_env(local_kpoint)%kpoint_env
-         DO ispin = 1, SIZE(kp%mos, 2)
-            CALL get_mo_set(kp%mos(1, ispin), nao=nao, nmo=nmo, &
-                            occupation_numbers=occupation, eigenvalues=eigenvalues, mo_coeff=coeff)
-            ionode = coeff%matrix_struct%para_env%is_source()
+         DO ispin = 1, SIZE(kp%mos)
+            CALL get_mo_set(kp%mos(ispin), nao=nao, nmo=nmo, &
+                            occupation_numbers=occupation, eigenvalues=eigenvalues)
+            IF (ASSOCIATED(kp%mos(ispin)%cmo_coeff)) THEN
+               ionode = kp%mos(ispin)%cmo_coeff%matrix_struct%para_env%is_source()
+            ELSE
+               ionode = kp%mos(ispin)%mo_coeff%matrix_struct%para_env%is_source()
+            END IF
             WRITE (filename, '(A,I0,A,I0,A,I0,A,I0,A)') &
                'ot-rebase-e', evaluation, '-p', phase, '-k', kp%nkpoint, '-s', ispin, '.bin'
             IF (ionode) THEN
@@ -3300,19 +3295,50 @@ CONTAINS
                WRITE (unit) weights(kp%nkpoint), energy%total, energy%kTS
                WRITE (unit) occupation, eigenvalues
             END IF
-            ALLOCATE (dense(nao, nmo))
-            CALL cp_fm_get_submatrix(coeff, dense, n_rows=nao, n_cols=nmo)
-            IF (ionode) WRITE (unit) dense
-            CALL get_mo_set(kp%mos(2, ispin), mo_coeff=coeff)
-            CALL cp_fm_get_submatrix(coeff, dense, n_rows=nao, n_cols=nmo)
-            IF (ionode) THEN
-               WRITE (unit) dense
-               CLOSE (unit)
-            END IF
-            DEALLOCATE (dense)
+            CALL qs_scf_dump_ot_mo_coefficients(kp%mos(ispin), nao, nmo, ionode, unit)
+            IF (ionode) CLOSE (unit)
          END DO
       END DO
    END SUBROUTINE qs_scf_dump_ot_rebase_state
+
+! **************************************************************************************************
+!> \brief Write the real and imaginary parts of k-point orbital coefficients to a dump record.
+!>        Complex orbitals are stored as one complex matrix; real orbitals get a zero imaginary
+!>        part, so that the record layout does not depend on the wavefunction type.
+!> \param mo_set orbitals of one spin at one k-point
+!> \param nao number of atomic orbitals
+!> \param nmo number of orbitals
+!> \param ionode whether this rank writes
+!> \param unit open stream unit on the writing rank
+! **************************************************************************************************
+   SUBROUTINE qs_scf_dump_ot_mo_coefficients(mo_set, nao, nmo, ionode, unit)
+      TYPE(mo_set_type), INTENT(IN)                      :: mo_set
+      INTEGER, INTENT(IN)                                :: nao, nmo
+      LOGICAL, INTENT(IN)                                :: ionode
+      INTEGER, INTENT(IN)                                :: unit
+
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
+      TYPE(cp_fm_type)                                   :: coeff_im, coeff_re
+
+      ALLOCATE (dense(nao, nmo))
+      IF (ASSOCIATED(mo_set%cmo_coeff)) THEN
+         CALL cp_fm_create(coeff_re, mo_set%cmo_coeff%matrix_struct)
+         CALL cp_fm_create(coeff_im, mo_set%cmo_coeff%matrix_struct)
+         CALL cp_cfm_to_fm(mo_set%cmo_coeff, coeff_re, coeff_im)
+         CALL cp_fm_get_submatrix(coeff_re, dense, n_rows=nao, n_cols=nmo)
+         IF (ionode) WRITE (unit) dense
+         CALL cp_fm_get_submatrix(coeff_im, dense, n_rows=nao, n_cols=nmo)
+         IF (ionode) WRITE (unit) dense
+         CALL cp_fm_release(coeff_re)
+         CALL cp_fm_release(coeff_im)
+      ELSE
+         CALL cp_fm_get_submatrix(mo_set%mo_coeff, dense, n_rows=nao, n_cols=nmo)
+         IF (ionode) WRITE (unit) dense
+         dense = 0.0_dp
+         IF (ionode) WRITE (unit) dense
+      END IF
+      DEALLOCATE (dense)
+   END SUBROUTINE qs_scf_dump_ot_mo_coefficients
 
 ! **************************************************************************************************
 !> \brief copy a distributed OT matrix to a replicated dense matrix
