@@ -54,6 +54,24 @@ typedef struct {
 static native_grid_gpu_state state = {{0, 0, 0}, {0, 0, 0}, 0, 0, 0, 0,
                                       NULL, NULL, NULL, NULL, NULL, NULL};
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
+/*******************************************************************************
+ * \brief atomicAdd for doubles on devices before compute capability 6.0, which
+ *        lack it (the build also compiles for older targets); as in
+ *        grid/gpu/grid_gpu_internal_header.h.
+ ******************************************************************************/
+__device__ static inline double atomicAdd(double *address, double val) {
+  unsigned long long int *address_as_ull = (unsigned long long int *)address;
+  unsigned long long int old = *address_as_ull, assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed,
+                    __double_as_longlong(val + __longlong_as_double(assumed)));
+  } while (assumed != old); // integer comparison, so NaN cannot hang the loop
+  return __longlong_as_double(old);
+}
+#endif
+
 /*******************************************************************************
  * \brief Grid index of node 'node' of a stencil whose first node is 'first'
  *        along one direction, or -1 outside a direction that does not wrap.
