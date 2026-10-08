@@ -947,7 +947,7 @@ CONTAINS
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="relativistic", &
                           description="parameters needed and setup for relativistic calculations", &
-                          n_keywords=7, n_subsections=0, repeats=.FALSE.)
+                          n_keywords=8, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
 
@@ -1011,6 +1011,17 @@ CONTAINS
                           "basis file, which are not one for many basis sets (opt-in; off keeps the "// &
                           "previous behaviour).", &
                           usage="ATOMIC_NORMALIZE_CONTRACTIONS T", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ATOMIC_FULL_NUCLEUS", &
+                          description="With TRANSFORMATION ATOM and DKH, use the full nuclear potential "// &
+                          "-Z/r both for the potential and for its pVp matrix in the atomic DKH "// &
+                          "transformation, and subtract the full nonrelativistic attraction. Without "// &
+                          "it the potential is the screened -Z erfc(alpha r)/r while pVp is that of "// &
+                          "the full nucleus (opt-in; off keeps the previous behaviour).", &
+                          usage="ATOMIC_FULL_NUCLEUS T", default_l_val=.FALSE., &
                           lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)

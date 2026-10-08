@@ -10,6 +10,7 @@
 ! **************************************************************************************************
 MODULE atom_kind_orbitals
    USE ai_onecenter,                    ONLY: sg_erfc,&
+                                              sg_nuclear,&
                                               sg_overlap
    USE atom_electronic_structure,       ONLY: calculate_atom
    USE atom_fit,                        ONLY: atom_fit_density
@@ -1138,8 +1139,14 @@ CONTAINS
          CALL atom_ppint_setup(integrals, basis, potential=atom%potential)
          ! relativistic correction terms
          NULLIFY (integrals%tzora, integrals%hdkh)
-         CALL atom_relint_setup(integrals, basis, atom%relativistic, zcore=REAL(atom%zcore, dp), &
-                                alpha=alpha)
+         ! The DKH input uses the screened nucleus -Z erfc(alpha r)/r for V but the full nucleus for
+         ! pVp; optionally use the full nucleus for both, as the atomic code itself does.
+         IF (rel_control%rel_atomic_full_nucleus) THEN
+            CALL atom_relint_setup(integrals, basis, atom%relativistic, zcore=REAL(atom%zcore, dp))
+         ELSE
+            CALL atom_relint_setup(integrals, basis, atom%relativistic, zcore=REAL(atom%zcore, dp), &
+                                   alpha=alpha)
+         END IF
          CALL set_atom(atom, integrals=integrals)
 
          ! for DKH we need erfc integrals to correct non-relativistic
@@ -1149,7 +1156,13 @@ CONTAINS
             m = basis%nprim(l)
             ALLOCATE (omat(m, m))
 
-            CALL sg_erfc(omat(1:m, 1:m), l, alpha, basis%am(1:m, l), basis%am(1:m, l))
+            ! the nonrelativistic attraction removed from H_DKH: the same nucleus as in its V;
+            ! Quickstep adds its own full nuclear attraction afterwards
+            IF (rel_control%rel_atomic_full_nucleus) THEN
+               CALL sg_nuclear(omat(1:m, 1:m), l, basis%am(1:m, l), basis%am(1:m, l))
+            ELSE
+               CALL sg_erfc(omat(1:m, 1:m), l, alpha, basis%am(1:m, l), basis%am(1:m, l))
+            END IF
             integrals%core(1:n, 1:n, l) = MATMUL(TRANSPOSE(basis%cm(1:m, 1:n, l)), &
                                                  MATMUL(omat(1:m, 1:m), basis%cm(1:m, 1:n, l)))
 
