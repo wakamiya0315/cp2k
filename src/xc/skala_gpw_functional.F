@@ -2968,6 +2968,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: cuda_device
       TYPE(section_vals_type), POINTER                   :: xc_section
 
+      INTEGER                                            :: iw
       LOGICAL                                            :: fp64
       TYPE(section_vals_type), POINTER                   :: gauxc_section
 
@@ -2987,6 +2988,16 @@ CONTAINS
       cached_model_cuda_device = cuda_device
       cached_model_fp64 = fp64
       cached_model_loaded = .TRUE.
+
+      iw = cp_logger_get_default_io_unit()
+      IF (iw > 0) THEN
+         WRITE (iw, "(T2,A,1X,A)") "SKALA_GPW| Model loaded:", TRIM(model_path)
+         IF (fp64) THEN
+            WRITE (iw, "(T2,A)") "SKALA_GPW| Model arithmetic: float64"
+         ELSE
+            WRITE (iw, "(T2,A)") "SKALA_GPW| Model arithmetic: float32"
+         END IF
+      END IF
 
    END SUBROUTINE ensure_model_loaded
 
