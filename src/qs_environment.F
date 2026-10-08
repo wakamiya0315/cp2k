@@ -725,6 +725,10 @@ CONTAINS
       CALL get_qs_env(qs_env, rel_control=rel_control)
       IF (rel_control%rel_method /= rel_none) THEN
          IF (rel_control%rel_transformation == rel_trans_atom) THEN
+            IF (.NOT. rel_control%rel_atomic_normalize) THEN
+               CALL cp_warn(__LOCATION__, "TRANSFORMATION ATOM without ATOMIC_NORMALIZE_CONTRACTIONS: "// &
+                            "the correction scales with the contraction norms of the basis file")
+            END IF
             nkind = SIZE(atomic_kind_set)
             DO ikind = 1, nkind
                NULLIFY (rtmat)

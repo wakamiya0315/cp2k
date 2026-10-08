@@ -947,7 +947,7 @@ CONTAINS
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="relativistic", &
                           description="parameters needed and setup for relativistic calculations", &
-                          n_keywords=5, n_subsections=0, repeats=.FALSE.)
+                          n_keywords=7, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
 
@@ -1001,6 +1001,17 @@ CONTAINS
                           usage="POTENTIAL {FULL,ERFC}", default_i_val=rel_pot_erfc, &
                           enum_c_vals=s2a("FULL", "ERFC"), &
                           enum_i_vals=[rel_pot_full, rel_pot_erfc])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ATOMIC_NORMALIZE_CONTRACTIONS", &
+                          description="With TRANSFORMATION ATOM, build the atomic correction from the "// &
+                          "contracted functions normalized to one, as Quickstep uses them. Without it "// &
+                          "the correction scales with the norms of the contraction coefficients of the "// &
+                          "basis file, which are not one for many basis sets (opt-in; off keeps the "// &
+                          "previous behaviour).", &
+                          usage="ATOMIC_NORMALIZE_CONTRACTIONS T", default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

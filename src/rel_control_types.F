@@ -59,6 +59,7 @@ MODULE rel_control_types
       INTEGER                               :: rel_transformation = -1
       INTEGER                               :: rel_z_cutoff = -1
       INTEGER                               :: rel_potential = -1
+      LOGICAL                               :: rel_atomic_normalize = .FALSE.
    END TYPE rel_control_type
 
 CONTAINS
@@ -83,6 +84,7 @@ CONTAINS
       rel_control%rel_transformation = rel_trans_full
       rel_control%rel_z_cutoff = 1
       rel_control%rel_potential = rel_pot_full
+      rel_control%rel_atomic_normalize = .FALSE.
 
    END SUBROUTINE rel_c_create
 
@@ -136,6 +138,8 @@ CONTAINS
                                 i_val=rel_control%rel_z_cutoff)
       CALL section_vals_val_get(rel_section, "potential", &
                                 i_val=rel_control%rel_potential)
+      CALL section_vals_val_get(rel_section, "ATOMIC_NORMALIZE_CONTRACTIONS", &
+                                l_val=rel_control%rel_atomic_normalize)
 
    END SUBROUTINE rel_c_read_parameters
 

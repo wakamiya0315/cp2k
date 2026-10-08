@@ -9,7 +9,8 @@
 !> \brief calculate the orbitals for a given atomic kind type
 ! **************************************************************************************************
 MODULE atom_kind_orbitals
-   USE ai_onecenter,                    ONLY: sg_erfc
+   USE ai_onecenter,                    ONLY: sg_erfc,&
+                                              sg_overlap
    USE atom_electronic_structure,       ONLY: calculate_atom
    USE atom_fit,                        ONLY: atom_fit_density
    USE atom_operators,                  ONLY: atom_int_release,&
@@ -876,7 +877,8 @@ CONTAINS
       INTEGER, DIMENSION(0:lmat, 100)                    :: set_index, shell_index
       INTEGER, DIMENSION(:), POINTER                     :: lmax, lmin, npgf, nshell
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf, last_sgf, ls
-      REAL(KIND=dp)                                      :: al, alpha, ear, prefac, rk, zeff
+      REAL(KIND=dp)                                      :: al, alpha, contraction_norm2, ear, &
+                                                            prefac, rk, zeff
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: omat
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: zet
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: gcc
@@ -1023,6 +1025,24 @@ CONTAINS
                END DO
             END DO
          END DO
+
+         ! gcc normalizes the primitives only; Quickstep normalizes every contracted function on
+         ! top of that (norm_cgf). Optionally use those functions here, so that the correction
+         ! does not scale with the norms of the contraction coefficients of the basis file.
+         IF (rel_control%rel_atomic_normalize) THEN
+            DO j = 0, lmat
+               m = basis%nprim(j)
+               IF (m == 0) CYCLE
+               ALLOCATE (omat(m, m))
+               CALL sg_overlap(omat(1:m, 1:m), j, basis%am(1:m, j), basis%am(1:m, j))
+               DO ii = 1, basis%nbas(j)
+                  contraction_norm2 = DOT_PRODUCT(basis%cm(1:m, ii, j), &
+                                                  MATMUL(omat(1:m, 1:m), basis%cm(1:m, ii, j)))
+                  basis%cm(1:m, ii, j) = basis%cm(1:m, ii, j)/SQRT(contraction_norm2)
+               END DO
+               DEALLOCATE (omat)
+            END DO
+         END IF
 
          ! initialize basis function on a radial grid
          nr = basis%grid%nr
