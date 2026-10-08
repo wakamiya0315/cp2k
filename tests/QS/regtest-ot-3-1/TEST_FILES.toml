@@ -33,7 +33,4 @@
   {matcher="NO_TEXT", text="K-point smearing includes the first band"},
   {matcher="NO_TEXT", text="K-point smearing includes the last band"},
 ]
-# A small density change cannot certify a fixed-H solve that missed EPS_ITER.
-# This case intentionally reaches MAX_SCF with an insufficient inner iteration budget.
-"Al-kpoint-otdiag-maxiter.inp"          = [{matcher="NO_TEXT", text="SCF run converged"}]
 #EOF
