@@ -117,7 +117,8 @@ CONTAINS
       nr = grid_atom%nr
       niso = harmonics%max_iso_not0
       CPASSERT(SIZE(rho_h, 1) == na .AND. SIZE(rho_h, 2) == nr)
-      CPASSERT(SIZE(drho_h, 1) == 4 .AND. SIZE(drho_h, 2) == na .AND. SIZE(drho_h, 3) == nr)
+      CPASSERT(SIZE(drho_h, 1) == 4)
+      CPASSERT(SIZE(drho_h, 2) == na .AND. SIZE(drho_h, 3) == nr)
       ALLOCATE (slm(na, niso), directions(3, na), radial(nr, niso, 10))
       slm(:, :) = harmonics%slm(1:na, 1:niso)
       directions(:, :) = harmonics%a(1:3, 1:na)
