@@ -719,6 +719,16 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="RESTORE_CONSTRAINT", &
+                          description="After each minimizer update, project X back onto the constraint"// &
+                          " (S C0)^T X = 0 that the STRICT parametrization C = C0 cos(U) + X sin(U)/U assumes."// &
+                          " Without it, roundoff along C0 in the preconditioned step (scaled by"// &
+                          " 1/ENERGY_GAP with FULL_ALL) accumulates and the orbitals lose S-orthonormality."// &
+                          " Real Gamma-point ALGORITHM STRICT only.", &
+                          usage="RESTORE_CONSTRAINT ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="MAX_SCF_DIIS", &
                           description="Maximum DIIS SCF inner loop cycles. This can be used to extend"// &
                           " SCF cycles after a switch to DIIS (see eps_diis).", &

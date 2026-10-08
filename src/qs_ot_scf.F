@@ -14,17 +14,19 @@
 MODULE qs_ot_scf
    USE cp_array_utils,                  ONLY: cp_1d_r_p_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_copy, dbcsr_get_info, dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, dbcsr_release, &
-        dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
+        dbcsr_add, dbcsr_copy, dbcsr_get_info, dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, &
+        dbcsr_release, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_add_on_diag,&
                                               dbcsr_dot,&
                                               dbcsr_get_diag,&
+                                              dbcsr_maxabs,&
                                               dbcsr_scale_by_vector,&
                                               dbcsr_set_diag
    USE cp_dbcsr_operations,             ONLY: copy_fm_to_dbcsr,&
                                               cp_dbcsr_m_by_n_from_row_template
    USE cp_fm_types,                     ONLY: cp_fm_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
+                                              cp_logger_get_default_io_unit,&
                                               cp_logger_type
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
@@ -55,6 +57,8 @@ MODULE qs_ot_scf
    PRIVATE
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ot_scf'
+   ! Step counter of the opt-in orthonormality report (CP2K_SKALA_OT_METRIC_DIAG)
+   INTEGER, SAVE, PRIVATE :: ot_metric_step = 0
    ! *** Public subroutines ***
 
    PUBLIC :: ot_scf_init
@@ -140,11 +144,13 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_scf_mini'
 
       INTEGER                                            :: handle, ispin, k, n, nspin
+      LOGICAL                                            :: metric_report
       REAL(KIND=dp)                                      :: ener_nondiag, trace
       TYPE(cp_1d_r_p_type), ALLOCATABLE, DIMENSION(:)    :: expectation_values, occupation_numbers, &
                                                             scaling_factor
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_dedc_physical, matrix_dedc_scaled
+      TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:)        :: x_before
       TYPE(dbcsr_type), POINTER                          :: mo_coeff
 
       CALL timeset(routineN, handle)
@@ -153,6 +159,16 @@ CONTAINS
       logger => cp_get_default_logger()
 
       nspin = SIZE(mo_array)
+
+      ! Opt-in report of the OT orthonormality constraint; it reads the state and changes nothing.
+      metric_report = ot_metric_report_requested() .AND. ASSOCIATED(matrix_s)
+      IF (metric_report) metric_report = qs_ot_env(1)%settings%ot_algorithm == "TOD"
+      IF (metric_report) THEN
+         ALLOCATE (x_before(SIZE(qs_ot_env)))
+         DO ispin = 1, SIZE(qs_ot_env)
+            CALL dbcsr_copy(x_before(ispin), qs_ot_env(ispin)%matrix_x, name="ot_metric_x_before")
+         END DO
+      END IF
 
       ALLOCATE (occupation_numbers(nspin))
       ALLOCATE (scaling_factor(nspin))
@@ -294,6 +310,14 @@ CONTAINS
       delta = qs_ot_env(1)%delta
       energy_only = qs_ot_env(1)%energy_only
 
+      ! optionally restore the constraint (S C0)^T X = 0 before the orbitals are built from X
+      IF (qs_ot_env(1)%settings%restore_constraint .AND. &
+          qs_ot_env(1)%settings%ot_algorithm == "TOD") THEN
+         DO ispin = 1, SIZE(qs_ot_env)
+            CALL ot_restore_constraint(qs_ot_env(ispin))
+         END DO
+      END IF
+
       ! generate the orbitals using the new matrix_x
       DO ispin = 1, SIZE(qs_ot_env)
          CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff_b=mo_coeff)
@@ -329,6 +353,17 @@ CONTAINS
             CALL set_mo_occupation(mo_set=mo_array(ispin), &
                                    smear=smear)
          END DO
+      END IF
+
+      IF (metric_report) THEN
+         ot_metric_step = ot_metric_step + 1
+         DO ispin = 1, SIZE(qs_ot_env)
+            CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff_b=mo_coeff)
+            CALL ot_metric_report(qs_ot_env(ispin), ispin, qs_ot_env(1)%OT_METHOD_FULL, mo_coeff, &
+                                  matrix_s, matrix_dedc_scaled(ispin)%matrix, x_before(ispin))
+            CALL dbcsr_release(x_before(ispin))
+         END DO
+         DEALLOCATE (x_before)
       END IF
 
       ! cleanup
@@ -461,8 +496,156 @@ CONTAINS
          END SELECT
 
       END DO
+
+      IF (ot_metric_report_requested() .AND. ASSOCIATED(matrix_s) .AND. &
+          qs_ot_env(1)%settings%ot_algorithm == "TOD") THEN
+         ot_metric_step = 0
+         CALL ot_metric_report_start(qs_ot_env)
+      END IF
       CALL timestop(handle)
    END SUBROUTINE ot_scf_init
+
+! **************************************************************************************************
+!> \brief X <- X - C0 (S C0)^T X, the projection onto the constraint (S C0)^T X = 0 in the S metric.
+!>        C = C0 cos(U) + X sin(U)/U is S-orthonormal only on this constraint. The gradient
+!>        projection in qs_ot_get_derivative leaves a roundoff component along C0 that a FULL_ALL
+!>        step scales by 1/ENERGY_GAP; for all-electron core orbitals it accumulates over long runs.
+!>        Exact for C0^T S C0 = I, which ot_scf_init receives from orthonormalized orbitals.
+!> \param qs_ot_env ...
+! **************************************************************************************************
+   SUBROUTINE ot_restore_constraint(qs_ot_env)
+      TYPE(qs_ot_type)                                   :: qs_ot_env
+
+      TYPE(dbcsr_type)                                   :: kk
+
+      CALL dbcsr_copy(kk, qs_ot_env%matrix_p, name="ot_constraint_kk")
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env%matrix_sc0, qs_ot_env%matrix_x, 0.0_dp, kk)
+      CALL dbcsr_multiply('N', 'N', -1.0_dp, qs_ot_env%matrix_c0, kk, 1.0_dp, qs_ot_env%matrix_x)
+      CALL dbcsr_release(kk)
+   END SUBROUTINE ot_restore_constraint
+
+! **************************************************************************************************
+!> \brief True if CP2K_SKALA_OT_METRIC_DIAG is set to a non-empty value. The report is a read-only
+!>        diagnostic of the OT constraint and does not change the calculation.
+!> \return ...
+! **************************************************************************************************
+   FUNCTION ot_metric_report_requested() RESULT(requested)
+      LOGICAL                                            :: requested
+
+      CHARACTER(LEN=8)                                   :: value
+      INTEGER                                            :: length, status
+
+      CALL GET_ENVIRONMENT_VARIABLE("CP2K_SKALA_OT_METRIC_DIAG", value, length, status)
+      requested = (status == 0 .OR. status == -1) .AND. length > 0
+   END FUNCTION ot_metric_report_requested
+
+! **************************************************************************************************
+!> \brief Print the column legend and the metric error of the starting orbitals C0 of each spin.
+!> \param qs_ot_env ...
+! **************************************************************************************************
+   SUBROUTINE ot_metric_report_start(qs_ot_env)
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
+
+      INTEGER                                            :: ispin, unit_nr
+      REAL(KIND=dp)                                      :: c0_error
+      TYPE(dbcsr_type)                                   :: kk
+
+      unit_nr = cp_logger_get_default_io_unit()
+      IF (unit_nr > 0) THEN
+         WRITE (unit_nr, '(T2,A)') "OT_METRIC| step spin method: max|C0'SC0-I| max|(SC0)'X| "// &
+            "max|(SC0)'dX| max|C0'G| max|C0'dE/dC| max|cos^2+sin'P sin-I| max|C'SC-I| tr(C'SC-I) "// &
+            "j (C'SC-I)_jj ((SC0)'X)_jj max|X| taylor_order"
+      END IF
+      DO ispin = 1, SIZE(qs_ot_env)
+         CALL dbcsr_copy(kk, qs_ot_env(ispin)%matrix_p, name="ot_metric_kk")
+         CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env(ispin)%matrix_c0, qs_ot_env(ispin)%matrix_sc0, &
+                             0.0_dp, kk)
+         CALL dbcsr_add_on_diag(kk, -1.0_dp)
+         c0_error = dbcsr_maxabs(kk)
+         CALL dbcsr_release(kk)
+         IF (unit_nr > 0) WRITE (unit_nr, '(T2,A,I6,I2,1X,A8,ES11.3)') "OT_METRIC|", 0, ispin, "INIT", c0_error
+      END DO
+   END SUBROUTINE ot_metric_report_start
+
+! **************************************************************************************************
+!> \brief One line per spin after the orbitals of a step are generated.
+!>        C = C0 cos(U) + X sin(U)/U is S-orthonormal only if C0'SC0 = I, (SC0)'X = 0 and the
+!>        matrix functions satisfy cos(U)^2 + sin(U)/U P sin(U)/U = I with P = X'SX. The line
+!>        reports each of these, the change of (SC0)'X in this step, the C0 component of the
+!>        projected gradient G and of dE/dC before the projection, and the resulting C'SC-I.
+!> \param qs_ot_env OT environment of this spin (after the step)
+!> \param ispin ...
+!> \param method minimizer step label, e.g. OT DIIS
+!> \param mo_coeff orbitals generated from the new X
+!> \param matrix_s overlap matrix
+!> \param matrix_dedc dE/dC passed to the minimizer in this step
+!> \param x_before X before the step
+! **************************************************************************************************
+   SUBROUTINE ot_metric_report(qs_ot_env, ispin, method, mo_coeff, matrix_s, matrix_dedc, x_before)
+      TYPE(qs_ot_type)                                   :: qs_ot_env
+      INTEGER, INTENT(IN)                                :: ispin
+      CHARACTER(LEN=*), INTENT(IN)                       :: method
+      TYPE(dbcsr_type), POINTER                          :: mo_coeff, matrix_s, matrix_dedc
+      TYPE(dbcsr_type), INTENT(IN)                       :: x_before
+
+      INTEGER                                            :: j, k, unit_nr
+      REAL(KIND=dp)                                      :: c0_error, c_error, c_trace, &
+                                                            function_error, gradient_c0, hc_c0, &
+                                                            step_violation, x_max, x_violation
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: c_diag, x_diag
+      TYPE(dbcsr_type)                                   :: kk, kk2, nk
+
+      CALL dbcsr_get_info(qs_ot_env%matrix_x, nfullcols_total=k)
+      ALLOCATE (c_diag(k), x_diag(k))
+      CALL dbcsr_copy(kk, qs_ot_env%matrix_p, name="ot_metric_kk")
+      CALL dbcsr_copy(kk2, qs_ot_env%matrix_p, name="ot_metric_kk2")
+      CALL dbcsr_copy(nk, qs_ot_env%matrix_x, name="ot_metric_nk")
+
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env%matrix_c0, qs_ot_env%matrix_sc0, 0.0_dp, kk)
+      CALL dbcsr_add_on_diag(kk, -1.0_dp)
+      c0_error = dbcsr_maxabs(kk)
+
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env%matrix_sc0, qs_ot_env%matrix_x, 0.0_dp, kk)
+      x_violation = dbcsr_maxabs(kk)
+      CALL dbcsr_get_diag(kk, x_diag)
+
+      CALL dbcsr_add(nk, x_before, 1.0_dp, -1.0_dp)
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env%matrix_sc0, nk, 0.0_dp, kk)
+      step_violation = dbcsr_maxabs(kk)
+
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env%matrix_c0, qs_ot_env%matrix_gx, 0.0_dp, kk)
+      gradient_c0 = dbcsr_maxabs(kk)
+
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, qs_ot_env%matrix_c0, matrix_dedc, 0.0_dp, kk)
+      hc_c0 = dbcsr_maxabs(kk)
+
+      CALL dbcsr_multiply('N', 'N', 1.0_dp, qs_ot_env%matrix_cosp, qs_ot_env%matrix_cosp, 0.0_dp, kk)
+      CALL dbcsr_multiply('N', 'N', 1.0_dp, qs_ot_env%matrix_p, qs_ot_env%matrix_sinp, 0.0_dp, kk2)
+      CALL dbcsr_multiply('N', 'N', 1.0_dp, qs_ot_env%matrix_sinp, kk2, 1.0_dp, kk)
+      CALL dbcsr_add_on_diag(kk, -1.0_dp)
+      function_error = dbcsr_maxabs(kk)
+
+      CALL dbcsr_multiply('N', 'N', 1.0_dp, matrix_s, mo_coeff, 0.0_dp, nk)
+      CALL dbcsr_multiply('T', 'N', 1.0_dp, mo_coeff, nk, 0.0_dp, kk)
+      CALL dbcsr_add_on_diag(kk, -1.0_dp)
+      c_error = dbcsr_maxabs(kk)
+      CALL dbcsr_get_diag(kk, c_diag)
+      c_trace = SUM(c_diag)
+      j = MAXLOC(ABS(c_diag), 1)
+      x_max = dbcsr_maxabs(qs_ot_env%matrix_x)
+
+      unit_nr = cp_logger_get_default_io_unit()
+      IF (unit_nr > 0) THEN
+         WRITE (unit_nr, '(T2,A,I6,I2,1X,A8,8ES11.3,I4,2ES11.3,ES10.2,I3)') "OT_METRIC|", ot_metric_step, &
+            ispin, ADJUSTL(method), c0_error, x_violation, step_violation, gradient_c0, hc_c0, &
+            function_error, c_error, c_trace, j, c_diag(j), x_diag(j), x_max, qs_ot_env%taylor_order
+      END IF
+
+      CALL dbcsr_release(kk)
+      CALL dbcsr_release(kk2)
+      CALL dbcsr_release(nk)
+      DEALLOCATE (c_diag, x_diag)
+   END SUBROUTINE ot_metric_report
 
 ! **************************************************************************************************
 !> \brief ...
