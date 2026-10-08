@@ -83,6 +83,10 @@ MODULE qs_vxc_atom
                                               native_grid_gpu_set_grid,&
                                               native_grid_gpu_set_rows,&
                                               native_grid_gpu_upload_field
+   USE qs_native_one_centre_gpu,        ONLY: calc_tau_atom_gpu,&
+                                              dgaVtaudgb_gpu,&
+                                              gaVxcgb_GC_gpu,&
+                                              one_centre_gpu_release
    USE qs_rho_atom_methods,             ONLY: replicate_rho_atom_radial
    USE qs_rho_atom_types,               ONLY: get_rho_atom,&
                                               rho_atom_coeff,&
@@ -331,7 +335,7 @@ CONTAINS
          composite_row_rank, gapw_density_partition, gapw_representation, handle, ia, iat, iatom, &
          icomponent, idir, ikind, ir, ispin, iw, jdir, myfun, na, natom, nlcc_entry, nlcc_first, &
          nlcc_last, nr, nspins, num_pe, on, section_handle, source_atom, target_atom
-      INTEGER :: xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: one_centre_col_count, xc_deriv_method_id, xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
@@ -342,7 +346,8 @@ CONTAINS
       LOGICAL :: accint, adjoint_private, atom_composite_active, atom_composite_diagnostic, &
          atom_composite_reference, direct_valence_atom_composite, donlcc, evaluate_hard, &
          evaluate_soft, gradient_f, image_partition_atom_composite, lsd, my_calculate_forces, &
-         native_grid_diagnostics, native_grid_gpu_stencil, native_trial_diagnostics, nlcc, &
+         native_grid_diagnostics, native_grid_gpu_one_centre, native_grid_gpu_stencil, &
+         native_trial_diagnostics, nlcc, &
          one_center_kind, paw_atom, &
          paw_pseudopotentials, requested_atom_composite_grid, reuse_partition, rho_g_valid, &
          skala_atom_grid, source_matrix_local, tau_f, tau_r_valid, use_atom_composite_density, &
@@ -536,6 +541,7 @@ CONTAINS
       paw_pseudopotentials = .FALSE.
       native_grid_diagnostics = .FALSE.
       native_grid_gpu_stencil = .FALSE.
+      native_grid_gpu_one_centre = .FALSE.
       native_trial_diagnostics = .FALSE.
       atom_composite_components = 1
       feature_vxc_step = 3.0E-3_dp
@@ -574,6 +580,8 @@ CONTAINS
                                    r_val=feature_vxc_step)
          CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_GPU_STENCIL", &
                                    l_val=native_grid_gpu_stencil)
+         CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_GPU_ONE_CENTRE", &
+                                   l_val=native_grid_gpu_one_centre)
       END IF
       atom_composite_reference = atom_composite_reference .OR. &
                                  (gapw_representation == skala_gapw_paw_one_center .AND. &
@@ -943,7 +951,8 @@ CONTAINS
             IF (.NOT. direct_valence_atom_composite) THEN
                CALL timeset("skala_vxc_1c_fields", section_handle)
                ALLOCATE (one_center_fields(SIZE(particle_set)))
-               CALL compute_one_center_fields(one_center_fields, my_kind_set, atomic_kind_set, &
+               CALL compute_one_center_fields(native_grid_gpu_one_centre, &
+                                              one_center_fields, my_kind_set, atomic_kind_set, &
                                               my_rho_atom_set, para_env, nspins, &
                                               gapw_representation)
                CALL timestop(section_handle)
@@ -2355,8 +2364,20 @@ CONTAINS
                         END DO
                      END IF
                      CALL timeset("skala_vxc_1c_adj_ks", section_handle)
-                     CALL gaVxcgb_GC(vxc_h, vxc_s, vxg_h, vxg_s, int_hh, int_ss, &
-                                     grid_atom, basis_1c, harmonics, nspins)
+                     IF (native_grid_gpu_one_centre) THEN
+                        CALL gaVxcgb_GC_gpu(vxc_h, vxc_s, vxg_h, vxg_s, int_hh, int_ss, &
+                                            grid_atom, basis_1c, harmonics, nspins, &
+                                            one_centre_col_count)
+                        IF (native_grid_diagnostics) THEN
+                           iw = cp_logger_get_default_io_unit()
+                           IF (iw > 0) WRITE (UNIT=iw, FMT="(T2,A,3(1X,I0))") &
+                              "SKALA_GPW| GPU one-centre kind, basis functions, radial columns", &
+                              ikind, tau_basis_cache%nsatbas, one_centre_col_count
+                        END IF
+                     ELSE
+                        CALL gaVxcgb_GC(vxc_h, vxc_s, vxg_h, vxg_s, int_hh, int_ss, &
+                                        grid_atom, basis_1c, harmonics, nspins)
+                     END IF
                      IF (atom_composite_diagnostic) THEN
                         DO ispin = 1, nspins
                            one_center_rho_grad_matrix_contraction = &
@@ -2369,7 +2390,12 @@ CONTAINS
                                                          tau_basis_cache%n2oindex)
                         END DO
                      END IF
-                     CALL dgaVtaudgb(vtau_h, vtau_s, int_hh, int_ss, tau_basis_cache, nspins)
+                     IF (native_grid_gpu_one_centre) THEN
+                        CALL dgaVtaudgb_gpu(vtau_h, vtau_s, int_hh, int_ss, tau_basis_cache, &
+                                            nspins, ikind)
+                     ELSE
+                        CALL dgaVtaudgb(vtau_h, vtau_s, int_hh, int_ss, tau_basis_cache, nspins)
+                     END IF
                      IF (atom_composite_diagnostic) THEN
                         DO ispin = 1, nspins
                            one_center_matrix_contraction = &
@@ -4365,6 +4391,8 @@ CONTAINS
       cache%gpu_stencils_ready = .FALSE.
       IF (ALLOCATED(cache%gpu_row_of_rank)) DEALLOCATE (cache%gpu_row_of_rank)
       CALL native_grid_gpu_release()
+      ! The basis gradients on the device belong to the kinds' grids, which are part of the key.
+      CALL one_centre_gpu_release()
    END SUBROUTINE release_composite_geometry
 
 ! **************************************************************************************************
@@ -4922,8 +4950,9 @@ CONTAINS
 !> \param nspins number of spin channels
 !> \param gapw_representation Skala pseudopotential GAPW representation
 ! **************************************************************************************************
-   SUBROUTINE compute_one_center_fields(fields, kind_set, atomic_kind_set, rho_atom_set, &
-                                        para_env, nspins, gapw_representation)
+   SUBROUTINE compute_one_center_fields(gpu_one_centre, fields, kind_set, atomic_kind_set, &
+                                        rho_atom_set, para_env, nspins, gapw_representation)
+      LOGICAL, INTENT(IN)                                :: gpu_one_centre
       TYPE(one_center_fields_type), DIMENSION(:), &
          INTENT(INOUT)                                   :: fields
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: kind_set
@@ -4980,8 +5009,13 @@ CONTAINS
             fields(iatom)%rho_s = 0.0_dp
             fields(iatom)%drho_h = 0.0_dp
             fields(iatom)%drho_s = 0.0_dp
-            CALL calc_tau_atom(fields(iatom)%tau_h, fields(iatom)%tau_s, rho_atom, &
-                               tau_basis_cache, nspins)
+            IF (gpu_one_centre) THEN
+               CALL calc_tau_atom_gpu(fields(iatom)%tau_h, fields(iatom)%tau_s, rho_atom, &
+                                      tau_basis_cache, nspins, ikind)
+            ELSE
+               CALL calc_tau_atom(fields(iatom)%tau_h, fields(iatom)%tau_s, rho_atom, &
+                                  tau_basis_cache, nspins)
+            END IF
             DO ir = 1, nr
                CALL calc_rho_angular(grid_atom, harmonics, nspins, .TRUE., ir, r_h, r_s, &
                                      fields(iatom)%rho_h, fields(iatom)%rho_s, dr_h, dr_s, &

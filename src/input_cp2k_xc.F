@@ -1523,6 +1523,18 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="NATIVE_GRID_GPU_ONE_CENTRE", &
+                          description="Compute the one-centre kinetic-energy densities and "// &
+                          "Kohn-Sham matrices of the experimental CP2K-native SKALA "// &
+                          "atom-composite route on the GPU (the counterparts of calc_tau_atom, "// &
+                          "dgaVtaudgb and gaVxcgb_GC at the route's call sites). The sums are "// &
+                          "regrouped into whole-atom matrix products, so results differ from "// &
+                          "the CPU path at the level of rounding. Requires a CP2K build with CUDA.", &
+                          usage="NATIVE_GRID_GPU_ONE_CENTRE T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="NATIVE_GRID_CUDA_DEVICE", &
                           description="CUDA device used by the experimental CP2K-native SKALA GPW "// &
                           "TorchScript path when NATIVE_GRID_USE_CUDA is enabled. A negative value "// &

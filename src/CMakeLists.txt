@@ -810,6 +810,7 @@ list(
   qs_vxc_atom.F
   qs_native_grid_cache.F
   qs_native_grid_gpu.F
+  qs_native_one_centre_gpu.F
   qs_vxc.F
   qs_wannier90.F
   qs_wf_history_methods.F
@@ -1597,7 +1598,7 @@ set(CP2K_DBM_SRCS_GPU_C dbm/dbm_multiply_opencl.c dbm/dbm_multiply_gpu.c)
 set(CP2K_PW_SRCS_GPU pw/gpu/pw_gpu_kernels.cu)
 
 # Plane-wave stencil of the native SKALA atom-composite route (NATIVE_GRID_GPU_STENCIL).
-set(CP2K_SKALA_SRCS_GPU xc/skala_native_grid_gpu.cu)
+set(CP2K_SKALA_SRCS_GPU xc/skala_native_grid_gpu.cu xc/skala_one_centre_gpu.cu)
 
 set(CP2K_PROGS_C
     grid/grid_miniapp.c;grid/grid_unittest.c;dbm/dbm_miniapp.c;start/libcp2k_unittest.c
