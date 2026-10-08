@@ -163,7 +163,8 @@ MODULE qs_scf
                                               qs_kpoint_set_fixed_occupations,&
                                               qs_kpoint_state_canonicalize_fixed,&
                                               qs_kpoint_state_commit,&
-                                              qs_kpoint_state_prepare_fixed_density
+                                              qs_kpoint_state_prepare_fixed_density,&
+                                              qs_kpoint_state_ritz_span
    USE qs_ks_atom,                      ONLY: update_ks_atom
    USE qs_ks_methods,                   ONLY: evaluate_core_matrix_traces,&
                                               qs_ks_update_qs_env
@@ -817,6 +818,9 @@ CONTAINS
                   IF (scf_env%qs_ot_env(1)%settings%refresh_keep_state) THEN
                      WRITE (UNIT=output_unit, FMT="(T2,A)") &
                         "K-point OT: rebasing reference chart while preserving the current electronic state."
+                  ELSE IF (scf_env%qs_ot_env(1)%settings%refresh_subspace_ritz) THEN
+                     WRITE (UNIT=output_unit, FMT="(T2,A)") &
+                        "K-point OT: rotating the current orbitals to Ritz vectors of H within their span."
                   ELSE
                      WRITE (UNIT=output_unit, FMT="(T2,A)") &
                         "K-point OT: rebuilding physical virtual subspace by full KS diagonalization."
@@ -1630,9 +1634,12 @@ CONTAINS
                   ! With REFRESH_KEEP_STATE a refresh keeps the current C, occupations and
                   ! auxiliary labels: replacing them by eigenstates of H[P] changes P and F and
                   ! is not a state-preserving retraction.
+                  ! With REFRESH_SUBSPACE_RITZ a refresh keeps span(C) and only rotates the orbitals
+                  ! to Ritz vectors of H inside it (below).
                   IF ((entry_reason == kp_ot_entry_initial .AND. .NOT. kpoint_mos_initialized) .OR. &
                       (entry_reason == kp_ot_entry_refresh .AND. &
-                       .NOT. scf_env%qs_ot_env(1)%settings%refresh_keep_state)) THEN
+                       .NOT. scf_env%qs_ot_env(1)%settings%refresh_keep_state .AND. &
+                       .NOT. scf_env%qs_ot_env(1)%settings%refresh_subspace_ritz)) THEN
                      kp_diis_step = .FALSE.
                      CALL do_general_diag_kp(matrix_ks_kp, matrix_s_kp, kpoints, scf_env, &
                                              scf_control, .FALSE., kp_diis_step)
@@ -1650,6 +1657,20 @@ CONTAINS
 
                      ! The accepted projector replaced the density-only input. Rebuild H and E so
                      ! the first minimizer call sees one coherent physical electronic state.
+                     CALL qs_ks_update_qs_env(qs_env, just_energy=.FALSE., &
+                                              calculate_forces=.FALSE.)
+                  ELSE IF (entry_reason == kp_ot_entry_refresh .AND. &
+                           scf_env%qs_ot_env(1)%settings%refresh_subspace_ritz) THEN
+                     IF (dft_control%restricted .OR. SIZE(matrix_ks_kp, 1) < nspin_ot) THEN
+                        CPABORT("REFRESH_SUBSPACE_RITZ is implemented for RKS and UKS channels only.")
+                     END IF
+                     ! Rotate within span(C) to Ritz vectors of H[P], reassign the smeared
+                     ! occupations from the Ritz values and rebuild the density and H.
+                     CALL kpoint_operator_store(kpoints, scf_env%scf_work1(1), matrix_ks_kp, matrix_s_kp)
+                     CALL qs_kpoint_state_ritz_span(kpoints)
+                     CALL qs_kpoint_state_commit( &
+                        qs_env, update_occupations=.TRUE., &
+                        fixed_occupations=.NOT. (dft_control%smear .OR. scf_control%smear%do_smear))
                      CALL qs_ks_update_qs_env(qs_env, just_energy=.FALSE., &
                                               calculate_forces=.FALSE.)
                   END IF

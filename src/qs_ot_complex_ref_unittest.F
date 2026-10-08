@@ -46,6 +46,7 @@ PROGRAM qs_ot_complex_ref_unittest
         ot_precond_solver_default, ot_precond_solver_direct, ot_precond_solver_inv_chol
    USE kinds,                           ONLY: dp
    USE kpoint_methods,                  ONLY: kpoint_ot_energy_weighted_density
+   USE qs_kpoint_state,                 ONLY: qs_kpoint_ritz_rotate_span
    USE machine,                         ONLY: default_output_unit
    USE mathlib,                         ONLY: diag_complex
    USE message_passing,                 ONLY: mp_comm_self,&
@@ -143,6 +144,7 @@ PROGRAM qs_ot_complex_ref_unittest
    CALL test_complex_preconditioner_gauge(para_env, nfail)
    CALL test_complex_occupation_block_preconditioner(para_env, nfail)
    CALL test_kpoint_ot_energy_weighted_density(para_env, io_unit, nfail)
+   CALL test_ritz_span_rotation(para_env, io_unit, nfail)
 
    x(:, 1) = [CMPLX(1.10_dp, 0.10_dp, KIND=dp), CMPLX(0.20_dp, -0.30_dp, KIND=dp), &
               CMPLX(-0.10_dp, 0.20_dp, KIND=dp)]
@@ -737,6 +739,95 @@ CONTAINS
       CALL cp_blacs_env_release(blacs_env)
 
    END SUBROUTINE test_split_complex_fm_gemm
+
+! **************************************************************************************************
+!> \brief R06: Ritz rotation of non-orthonormal orbitals within their span in the overlap metric.
+!> \param para_env Parallel environment.
+!> \param io_unit Output unit.
+!> \param nfail Failure count.
+! **************************************************************************************************
+   SUBROUTINE test_ritz_span_rotation(para_env, io_unit, nfail)
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      INTEGER, INTENT(IN)                                :: io_unit
+      INTEGER, INTENT(INOUT)                             :: nfail
+
+      INTEGER, PARAMETER                                 :: nao = 4, nmo = 3
+
+      COMPLEX(KIND=dp), DIMENSION(nao, nao)              :: hamiltonian, overlap, projector_new, &
+                                                            projector_old
+      COMPLEX(KIND=dp), DIMENSION(nao, nmo)              :: orbitals, rotated
+      COMPLEX(KIND=dp), DIMENSION(nmo, nmo)              :: gram_inverse, inverse_sqrt, projected
+      INTEGER                                            :: i, j
+      REAL(KIND=dp)                                      :: error_h, error_order, error_s, error_span
+      REAL(KIND=dp), DIMENSION(nmo)                      :: ritz_values
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+      TYPE(cp_cfm_type)                                  :: coeff, matrix_h, matrix_s
+      TYPE(cp_fm_struct_type), POINTER                   :: struct_nn, struct_nm
+
+      NULLIFY (blacs_env, struct_nn, struct_nm)
+      DO j = 1, nao
+         DO i = 1, nao
+            overlap(i, j) = CMPLX(0.03_dp*(i + j), 0.02_dp*(i - j), KIND=dp)
+            hamiltonian(i, j) = CMPLX(0.11_dp*i*j - 0.2_dp, 0.05_dp*(i - j), KIND=dp)
+         END DO
+         overlap(j, j) = CMPLX(1.0_dp + 0.1_dp*j, 0.0_dp, KIND=dp)
+         hamiltonian(j, j) = CMPLX(-0.5_dp + 0.4_dp*j, 0.0_dp, KIND=dp)
+      END DO
+      DO j = 1, nmo
+         DO i = 1, nao
+            orbitals(i, j) = CMPLX(0.2_dp*i - 0.1_dp*j + MERGE(1.0_dp, 0.0_dp, i == j), &
+                                   0.07_dp*i*j - 0.03_dp, KIND=dp)
+         END DO
+      END DO
+
+      CALL cp_blacs_env_create(blacs_env=blacs_env, para_env=para_env)
+      CALL cp_fm_struct_create(struct_nn, nrow_global=nao, ncol_global=nao, &
+                               context=blacs_env, para_env=para_env)
+      CALL cp_fm_struct_create(struct_nm, nrow_global=nao, ncol_global=nmo, &
+                               context=blacs_env, para_env=para_env)
+      CALL cp_cfm_create(matrix_h, struct_nn)
+      CALL cp_cfm_create(matrix_s, struct_nn)
+      CALL cp_cfm_create(coeff, struct_nm)
+      CALL cp_cfm_set_submatrix(matrix_h, hamiltonian)
+      CALL cp_cfm_set_submatrix(matrix_s, overlap)
+      CALL cp_cfm_set_submatrix(coeff, orbitals)
+
+      CALL qs_kpoint_ritz_rotate_span(coeff, matrix_h, matrix_s, ritz_values)
+      CALL cp_cfm_get_submatrix(coeff, rotated)
+
+      ! S-orthonormal Ritz vectors, diagonal projected H with ascending values, same span.
+      projected = MATMUL(CONJG(TRANSPOSE(rotated)), MATMUL(overlap, rotated))
+      error_s = 0.0_dp
+      DO i = 1, nmo
+         projected(i, i) = projected(i, i) - 1.0_dp
+      END DO
+      error_s = MAXVAL(ABS(projected))
+      projected = MATMUL(CONJG(TRANSPOSE(rotated)), MATMUL(hamiltonian, rotated))
+      DO i = 1, nmo
+         projected(i, i) = projected(i, i) - ritz_values(i)
+      END DO
+      error_h = MAXVAL(ABS(projected))
+      error_order = 0.0_dp
+      DO i = 2, nmo
+         error_order = MAX(error_order, ritz_values(i - 1) - ritz_values(i))
+      END DO
+      CALL dense_inverse_sqrt(MATMUL(CONJG(TRANSPOSE(orbitals)), MATMUL(overlap, orbitals)), inverse_sqrt)
+      gram_inverse = MATMUL(inverse_sqrt, inverse_sqrt)
+      projector_old = MATMUL(orbitals, MATMUL(gram_inverse, CONJG(TRANSPOSE(orbitals))))
+      projector_new = MATMUL(rotated, CONJG(TRANSPOSE(rotated)))
+      error_span = MAXVAL(ABS(projector_new - projector_old))
+      IF (MAX(error_s, error_h, error_span) > 1.0E-12_dp .OR. error_order > 0.0_dp) nfail = nfail + 1
+      IF (io_unit >= 0) WRITE (io_unit, '(A,3(1X,ES13.6))') &
+         'Ritz span rotation S-orthonormality/projected-H/span errors:', error_s, error_h, error_span
+
+      CALL cp_cfm_release(coeff)
+      CALL cp_cfm_release(matrix_s)
+      CALL cp_cfm_release(matrix_h)
+      CALL cp_fm_struct_release(struct_nm)
+      CALL cp_fm_struct_release(struct_nn)
+      CALL cp_blacs_env_release(blacs_env)
+
+   END SUBROUTINE test_ritz_span_rotation
 
 ! **************************************************************************************************
 !> \brief Check the noncanonical complex OT energy-weighted density and its gauge covariance.

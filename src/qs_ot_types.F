@@ -105,6 +105,7 @@ MODULE qs_ot_types
       LOGICAL           :: check_interpolated_energy = .FALSE.
       LOGICAL           :: count_full_gradients = .FALSE.
       LOGICAL           :: project_strict_direction = .FALSE.
+      LOGICAL           :: refresh_subspace_ritz = .FALSE.
       REAL(KIND=dp)     :: ds_min = -1.0_dp
       REAL(KIND=dp)     :: energy_gap = -1.0_dp
       INTEGER           :: diis_m = -1
@@ -328,6 +329,7 @@ CONTAINS
       settings%check_interpolated_energy = .FALSE.
       settings%count_full_gradients = .FALSE.
       settings%project_strict_direction = .FALSE.
+      settings%refresh_subspace_ritz = .FALSE.
       settings%preconditioner_name = "FULL_KINETIC"
       settings%preconditioner_type = ot_precond_full_kinetic
       settings%low_rank_base_name = "OVERLAP_INVERSE"
@@ -1773,6 +1775,10 @@ CONTAINS
       CALL section_vals_val_get(ot_section, "CHECK_INTERPOLATED_ENERGY", l_val=settings%check_interpolated_energy)
       CALL section_vals_val_get(ot_section, "COUNT_FULL_GRADIENTS", l_val=settings%count_full_gradients)
       CALL section_vals_val_get(ot_section, "PROJECT_STRICT_DIRECTION", l_val=settings%project_strict_direction)
+      CALL section_vals_val_get(ot_section, "REFRESH_SUBSPACE_RITZ", l_val=settings%refresh_subspace_ritz)
+      IF (settings%refresh_keep_state .AND. settings%refresh_subspace_ritz) THEN
+         CPABORT("OT REFRESH_KEEP_STATE and REFRESH_SUBSPACE_RITZ are exclusive.")
+      END IF
 
       !If these values are negative we will set them "optimal" for a given precondtioner below
       CALL section_vals_val_get(ot_section, "STEPSIZE", r_val=settings%ds_min)

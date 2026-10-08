@@ -900,6 +900,15 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="REFRESH_SUBSPACE_RITZ", &
+                          description="At a k-point OT reference-chart refresh, rotate all current orbitals"// &
+                          " (occupied and added) to Ritz vectors of the Hamiltonian within their span and"// &
+                          " reassign the smeared occupations from the Ritz values, instead of replacing the"// &
+                          " orbitals by a full Kohn-Sham diagonalization. Exclusive with REFRESH_KEEP_STATE.", &
+                          usage="REFRESH_SUBSPACE_RITZ ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create( &
          keyword, __LOCATION__, name="STEPSIZE", &
          description="Initial stepsize used for the line search, sometimes this parameter can be reduced to stabilize DIIS"// &
