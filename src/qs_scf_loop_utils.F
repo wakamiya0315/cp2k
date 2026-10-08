@@ -149,6 +149,7 @@ MODULE qs_scf_loop_utils
 
    PUBLIC :: qs_scf_set_loop_flags, &
              qs_scf_new_mos, qs_scf_new_mos_kp, &
+             qs_scf_dump_ot_rebase_state, &
              qs_scf_kp_ref_refresh_ready, qs_scf_kp_search_endpoint, &
              qs_scf_candidate_density_delta, qs_scf_commit_density_candidate, &
              qs_scf_density_mixing, qs_scf_check_inner_exit, &
@@ -1086,6 +1087,26 @@ CONTAINS
                para_env_inter_kp=para_env_inter_kp)
          END IF
          ot_gradient_prepared = .TRUE.
+         IF (physical_base_state .AND. local_ot_env(1)%settings%diagnostics_state) THEN
+            scf_env%ot_diagnostic_evaluations = scf_env%ot_diagnostic_evaluations + 1
+            IF (MOD(scf_env%ot_diagnostic_evaluations - 1, &
+                    local_ot_env(1)%settings%diagnostics_state_interval) == 0) THEN
+               DO local_kpoint = 1, SIZE(kpoints%kp_env)
+                  kp => kpoints%kp_env(local_kpoint)%kpoint_env
+                  ikpoint = kp%nkpoint
+                  DO ispin = 1, nspin_ot
+                     local_channel = qs_ot_channel_index(ispin, ikpoint, nspin_ot) - first_channel + 1
+                     CPASSERT(.NOT. restricted_roks)
+                     CPASSERT(local_ot_env(local_channel)%settings%do_rotation)
+                     CALL qs_scf_dump_ot_current_state( &
+                        kp, local_ot_env(local_channel), matrix_s, kpoints, ispin, &
+                        scf_env%ot_diagnostic_evaluations, scf_env%iter_count, wkp(ikpoint), &
+                        energy%total, local_ot_env(1)%etotal, energy%kTS, trial_kTS, trial_mu(ispin), &
+                        scf_control%smear%electronic_temperature, trial_occupation(:, ikpoint, ispin))
+                  END DO
+               END DO
+            END IF
+         END IF
          ! A coupled response direction is consumed only when the minimizer starts a new
          ! search.  Line-search trial points still need their physical gradient, but rebuilding
          ! the dense finite-rotation Hessian there cannot affect the accepted direction.
@@ -1114,6 +1135,22 @@ CONTAINS
          CALL ot_mini(local_ot_env, matrix_hc, matrix_hc_im=matrix_hc_im, &
                       para_env_inter_kp=para_env_inter_kp, &
                       gradient_prepared=ot_gradient_prepared)
+      END IF
+      IF (physical_base_state .AND. local_ot_env(1)%settings%diagnostics_state .AND. &
+          local_ot_env(1)%line_search_count == 1) THEN
+         IF (MOD(scf_env%ot_diagnostic_evaluations - 1, &
+                 local_ot_env(1)%settings%diagnostics_state_interval) == 0) THEN
+            DO local_kpoint = 1, SIZE(kpoints%kp_env)
+               kp => kpoints%kp_env(local_kpoint)%kpoint_env
+               DO ispin = 1, nspin_ot
+                  local_channel = qs_ot_channel_index(ispin, kp%nkpoint, nspin_ot) - first_channel + 1
+                  CALL qs_scf_dump_ot_direction( &
+                     kp, local_ot_env(local_channel), ispin, scf_env%ot_diagnostic_evaluations, &
+                     scf_env%iter_count, wkp(kp%nkpoint), energy%total, local_ot_env(1)%etotal, &
+                     local_ot_env(1)%gradient)
+               END DO
+            END DO
+         END IF
       END IF
       scf_env%iter_delta = local_ot_env(1)%delta
       energy_only = local_ot_env(1)%energy_only
@@ -3078,6 +3115,225 @@ CONTAINS
    END SUBROUTINE qs_scf_loop_prepare_ot_kp_rotation_response
 
 ! **************************************************************************************************
+!> \brief Export the actual current Mermin state and its fixed-chart covector, read-only.
+!>
+!> The H cache was synchronized with H*C at this accepted endpoint. S is the native
+!> overlap, not MOLDEN scaling. Each local K-point-group source writes a unique file.
+!> All matrix gathers remain collective; output never changes a stopping criterion.
+   SUBROUTINE qs_scf_dump_ot_current_state( &
+      kp, ot_env, matrix_s, kpoints, ispin, evaluation, iteration, weight, &
+      native_f, chart_f, native_kts, trial_kts, mu, sigma, trial_occupation)
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(qs_ot_type), INTENT(IN)                       :: ot_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      INTEGER, INTENT(IN)                                :: ispin, evaluation, iteration
+      REAL(KIND=dp), INTENT(IN)                          :: weight, native_f, chart_f, native_kts, trial_kts, mu, sigma
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)             :: trial_occupation
+
+      CHARACTER(LEN=128)                                 :: filename
+      INTEGER                                            :: nao, nmo, unit
+      LOGICAL                                            :: ionode
+      REAL(KIND=dp)                                      :: maxocc
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation, eigenvalues
+      TYPE(dbcsr_type), POINTER                          :: s_re, s_im
+
+      NULLIFY (occupation, eigenvalues, s_re, s_im)
+      CALL get_mo_set(kp%mos(ispin), nao=nao, nmo=nmo, occupation_numbers=occupation, &
+                      eigenvalues=eigenvalues, maxocc=maxocc)
+      ionode = ot_env%para_env%is_source()
+      WRITE (filename, '(A,I0,A,I0,A,I0,A)') 'ot-state-e', evaluation, '-k', kp%nkpoint, '-s', ispin, '.bin'
+      IF (ionode) THEN
+         OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='NEW', ACCESS='STREAM', FORM='UNFORMATTED')
+         WRITE (unit) 'OTSTAT01'
+         WRITE (unit) evaluation, iteration, kp%nkpoint, ispin, nao, nmo
+         WRITE (unit) weight, native_f, chart_f, native_kts, trial_kts, mu, sigma, maxocc
+         WRITE (unit) occupation, trial_occupation, eigenvalues, ot_env%ener_x, ot_env%ener_gx
+      END IF
+      CALL qs_scf_dump_ot_mo_coefficients(kp%mos(ispin), nao, nmo, ionode, unit)
+      CALL kpoint_operator_get_local(matrix_s, kpoints, kp, 1, &
+                                     kp%ot_smat(1), kp%ot_smat(2), s_re, s_im)
+      CALL qs_scf_loop_ot_matrix_to_dense(s_re, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(s_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL dbcsr_release_p(s_re)
+      CALL dbcsr_release_p(s_im)
+      DEALLOCATE (dense)
+      ALLOCATE (dense(nao, nao))
+      CALL cp_fm_get_submatrix(kp%ot_hmat(1, ispin), dense, n_rows=nao, n_cols=nao)
+      IF (ionode) WRITE (unit) dense
+      CALL cp_fm_get_submatrix(kp%ot_hmat(2, ispin), dense, n_rows=nao, n_cols=nao)
+      IF (ionode) WRITE (unit) dense
+      DEALLOCATE (dense)
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_c0, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_c0_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_x, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_x_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_gx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_gx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_x, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_x_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_gx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_gx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      DEALLOCATE (dense)
+      IF (ionode) CLOSE (unit)
+   END SUBROUTINE qs_scf_dump_ot_current_state
+
+! **************************************************************************************************
+!> \brief Export the actual stored search direction and its final raw covector, read-only.
+!>        The matching OTSTAT01 export precedes this minimizer call; the physical MO set is
+!>        still unchanged here, although the chart has advanced to its first trial coordinate.
+!> \param kp Actual physical K-point state.
+!> \param ot_env Channel containing the proposed direction.
+!> \param ispin Spin channel.
+!> \param evaluation Matching state-export identity.
+!> \param iteration Physical SCF iteration.
+!> \param weight K-point weight.
+!> \param native_f Actual physical origin F.
+!> \param chart_f Origin F seen by the line search.
+!> \param slope Reported total search slope.
+! **************************************************************************************************
+   SUBROUTINE qs_scf_dump_ot_direction(kp, ot_env, ispin, evaluation, iteration, weight, native_f, chart_f, slope)
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(qs_ot_type), INTENT(IN)                       :: ot_env
+      INTEGER, INTENT(IN)                                :: ispin, evaluation, iteration
+      REAL(KIND=dp), INTENT(IN)                          :: weight, native_f, chart_f, slope
+
+      CHARACTER(LEN=128)                                 :: filename
+      INTEGER                                            :: nao, nmo, unit
+      LOGICAL                                            :: ionode
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
+
+      CPASSERT(ot_env%use_dx)
+      CALL get_mo_set(kp%mos(ispin), nao=nao, nmo=nmo)
+      ionode = ot_env%para_env%is_source()
+      WRITE (filename, '(A,I0,A,I0,A,I0,A)') 'ot-direction-e', evaluation, '-k', kp%nkpoint, '-s', ispin, '.bin'
+      IF (ionode) THEN
+         OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='NEW', ACCESS='STREAM', FORM='UNFORMATTED')
+         WRITE (unit) 'OTDIR001'
+         WRITE (unit) evaluation, iteration, kp%nkpoint, ispin, nao, nmo
+         WRITE (unit) weight, native_f, chart_f, slope
+         WRITE (unit) ot_env%ener_dx, ot_env%ener_gx
+      END IF
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_dx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_dx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_dx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_dx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_gx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%matrix_gx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_gx, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      CALL qs_scf_loop_ot_matrix_to_dense(ot_env%rot_mat_gx_im, ot_env, dense)
+      IF (ionode) WRITE (unit) dense
+      DEALLOCATE (dense)
+      IF (ionode) CLOSE (unit)
+   END SUBROUTINE qs_scf_dump_ot_direction
+
+! **************************************************************************************************
+!> \brief Read-only actual C/f capture bracketing a reference-chart refresh.
+!> \param qs_env Current physical QS state, after its density has been committed.
+!> \param evaluation Unchanged diagnostic evaluation identity across the refresh.
+!> \param phase One before workspace destruction, two after workspace allocation.
+! **************************************************************************************************
+   SUBROUTINE qs_scf_dump_ot_rebase_state(qs_env, evaluation, phase)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER, INTENT(IN)                                :: evaluation, phase
+
+      CHARACTER(LEN=128)                                 :: filename
+      INTEGER                                            :: local_kpoint, ispin, nao, nmo, unit
+      LOGICAL                                            :: ionode
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation, eigenvalues, weights
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+      NULLIFY (eigenvalues, energy, kp, kpoints, occupation, weights)
+      CPASSERT(phase == 1 .OR. phase == 2)
+      CALL get_qs_env(qs_env, kpoints=kpoints, energy=energy)
+      CALL get_kpoint_info(kpoints, wkp=weights)
+      DO local_kpoint = 1, SIZE(kpoints%kp_env)
+         kp => kpoints%kp_env(local_kpoint)%kpoint_env
+         DO ispin = 1, SIZE(kp%mos)
+            CALL get_mo_set(kp%mos(ispin), nao=nao, nmo=nmo, &
+                            occupation_numbers=occupation, eigenvalues=eigenvalues)
+            IF (ASSOCIATED(kp%mos(ispin)%cmo_coeff)) THEN
+               ionode = kp%mos(ispin)%cmo_coeff%matrix_struct%para_env%is_source()
+            ELSE
+               ionode = kp%mos(ispin)%mo_coeff%matrix_struct%para_env%is_source()
+            END IF
+            WRITE (filename, '(A,I0,A,I0,A,I0,A,I0,A)') &
+               'ot-rebase-e', evaluation, '-p', phase, '-k', kp%nkpoint, '-s', ispin, '.bin'
+            IF (ionode) THEN
+               OPEN (NEWUNIT=unit, FILE=TRIM(filename), STATUS='NEW', ACCESS='STREAM', FORM='UNFORMATTED')
+               WRITE (unit) 'OTRBAS01'
+               WRITE (unit) evaluation, phase, kp%nkpoint, ispin, nao, nmo
+               WRITE (unit) weights(kp%nkpoint), energy%total, energy%kTS
+               WRITE (unit) occupation, eigenvalues
+            END IF
+            CALL qs_scf_dump_ot_mo_coefficients(kp%mos(ispin), nao, nmo, ionode, unit)
+            IF (ionode) CLOSE (unit)
+         END DO
+      END DO
+   END SUBROUTINE qs_scf_dump_ot_rebase_state
+
+! **************************************************************************************************
+!> \brief Write the real and imaginary parts of k-point orbital coefficients to a dump record.
+!>        Complex orbitals are stored as one complex matrix; real orbitals get a zero imaginary
+!>        part, so that the record layout does not depend on the wavefunction type.
+!> \param mo_set orbitals of one spin at one k-point
+!> \param nao number of atomic orbitals
+!> \param nmo number of orbitals
+!> \param ionode whether this rank writes
+!> \param unit open stream unit on the writing rank
+! **************************************************************************************************
+   SUBROUTINE qs_scf_dump_ot_mo_coefficients(mo_set, nao, nmo, ionode, unit)
+      TYPE(mo_set_type), INTENT(IN)                      :: mo_set
+      INTEGER, INTENT(IN)                                :: nao, nmo
+      LOGICAL, INTENT(IN)                                :: ionode
+      INTEGER, INTENT(IN)                                :: unit
+
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: dense
+      TYPE(cp_fm_type)                                   :: coeff_im, coeff_re
+
+      ALLOCATE (dense(nao, nmo))
+      IF (ASSOCIATED(mo_set%cmo_coeff)) THEN
+         CALL cp_fm_create(coeff_re, mo_set%cmo_coeff%matrix_struct)
+         CALL cp_fm_create(coeff_im, mo_set%cmo_coeff%matrix_struct)
+         CALL cp_cfm_to_fm(mo_set%cmo_coeff, coeff_re, coeff_im)
+         CALL cp_fm_get_submatrix(coeff_re, dense, n_rows=nao, n_cols=nmo)
+         IF (ionode) WRITE (unit) dense
+         CALL cp_fm_get_submatrix(coeff_im, dense, n_rows=nao, n_cols=nmo)
+         IF (ionode) WRITE (unit) dense
+         CALL cp_fm_release(coeff_re)
+         CALL cp_fm_release(coeff_im)
+      ELSE
+         CALL cp_fm_get_submatrix(mo_set%mo_coeff, dense, n_rows=nao, n_cols=nmo)
+         IF (ionode) WRITE (unit) dense
+         dense = 0.0_dp
+         IF (ionode) WRITE (unit) dense
+      END IF
+      DEALLOCATE (dense)
+   END SUBROUTINE qs_scf_dump_ot_mo_coefficients
+
+! **************************************************************************************************
 !> \brief copy a distributed OT matrix to a replicated dense matrix
 !> \param matrix distributed matrix
 !> \param ot_env channel owning the matrix distribution
@@ -3401,6 +3657,22 @@ CONTAINS
          CPASSERT(ASSOCIATED(scf_env%scf_subspace_buffer))
          update_validated = scf_env%adiis_validated .OR. &
                             scf_env%scf_subspace_buffer%diis_weight >= 1.0_dp
+      END IF
+      IF (scf_env%method == ot_diag_method_nr) THEN
+         update_validated = update_validated .AND. scf_env%ot_eigensolver_converged
+         IF (.NOT. scf_env%ot_eigensolver_converged .AND. &
+             scf_env%iter_delta < scf_control%eps_scf .AND. output_unit > 0) THEN
+            WRITE (output_unit, '(T2,A)') &
+               'OT| Density residual reached EPS_SCF, but the inner eigensolver did not converge.'
+         END IF
+      END IF
+      IF (scf_env%method == ot_method_nr .AND. ASSOCIATED(scf_env%qs_ot_env)) THEN
+         ! With COUNT_FULL_GRADIENTS: an energy-only line-search trial still carries its
+         ! origin's residual. It has neither a current gradient nor the full H needed for
+         ! the final force W matrix.
+         IF (scf_env%qs_ot_env(1)%settings%count_full_gradients) THEN
+            update_validated = update_validated .AND. .NOT. just_energy
+         END IF
       END IF
 
       ! The opt-in objective never accepts a one-step smeared restart as a physical reference.

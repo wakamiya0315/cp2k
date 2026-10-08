@@ -99,6 +99,7 @@ MODULE qs_scf_types
    TYPE qs_scf_env_type
       TYPE(qs_outer_scf_type) :: outer_scf = qs_outer_scf_type()
       INTEGER :: iter_count = -1
+      INTEGER :: ot_diagnostic_evaluations = 0
       INTEGER :: cholesky_method = -1, nelectron = -1, method = -1, mixing_method = -1, nskip_mixing = -1
       REAL(KIND=dp) :: iter_param = -1.0_dp, iter_delta = -1.0_dp, p_mix_alpha = -1.0_dp, sum_zeff_corr = -1.0_dp
       ! ADIIS diagnostics: accepted-step norm and raw-map delta.
@@ -120,6 +121,8 @@ MODULE qs_scf_types
       TYPE(dbcsr_type), POINTER :: ortho_dbcsr => NULL(), buf1_dbcsr => NULL(), buf2_dbcsr => NULL()
       TYPE(preconditioner_p_type), DIMENSION(:), POINTER :: ot_preconditioner => NULL()
       TYPE(qs_ot_type), POINTER, DIMENSION(:)  :: qs_ot_env => NULL()
+      ! The density residual alone cannot certify an unconverged inner fixed-H OT solve.
+      LOGICAL :: ot_eigensolver_converged = .TRUE.
       TYPE(qs_diis_buffer_type), POINTER :: scf_diis_buffer => NULL()
       TYPE(qs_scf_subspace_buffer_type), POINTER :: scf_subspace_buffer => NULL()
       TYPE(subspace_env_type), POINTER :: subspace_env => NULL()

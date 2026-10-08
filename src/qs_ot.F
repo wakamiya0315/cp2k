@@ -51,6 +51,7 @@ MODULE qs_ot
    PUBLIC  :: qs_ot_get_derivative
    PUBLIC  :: qs_ot_get_derivative_complex
    PUBLIC  :: qs_ot_prepare_complex_tangent_metric
+   PUBLIC  :: qs_ot_project_complex_tangent
    PUBLIC  :: qs_ot_get_orbitals_ref
    PUBLIC  :: qs_ot_get_orbitals_ref_complex
    PUBLIC  :: qs_ot_get_derivative_ref
@@ -3479,6 +3480,110 @@ CONTAINS
       qs_ot_env%os_valid = .TRUE.
 
    END SUBROUTINE qs_ot_prepare_complex_tangent_metric
+
+! **************************************************************************************************
+!> \brief Project a complex STRICT search direction onto the tangent space of the reference
+!>        orbitals, D <- D - C0 (C0^H S C0)^-1 C0^H S D.
+!>
+!> STRICT keeps C0^H S X = 0, so every step must satisfy C0^H S D = 0. The preconditioner-aware
+!> gradient projection gives this only in exact arithmetic; here the constraint is imposed on
+!> the final direction with the Gram matrix of C0 itself, which is the identity up to roundoff
+!> for an S-orthonormal reference and therefore well conditioned. Only the orbital block of the
+!> direction changes; rotation and occupation blocks are not touched.
+!> \param qs_ot_env OT channel state; the direction is matrix_dx/matrix_dx_im
+!> \param contamination_before Frobenius norm of C0^H S D before the projection
+!> \param contamination_after Frobenius norm of C0^H S D after the projection
+! **************************************************************************************************
+   SUBROUTINE qs_ot_project_complex_tangent(qs_ot_env, contamination_before, contamination_after)
+      TYPE(qs_ot_type)                                   :: qs_ot_env
+      REAL(KIND=dp), INTENT(OUT)                         :: contamination_before, &
+                                                            contamination_after
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'qs_ot_project_complex_tangent'
+
+      INTEGER                                            :: handle, i, k, ortho_k
+      REAL(KIND=dp)                                      :: eval_threshold
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: evals, inverse_evals
+      TYPE(dbcsr_type)                                   :: gram_im, gram_re, kk_tmp, nk_im, nk_re, &
+                                                            nk_tmp, ok_tmp, vec_im, vec_re, w_im, w_re, &
+                                                            y_im, y_re
+
+      CALL timeset(routineN, handle)
+
+      CPASSERT(qs_ot_env%has_complex_kpoint_state)
+      CPASSERT(qs_ot_env%settings%ot_algorithm == 'TOD')
+      ! Without an extra orthogonal space the reference block has as many columns as X.
+      CALL dbcsr_get_info(qs_ot_env%matrix_os, nfullrows_total=ortho_k)
+      CALL dbcsr_get_info(qs_ot_env%matrix_x, nfullcols_total=k)
+      CPASSERT(ortho_k == k)
+
+      CALL dbcsr_copy(w_re, qs_ot_env%matrix_buf1_ortho, name="tangent_w_re")
+      CALL dbcsr_copy(w_im, qs_ot_env%matrix_buf1_ortho, name="tangent_w_im")
+      CALL dbcsr_copy(y_re, qs_ot_env%matrix_buf1_ortho, name="tangent_y_re")
+      CALL dbcsr_copy(y_im, qs_ot_env%matrix_buf1_ortho, name="tangent_y_im")
+      CALL dbcsr_copy(ok_tmp, qs_ot_env%matrix_buf1_ortho, name="tangent_ok_tmp")
+      CALL dbcsr_copy(gram_re, qs_ot_env%matrix_os, name="tangent_gram_re")
+      CALL dbcsr_copy(gram_im, qs_ot_env%matrix_os, name="tangent_gram_im")
+      CALL dbcsr_copy(vec_re, qs_ot_env%matrix_os, name="tangent_vec_re")
+      CALL dbcsr_copy(vec_im, qs_ot_env%matrix_os, name="tangent_vec_im")
+      CALL dbcsr_copy(kk_tmp, qs_ot_env%matrix_os, name="tangent_kk_tmp")
+      CALL dbcsr_copy(nk_re, qs_ot_env%matrix_dx, name="tangent_nk_re")
+      CALL dbcsr_copy(nk_im, qs_ot_env%matrix_dx, name="tangent_nk_im")
+      CALL dbcsr_copy(nk_tmp, qs_ot_env%matrix_dx, name="tangent_nk_tmp")
+
+      ! W = C0^H S D, with S*C0 kept by the STRICT state.
+      CALL qs_ot_complex_multiply('C', 'N', qs_ot_env%matrix_sc0, qs_ot_env%matrix_sc0_im, &
+                                  qs_ot_env%matrix_dx, qs_ot_env%matrix_dx_im, w_re, w_im, ok_tmp)
+      contamination_before = SQRT(dbcsr_frobenius_norm(w_re)**2 + dbcsr_frobenius_norm(w_im)**2)
+
+      ! (C0^H S C0)^-1 from the eigenpairs of the Hermitian Gram matrix.
+      CALL qs_ot_complex_multiply('C', 'N', qs_ot_env%matrix_sc0, qs_ot_env%matrix_sc0_im, &
+                                  qs_ot_env%matrix_c0, qs_ot_env%matrix_c0_im, gram_re, gram_im, &
+                                  kk_tmp)
+      ALLOCATE (evals(k), inverse_evals(k))
+      CALL cp_dbcsr_heevd(matrix_re=gram_re, matrix_im=gram_im, eigenvectors_re=vec_re, &
+                          eigenvectors_im=vec_im, eigenvalues=evals, para_env=qs_ot_env%para_env, &
+                          blacs_env=qs_ot_env%blacs_env)
+      eval_threshold = 100.0_dp*EPSILON(1.0_dp)*MAX(1.0_dp, MAXVAL(ABS(evals)))
+      IF (MINVAL(evals) <= eval_threshold) THEN
+         CPABORT("STRICT reference orbitals have a singular overlap Gram matrix.")
+      END IF
+      DO i = 1, k
+         inverse_evals(i) = 1.0_dp/evals(i)
+      END DO
+
+      ! Y = V Lambda^-1 V^H W and D <- D - C0 Y.
+      CALL qs_ot_complex_multiply('C', 'N', vec_re, vec_im, w_re, w_im, y_re, y_im, ok_tmp)
+      CALL dbcsr_scale_by_vector(y_re, alpha=inverse_evals, side='left')
+      CALL dbcsr_scale_by_vector(y_im, alpha=inverse_evals, side='left')
+      CALL qs_ot_complex_multiply('N', 'N', vec_re, vec_im, y_re, y_im, w_re, w_im, ok_tmp)
+      CALL qs_ot_complex_multiply('N', 'N', qs_ot_env%matrix_c0, qs_ot_env%matrix_c0_im, &
+                                  w_re, w_im, nk_re, nk_im, nk_tmp)
+      CALL dbcsr_add(qs_ot_env%matrix_dx, nk_re, alpha_scalar=1.0_dp, beta_scalar=-1.0_dp)
+      CALL dbcsr_add(qs_ot_env%matrix_dx_im, nk_im, alpha_scalar=1.0_dp, beta_scalar=-1.0_dp)
+
+      CALL qs_ot_complex_multiply('C', 'N', qs_ot_env%matrix_sc0, qs_ot_env%matrix_sc0_im, &
+                                  qs_ot_env%matrix_dx, qs_ot_env%matrix_dx_im, w_re, w_im, ok_tmp)
+      contamination_after = SQRT(dbcsr_frobenius_norm(w_re)**2 + dbcsr_frobenius_norm(w_im)**2)
+
+      DEALLOCATE (evals, inverse_evals)
+      CALL dbcsr_release(w_re)
+      CALL dbcsr_release(w_im)
+      CALL dbcsr_release(y_re)
+      CALL dbcsr_release(y_im)
+      CALL dbcsr_release(gram_re)
+      CALL dbcsr_release(gram_im)
+      CALL dbcsr_release(vec_re)
+      CALL dbcsr_release(vec_im)
+      CALL dbcsr_release(kk_tmp)
+      CALL dbcsr_release(ok_tmp)
+      CALL dbcsr_release(nk_re)
+      CALL dbcsr_release(nk_im)
+      CALL dbcsr_release(nk_tmp)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE qs_ot_project_complex_tangent
 
 ! **************************************************************************************************
 !> \brief finite complex STRICT derivative, projected onto C0^H*S*X=0
