@@ -809,6 +809,8 @@ list(
   qs_vxc_atom_utils.F
   qs_vxc_atom.F
   qs_native_grid_cache.F
+  qs_native_grid_gpu.F
+  qs_native_one_centre_gpu.F
   qs_vxc.F
   qs_wannier90.F
   qs_wf_history_methods.F
@@ -1595,6 +1597,9 @@ set(CP2K_DBM_SRCS_GPU_C dbm/dbm_multiply_opencl.c dbm/dbm_multiply_gpu.c)
 
 set(CP2K_PW_SRCS_GPU pw/gpu/pw_gpu_kernels.cu)
 
+# Plane-wave stencil of the native SKALA atom-composite route (NATIVE_GRID_GPU_STENCIL).
+set(CP2K_SKALA_SRCS_GPU xc/skala_native_grid_gpu.cu xc/skala_one_centre_gpu.cu)
+
 set(CP2K_PROGS_C
     grid/grid_miniapp.c;grid/grid_unittest.c;dbm/dbm_miniapp.c;start/libcp2k_unittest.c
 )
@@ -1650,6 +1655,10 @@ if(CP2K_USE_CUDA
   if(CP2K_ENABLE_PW_GPU)
     list(APPEND CP2K_SRCS_GPU "pw/gpu/pw_gpu_kernels.cu")
     list(APPEND CP2K_SRCS_C ${CP2K_PW_SRCS_C})
+  endif()
+
+  if(CP2K_USE_CUDA)
+    list(APPEND CP2K_SRCS_GPU ${CP2K_SKALA_SRCS_GPU})
   endif()
 
   if(CP2K_ENABLE_DBM_GPU)
@@ -1709,7 +1718,7 @@ if(CP2K_ENABLE_CONSISTENCY_CHECKS)
     "${CP2K_SRCS_F};${CP2K_OFFLOAD_SRCS_F};${CP2K_PROGS_F}" "*.F"
     "${CP2K_EXCLUDED_SRCS_F}")
   cp2k_compare_src_with_list(
-    "${CP2K_GRID_SRCS_GPU};${CP2K_GRID_SRCS_HIP};${CP2K_DBM_SRCS_GPU};${CP2K_PW_SRCS_GPU}"
+    "${CP2K_GRID_SRCS_GPU};${CP2K_GRID_SRCS_HIP};${CP2K_DBM_SRCS_GPU};${CP2K_PW_SRCS_GPU};${CP2K_SKALA_SRCS_GPU}"
     "*.cu"
     "")
   cp2k_compare_src_with_list("${CP2K_SRCS_CPP}" "*.cpp" "")

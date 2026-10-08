@@ -70,12 +70,23 @@ MODULE qs_vxc_atom
                                               qs_kind_type
    USE qs_linres_types,                 ONLY: nablavks_atom_type
    USE qs_native_grid_cache,            ONLY: fetch_native_grid_stencil,&
+                                              native_grid_cache_type,&
                                               native_grid_interp_npts,&
                                               native_grid_interp_offset_max,&
                                               native_grid_interp_offset_min,&
                                               native_grid_interpolation_stencil_type,&
                                               prepare_native_grid_cache,&
                                               store_native_grid_stencil
+   USE qs_native_grid_gpu,              ONLY: native_grid_gpu_adjoint,&
+                                              native_grid_gpu_interpolate,&
+                                              native_grid_gpu_release,&
+                                              native_grid_gpu_set_grid,&
+                                              native_grid_gpu_set_rows,&
+                                              native_grid_gpu_upload_field
+   USE qs_native_one_centre_gpu,        ONLY: calc_tau_atom_gpu,&
+                                              dgaVtaudgb_gpu,&
+                                              gaVxcgb_GC_gpu,&
+                                              one_centre_gpu_release
    USE qs_rho_atom_methods,             ONLY: replicate_rho_atom_radial
    USE qs_rho_atom_types,               ONLY: get_rho_atom,&
                                               rho_atom_coeff,&
@@ -194,6 +205,10 @@ MODULE qs_vxc_atom
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: partition_weight
       TYPE(cross_candidate_list_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: cross
+      ! NATIVE_GRID_GPU_STENCIL: the stencils on the device are those of the rows
+      ! gpu_row_of_rank, in this order.
+      LOGICAL                                            :: gpu_stencils_ready = .FALSE.
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: gpu_row_of_rank
    END TYPE composite_geometry_cache_type
 
    TYPE(composite_geometry_cache_type), SAVE             :: composite_geometry
@@ -320,7 +335,7 @@ CONTAINS
          composite_row_rank, gapw_density_partition, gapw_representation, handle, ia, iat, iatom, &
          icomponent, idir, ikind, ir, ispin, iw, jdir, myfun, na, natom, nlcc_entry, nlcc_first, &
          nlcc_last, nr, nspins, num_pe, on, section_handle, source_atom, target_atom
-      INTEGER :: xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: one_centre_col_count, xc_deriv_method_id, xc_rho_smooth_id, zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
@@ -331,7 +346,9 @@ CONTAINS
       LOGICAL :: accint, adjoint_private, atom_composite_active, atom_composite_diagnostic, &
          atom_composite_reference, direct_valence_atom_composite, donlcc, evaluate_hard, &
          evaluate_soft, gradient_f, image_partition_atom_composite, lsd, my_calculate_forces, &
-         native_grid_diagnostics, native_trial_diagnostics, nlcc, one_center_kind, paw_atom, &
+         native_grid_diagnostics, native_grid_gpu_one_centre, native_grid_gpu_stencil, &
+         native_trial_diagnostics, nlcc, &
+         one_center_kind, paw_atom, &
          paw_pseudopotentials, requested_atom_composite_grid, reuse_partition, rho_g_valid, &
          skala_atom_grid, source_matrix_local, tau_f, tau_r_valid, use_atom_composite_density, &
          use_atom_composite_gradient, use_atom_composite_tau, use_virial
@@ -523,6 +540,8 @@ CONTAINS
       atom_composite_reference = .FALSE.
       paw_pseudopotentials = .FALSE.
       native_grid_diagnostics = .FALSE.
+      native_grid_gpu_stencil = .FALSE.
+      native_grid_gpu_one_centre = .FALSE.
       native_trial_diagnostics = .FALSE.
       atom_composite_components = 1
       feature_vxc_step = 3.0E-3_dp
@@ -559,6 +578,10 @@ CONTAINS
          CALL section_vals_val_get(gauxc_section, &
                                    "NATIVE_GRID_GAPW_ATOM_COMPOSITE_FD_STEP", &
                                    r_val=feature_vxc_step)
+         CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_GPU_STENCIL", &
+                                   l_val=native_grid_gpu_stencil)
+         CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_GPU_ONE_CENTRE", &
+                                   l_val=native_grid_gpu_one_centre)
       END IF
       atom_composite_reference = atom_composite_reference .OR. &
                                  (gapw_representation == skala_gapw_paw_one_center .AND. &
@@ -855,6 +878,16 @@ CONTAINS
             CALL timeset("skala_vxc_pw_interp", section_handle)
             CALL native_grid_row_order(smooth_rho_r(1)%pw_grid, cell, composite_grid_coords, &
                                        image_partition_atom_composite, composite_row_order)
+            IF (native_grid_gpu_stencil) THEN
+               CALL gpu_stencil_interpolate( &
+                  qs_env%native_grid_cache, smooth_rho_r(1)%pw_grid, cell, composite_grid_coords, &
+                  composite_row_order(1:composite_nflat), image_partition_atom_composite, lsd, &
+                  composite_smooth_rho, composite_smooth_drho, composite_smooth_tau, &
+                  composite_smooth_rhoa, composite_smooth_drhoa, composite_smooth_tau_a, &
+                  composite_smooth_rhob, composite_smooth_drhob, composite_smooth_tau_b, &
+                  composite_smooth_density_cache, composite_smooth_gradient_cache, &
+                  composite_smooth_kin_cache)
+            ELSE
 !$OMP PARALLEL DO SCHEDULE(DYNAMIC, 256) DEFAULT(NONE) &
 !$OMP PRIVATE(composite_row, composite_smooth_density_value, composite_smooth_gradient_value, &
 !$OMP         composite_smooth_kin_value, interpolation_stencil) &
@@ -864,60 +897,62 @@ CONTAINS
 !$OMP        composite_smooth_kin_cache, composite_smooth_rho, composite_smooth_rhoa, &
 !$OMP        composite_smooth_rhob, composite_smooth_tau, composite_smooth_tau_a, &
 !$OMP        composite_smooth_tau_b, image_partition_atom_composite, lsd, qs_env, smooth_rho_r)
-            DO composite_row_rank = 1, composite_nflat
-               composite_row = composite_row_order(composite_row_rank)
-               IF (.NOT. fetch_native_grid_stencil(qs_env%native_grid_cache, composite_row, &
-                                                   composite_grid_coords(:, composite_row), &
-                                                   interpolation_stencil)) THEN
-                  CALL create_native_grid_interpolation_stencil( &
-                     interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, &
-                     composite_grid_coords(:, composite_row), image_partition_atom_composite)
-                  CALL store_native_grid_stencil(qs_env%native_grid_cache, composite_row, &
-                                                 composite_grid_coords(:, composite_row), &
-                                                 interpolation_stencil)
-               END IF
-               IF (lsd) THEN
-                  CALL interpolate_native_grid_fields( &
-                     composite_smooth_rhoa, composite_smooth_drhoa(1)%array, &
-                     composite_smooth_drhoa(2)%array, composite_smooth_drhoa(3)%array, &
-                     composite_smooth_tau_a, interpolation_stencil, &
-                     composite_smooth_density_value(1), &
-                     composite_smooth_gradient_value(:, 1), &
-                     composite_smooth_kin_value(1))
-                  CALL interpolate_native_grid_fields( &
-                     composite_smooth_rhob, composite_smooth_drhob(1)%array, &
-                     composite_smooth_drhob(2)%array, composite_smooth_drhob(3)%array, &
-                     composite_smooth_tau_b, interpolation_stencil, &
-                     composite_smooth_density_value(2), &
-                     composite_smooth_gradient_value(:, 2), &
-                     composite_smooth_kin_value(2))
-                  composite_smooth_density_cache(composite_row, :) = composite_smooth_density_value
-                  composite_smooth_gradient_cache(composite_row, :, :) = &
-                     composite_smooth_gradient_value
-                  composite_smooth_kin_cache(composite_row, :) = composite_smooth_kin_value
-               ELSE
-                  CALL interpolate_native_grid_fields( &
-                     composite_smooth_rho, composite_smooth_drho(1)%array, &
-                     composite_smooth_drho(2)%array, composite_smooth_drho(3)%array, &
-                     composite_smooth_tau, interpolation_stencil, &
-                     composite_smooth_density_value(1), &
-                     composite_smooth_gradient_value(:, 1), &
-                     composite_smooth_kin_value(1))
-                  composite_smooth_density_cache(composite_row, 1) = &
-                     composite_smooth_density_value(1)
-                  composite_smooth_gradient_cache(composite_row, :, 1) = &
-                     composite_smooth_gradient_value(:, 1)
-                  composite_smooth_kin_cache(composite_row, 1) = composite_smooth_kin_value(1)
-               END IF
-            END DO
+               DO composite_row_rank = 1, composite_nflat
+                  composite_row = composite_row_order(composite_row_rank)
+                  IF (.NOT. fetch_native_grid_stencil(qs_env%native_grid_cache, composite_row, &
+                                                      composite_grid_coords(:, composite_row), &
+                                                      interpolation_stencil)) THEN
+                     CALL create_native_grid_interpolation_stencil( &
+                        interpolation_stencil, smooth_rho_r(1)%pw_grid, cell, &
+                        composite_grid_coords(:, composite_row), image_partition_atom_composite)
+                     CALL store_native_grid_stencil(qs_env%native_grid_cache, composite_row, &
+                                                    composite_grid_coords(:, composite_row), &
+                                                    interpolation_stencil)
+                  END IF
+                  IF (lsd) THEN
+                     CALL interpolate_native_grid_fields( &
+                        composite_smooth_rhoa, composite_smooth_drhoa(1)%array, &
+                        composite_smooth_drhoa(2)%array, composite_smooth_drhoa(3)%array, &
+                        composite_smooth_tau_a, interpolation_stencil, &
+                        composite_smooth_density_value(1), &
+                        composite_smooth_gradient_value(:, 1), &
+                        composite_smooth_kin_value(1))
+                     CALL interpolate_native_grid_fields( &
+                        composite_smooth_rhob, composite_smooth_drhob(1)%array, &
+                        composite_smooth_drhob(2)%array, composite_smooth_drhob(3)%array, &
+                        composite_smooth_tau_b, interpolation_stencil, &
+                        composite_smooth_density_value(2), &
+                        composite_smooth_gradient_value(:, 2), &
+                        composite_smooth_kin_value(2))
+                     composite_smooth_density_cache(composite_row, :) = composite_smooth_density_value
+                     composite_smooth_gradient_cache(composite_row, :, :) = &
+                        composite_smooth_gradient_value
+                     composite_smooth_kin_cache(composite_row, :) = composite_smooth_kin_value
+                  ELSE
+                     CALL interpolate_native_grid_fields( &
+                        composite_smooth_rho, composite_smooth_drho(1)%array, &
+                        composite_smooth_drho(2)%array, composite_smooth_drho(3)%array, &
+                        composite_smooth_tau, interpolation_stencil, &
+                        composite_smooth_density_value(1), &
+                        composite_smooth_gradient_value(:, 1), &
+                        composite_smooth_kin_value(1))
+                     composite_smooth_density_cache(composite_row, 1) = &
+                        composite_smooth_density_value(1)
+                     composite_smooth_gradient_cache(composite_row, :, 1) = &
+                        composite_smooth_gradient_value(:, 1)
+                     composite_smooth_kin_cache(composite_row, 1) = composite_smooth_kin_value(1)
+                  END IF
+               END DO
 !$OMP END PARALLEL DO
+            END IF
             CALL timestop(section_handle)
 
             ! Hard and soft one-center fields of all atoms, once for the whole call.
             IF (.NOT. direct_valence_atom_composite) THEN
                CALL timeset("skala_vxc_1c_fields", section_handle)
                ALLOCATE (one_center_fields(SIZE(particle_set)))
-               CALL compute_one_center_fields(one_center_fields, my_kind_set, atomic_kind_set, &
+               CALL compute_one_center_fields(native_grid_gpu_one_centre, &
+                                              one_center_fields, my_kind_set, atomic_kind_set, &
                                               my_rho_atom_set, para_env, nspins, &
                                               gapw_representation)
                CALL timestop(section_handle)
@@ -1959,7 +1994,12 @@ CONTAINS
 !$          adjoint_threads = omp_get_max_threads()
             adjoint_private = REAL(adjoint_threads, dp)*REAL(composite_pw_nflat, dp)* &
                               REAL(5*adjoint_nchannels, dp)*8.0_dp <= adjoint_private_bytes_max
-            IF (adjoint_private) THEN
+            IF (native_grid_gpu_stencil) THEN
+               CALL gpu_stencil_adjoint( &
+                  smooth_rho_r(1)%pw_grid, lsd, composite_density_grad, composite_grad_grad, &
+                  composite_kin_grad, adjoint_nchannels, smooth_density_adjoint_storage, &
+                  smooth_grad_adjoint_storage, smooth_kin_adjoint_storage)
+            ELSE IF (adjoint_private) THEN
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP PRIVATE(composite_row, composite_smooth_density_adjoint_value, &
 !$OMP         composite_smooth_gradient_adjoint_value, composite_smooth_kin_adjoint_value, &
@@ -2324,8 +2364,20 @@ CONTAINS
                         END DO
                      END IF
                      CALL timeset("skala_vxc_1c_adj_ks", section_handle)
-                     CALL gaVxcgb_GC(vxc_h, vxc_s, vxg_h, vxg_s, int_hh, int_ss, &
-                                     grid_atom, basis_1c, harmonics, nspins)
+                     IF (native_grid_gpu_one_centre) THEN
+                        CALL gaVxcgb_GC_gpu(vxc_h, vxc_s, vxg_h, vxg_s, int_hh, int_ss, &
+                                            grid_atom, basis_1c, harmonics, nspins, &
+                                            one_centre_col_count)
+                        IF (native_grid_diagnostics) THEN
+                           iw = cp_logger_get_default_io_unit()
+                           IF (iw > 0) WRITE (UNIT=iw, FMT="(T2,A,3(1X,I0))") &
+                              "SKALA_GPW| GPU one-centre kind, basis functions, radial columns", &
+                              ikind, tau_basis_cache%nsatbas, one_centre_col_count
+                        END IF
+                     ELSE
+                        CALL gaVxcgb_GC(vxc_h, vxc_s, vxg_h, vxg_s, int_hh, int_ss, &
+                                        grid_atom, basis_1c, harmonics, nspins)
+                     END IF
                      IF (atom_composite_diagnostic) THEN
                         DO ispin = 1, nspins
                            one_center_rho_grad_matrix_contraction = &
@@ -2338,7 +2390,12 @@ CONTAINS
                                                          tau_basis_cache%n2oindex)
                         END DO
                      END IF
-                     CALL dgaVtaudgb(vtau_h, vtau_s, int_hh, int_ss, tau_basis_cache, nspins)
+                     IF (native_grid_gpu_one_centre) THEN
+                        CALL dgaVtaudgb_gpu(vtau_h, vtau_s, int_hh, int_ss, tau_basis_cache, &
+                                            nspins, ikind)
+                     ELSE
+                        CALL dgaVtaudgb(vtau_h, vtau_s, int_hh, int_ss, tau_basis_cache, nspins)
+                     END IF
                      IF (atom_composite_diagnostic) THEN
                         DO ispin = 1, nspins
                            one_center_matrix_contraction = &
@@ -2965,6 +3022,225 @@ CONTAINS
       stencil%active = .TRUE.
 
    END SUBROUTINE create_native_grid_interpolation_stencil
+
+! **************************************************************************************************
+!> \brief Make the plane-wave stencils of the local atom-grid rows, as the CPU path does, and upload
+!>        them to the GPU (NATIVE_GRID_GPU_STENCIL). The stencils depend only on the geometry and
+!>        the grid, so they are uploaded once and kept while the geometry cache is unchanged.
+!> \param native_grid_cache stencil cache of the CPU path
+!> \param pw_grid plane-wave grid of the smooth fields
+!> \param cell ...
+!> \param grid_coords Cartesian coordinates of the rows
+!> \param row_order rows in the order of their stencils on the grid
+!> \param wrap_auxiliary_cell wrap all auxiliary-grid directions
+! **************************************************************************************************
+   SUBROUTINE gpu_stencil_prepare(native_grid_cache, pw_grid, cell, grid_coords, row_order, &
+                                  wrap_auxiliary_cell)
+      TYPE(native_grid_cache_type), INTENT(IN)           :: native_grid_cache
+      TYPE(pw_grid_type), INTENT(IN), POINTER            :: pw_grid
+      TYPE(cell_type), INTENT(IN), POINTER               :: cell
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_coords
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: row_order
+      LOGICAL, INTENT(IN)                                :: wrap_auxiliary_cell
+
+      INTEGER                                            :: nrows, rank, row
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: first_node
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: active
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: weights
+      TYPE(native_grid_interpolation_stencil_type)       :: stencil
+
+      nrows = SIZE(row_order)
+      IF (composite_geometry%gpu_stencils_ready) THEN
+         IF (SIZE(composite_geometry%gpu_row_of_rank) == nrows) THEN
+            IF (ALL(composite_geometry%gpu_row_of_rank == row_order)) RETURN
+         END IF
+      END IF
+      ALLOCATE (first_node(3, nrows), weights(native_grid_interp_npts, 3, nrows), active(nrows))
+!$OMP PARALLEL DO SCHEDULE(STATIC) DEFAULT(NONE) PRIVATE(rank, row, stencil) &
+!$OMP SHARED(active, cell, first_node, grid_coords, native_grid_cache, nrows, pw_grid, &
+!$OMP        row_order, weights, wrap_auxiliary_cell)
+      DO rank = 1, nrows
+         row = row_order(rank)
+         IF (.NOT. fetch_native_grid_stencil(native_grid_cache, row, grid_coords(:, row), &
+                                             stencil)) THEN
+            CALL create_native_grid_interpolation_stencil(stencil, pw_grid, cell, &
+                                                          grid_coords(:, row), wrap_auxiliary_cell)
+         END IF
+         ! Node i of a direction is first_node + i - 1, wrapped where the direction wraps, as in
+         ! create_native_grid_interpolation_stencil.
+         first_node(:, rank) = stencil%relative_index(1, :)
+         weights(:, :, rank) = stencil%weight
+         active(rank) = stencil%active
+      END DO
+!$OMP END PARALLEL DO
+      CALL native_grid_gpu_set_rows(first_node, weights, active)
+      IF (ALLOCATED(composite_geometry%gpu_row_of_rank)) DEALLOCATE (composite_geometry%gpu_row_of_rank)
+      ALLOCATE (composite_geometry%gpu_row_of_rank(nrows))
+      composite_geometry%gpu_row_of_rank(:) = row_order
+      composite_geometry%gpu_stencils_ready = .TRUE.
+      DEALLOCATE (first_node, weights, active)
+
+   END SUBROUTINE gpu_stencil_prepare
+
+! **************************************************************************************************
+!> \brief Interpolate the smooth density, gradient and kinetic-energy density at the local
+!>        atom-grid rows on the GPU (NATIVE_GRID_GPU_STENCIL); the GPU counterpart of the
+!>        interpolation loop of calculate_vxc_atom, with the same stencils.
+!> \param native_grid_cache ...
+!> \param pw_grid ...
+!> \param cell ...
+!> \param grid_coords ...
+!> \param row_order ...
+!> \param wrap_auxiliary_cell ...
+!> \param lsd spin-polarized fields (channels a and b) instead of the total
+!> \param rho total density, used without lsd
+!> \param drho its gradient
+!> \param tau its kinetic-energy density
+!> \param rhoa density of spin a, used with lsd
+!> \param drhoa ...
+!> \param tau_a ...
+!> \param rhob ...
+!> \param drhob ...
+!> \param tau_b ...
+!> \param density_cache interpolated density per row and channel
+!> \param gradient_cache interpolated gradient per row, direction and channel
+!> \param kin_cache interpolated kinetic-energy density per row and channel
+! **************************************************************************************************
+   SUBROUTINE gpu_stencil_interpolate(native_grid_cache, pw_grid, cell, grid_coords, row_order, &
+                                      wrap_auxiliary_cell, lsd, rho, drho, tau, rhoa, drhoa, &
+                                      tau_a, rhob, drhob, tau_b, density_cache, gradient_cache, &
+                                      kin_cache)
+      TYPE(native_grid_cache_type), INTENT(IN)           :: native_grid_cache
+      TYPE(pw_grid_type), INTENT(IN), POINTER            :: pw_grid
+      TYPE(cell_type), INTENT(IN), POINTER               :: cell
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: grid_coords
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: row_order
+      LOGICAL, INTENT(IN)                                :: wrap_auxiliary_cell, lsd
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: rho
+      TYPE(cp_3d_r_cp_type), DIMENSION(3), INTENT(IN)    :: drho
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: tau, rhoa
+      TYPE(cp_3d_r_cp_type), DIMENSION(3), INTENT(IN)    :: drhoa
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: tau_a, rhob
+      TYPE(cp_3d_r_cp_type), DIMENSION(3), INTENT(IN)    :: drhob
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: tau_b
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: density_cache
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT)   :: gradient_cache
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: kin_cache
+
+      INTEGER                                            :: channel, handle, idir, nchannels, &
+                                                            rank, row
+      LOGICAL, DIMENSION(3)                              :: wrap
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: values
+
+      nchannels = MERGE(2, 1, lsd)
+      DO idir = 1, 3
+         wrap(idir) = cell%perd(idir) == 1 .OR. wrap_auxiliary_cell
+      END DO
+      CALL timeset("skala_vxc_gpu_stencils", handle)
+      CALL native_grid_gpu_set_grid(pw_grid%npts, wrap, nchannels)
+      CALL gpu_stencil_prepare(native_grid_cache, pw_grid, cell, grid_coords, row_order, &
+                               wrap_auxiliary_cell)
+      CALL timestop(handle)
+      CALL timeset("skala_vxc_gpu_fields_up", handle)
+      IF (lsd) THEN
+         CALL native_grid_gpu_upload_field(1, 1, rhoa)
+         CALL native_grid_gpu_upload_field(2, 1, rhob)
+         DO idir = 1, 3
+            CALL native_grid_gpu_upload_field(1, 1 + idir, drhoa(idir)%array)
+            CALL native_grid_gpu_upload_field(2, 1 + idir, drhob(idir)%array)
+         END DO
+         CALL native_grid_gpu_upload_field(1, 5, tau_a)
+         CALL native_grid_gpu_upload_field(2, 5, tau_b)
+      ELSE
+         CALL native_grid_gpu_upload_field(1, 1, rho)
+         DO idir = 1, 3
+            CALL native_grid_gpu_upload_field(1, 1 + idir, drho(idir)%array)
+         END DO
+         CALL native_grid_gpu_upload_field(1, 5, tau)
+      END IF
+      CALL timestop(handle)
+      CALL timeset("skala_vxc_gpu_interp", handle)
+      ALLOCATE (values(5, nchannels, SIZE(row_order)))
+      CALL native_grid_gpu_interpolate(values)
+      CALL timestop(handle)
+!$OMP PARALLEL DO SCHEDULE(STATIC) DEFAULT(NONE) PRIVATE(channel, rank, row) &
+!$OMP SHARED(density_cache, gradient_cache, kin_cache, nchannels, row_order, values)
+      DO rank = 1, SIZE(row_order)
+         row = row_order(rank)
+         DO channel = 1, nchannels
+            density_cache(row, channel) = values(1, channel, rank)
+            gradient_cache(row, :, channel) = values(2:4, channel, rank)
+            kin_cache(row, channel) = values(5, channel, rank)
+         END DO
+      END DO
+!$OMP END PARALLEL DO
+      DEALLOCATE (values)
+
+   END SUBROUTINE gpu_stencil_interpolate
+
+! **************************************************************************************************
+!> \brief Adjoint of gpu_stencil_interpolate: scatter the model gradients of the rows to the
+!>        plane-wave grid on the GPU (NATIVE_GRID_GPU_STENCIL). Uses the stencils uploaded by the
+!>        interpolation of the same call.
+!> \param pw_grid ...
+!> \param lsd ...
+!> \param density_grad derivative of the energy with respect to the row densities
+!> \param grad_grad ... gradients
+!> \param kin_grad ... kinetic-energy densities
+!> \param nchannels spin channels of the adjoint fields
+!> \param density_adjoint adjoint density per grid point and channel
+!> \param grad_adjoint adjoint gradient per grid point, direction and channel
+!> \param kin_adjoint adjoint kinetic-energy density per grid point and channel
+! **************************************************************************************************
+   SUBROUTINE gpu_stencil_adjoint(pw_grid, lsd, density_grad, grad_grad, kin_grad, nchannels, &
+                                  density_adjoint, grad_adjoint, kin_adjoint)
+      TYPE(pw_grid_type), INTENT(IN), POINTER            :: pw_grid
+      LOGICAL, INTENT(IN)                                :: lsd
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: density_grad
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: grad_grad
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: kin_grad
+      INTEGER, INTENT(IN)                                :: nchannels
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: density_adjoint
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT)   :: grad_adjoint
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: kin_adjoint
+
+      INTEGER                                            :: channel, handle, idir, rank, row
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: adjoint, row_values
+      REAL(KIND=dp), DIMENSION(2)                        :: density_value, kin_value
+      REAL(KIND=dp), DIMENSION(3, 2)                     :: grad_value
+
+      CPASSERT(composite_geometry%gpu_stencils_ready)
+      CPASSERT(SIZE(density_adjoint, 1) == PRODUCT(pw_grid%npts))
+      ALLOCATE (row_values(5, nchannels, SIZE(composite_geometry%gpu_row_of_rank)))
+!$OMP PARALLEL DO SCHEDULE(STATIC) DEFAULT(NONE) &
+!$OMP PRIVATE(channel, density_value, grad_value, kin_value, rank, row) &
+!$OMP SHARED(composite_geometry, density_grad, grad_grad, kin_grad, lsd, nchannels, row_values)
+      DO rank = 1, SIZE(composite_geometry%gpu_row_of_rank)
+         row = composite_geometry%gpu_row_of_rank(rank)
+         CALL composite_row_smooth_adjoint(row, lsd, density_grad, grad_grad, kin_grad, &
+                                           density_value, grad_value, kin_value)
+         DO channel = 1, nchannels
+            row_values(1, channel, rank) = density_value(channel)
+            row_values(2:4, channel, rank) = grad_value(:, channel)
+            row_values(5, channel, rank) = kin_value(channel)
+         END DO
+      END DO
+!$OMP END PARALLEL DO
+      CALL timeset("skala_vxc_gpu_scatter", handle)
+      ALLOCATE (adjoint(SIZE(density_adjoint, 1), 5, nchannels))
+      CALL native_grid_gpu_adjoint(row_values, adjoint)
+      CALL timestop(handle)
+      DO channel = 1, nchannels
+         density_adjoint(:, channel) = density_adjoint(:, channel) + adjoint(:, 1, channel)
+         DO idir = 1, 3
+            grad_adjoint(:, idir, channel) = grad_adjoint(:, idir, channel) + &
+                                             adjoint(:, 1 + idir, channel)
+         END DO
+         kin_adjoint(:, channel) = kin_adjoint(:, channel) + adjoint(:, 5, channel)
+      END DO
+      DEALLOCATE (adjoint, row_values)
+
+   END SUBROUTINE gpu_stencil_adjoint
 
 ! **************************************************************************************************
 !> \brief Interpolate density, gradient, and kinetic-density fields in one stencil traversal.
@@ -4112,6 +4388,11 @@ CONTAINS
       IF (ALLOCATED(cache%kind_grid)) DEALLOCATE (cache%kind_grid)
       IF (ALLOCATED(cache%partition_weight)) DEALLOCATE (cache%partition_weight)
       IF (ALLOCATED(cache%cross)) DEALLOCATE (cache%cross)
+      cache%gpu_stencils_ready = .FALSE.
+      IF (ALLOCATED(cache%gpu_row_of_rank)) DEALLOCATE (cache%gpu_row_of_rank)
+      CALL native_grid_gpu_release()
+      ! The basis gradients on the device belong to the kinds' grids, which are part of the key.
+      CALL one_centre_gpu_release()
    END SUBROUTINE release_composite_geometry
 
 ! **************************************************************************************************
@@ -4669,8 +4950,9 @@ CONTAINS
 !> \param nspins number of spin channels
 !> \param gapw_representation Skala pseudopotential GAPW representation
 ! **************************************************************************************************
-   SUBROUTINE compute_one_center_fields(fields, kind_set, atomic_kind_set, rho_atom_set, &
-                                        para_env, nspins, gapw_representation)
+   SUBROUTINE compute_one_center_fields(gpu_one_centre, fields, kind_set, atomic_kind_set, &
+                                        rho_atom_set, para_env, nspins, gapw_representation)
+      LOGICAL, INTENT(IN)                                :: gpu_one_centre
       TYPE(one_center_fields_type), DIMENSION(:), &
          INTENT(INOUT)                                   :: fields
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: kind_set
@@ -4727,8 +5009,13 @@ CONTAINS
             fields(iatom)%rho_s = 0.0_dp
             fields(iatom)%drho_h = 0.0_dp
             fields(iatom)%drho_s = 0.0_dp
-            CALL calc_tau_atom(fields(iatom)%tau_h, fields(iatom)%tau_s, rho_atom, &
-                               tau_basis_cache, nspins)
+            IF (gpu_one_centre) THEN
+               CALL calc_tau_atom_gpu(fields(iatom)%tau_h, fields(iatom)%tau_s, rho_atom, &
+                                      tau_basis_cache, nspins, ikind)
+            ELSE
+               CALL calc_tau_atom(fields(iatom)%tau_h, fields(iatom)%tau_s, rho_atom, &
+                                  tau_basis_cache, nspins)
+            END IF
             DO ir = 1, nr
                CALL calc_rho_angular(grid_atom, harmonics, nspins, .TRUE., ir, r_h, r_s, &
                                      fields(iatom)%rho_h, fields(iatom)%rho_s, dr_h, dr_s, &
