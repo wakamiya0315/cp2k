@@ -3607,6 +3607,8 @@ CONTAINS
       END IF
       density_full_step = .FALSE.
       raw_residual = scf_env%iter_delta; evaluations_before = store%dm_trial_free_evaluations
+      IF (iw > 0 .AND. scf_env%iter_count == 1 .AND. store%dm_trial_free_f_slack > 0.0_dp) &
+         WRITE (iw, '(T2,A,ES24.14E3)') "SCF_FREE_ENERGY| accepted F rise slack [hartree] ", store%dm_trial_free_f_slack
       IF (store%dm_trial_free_validate .AND. scf_env%iter_count == 1) &
          CALL qs_scf_free_validate(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
       accepted = .FALSE.
@@ -3638,7 +3640,7 @@ CONTAINS
             IF (iw > 0) WRITE (iw, '(T2,A,3I6,4ES24.14E3,L3)') &
                "SCF_FREE_ENERGY| trial step,direction,halvings,lambda,F,deltaF,EKS,valid ", &
                scf_env%iter_count, direction, backtrack, lambda, free_energy, free_energy - store%dm_trial_f_input, eks, valid
-            accepted = valid .AND. free_energy <= store%dm_trial_f_input
+            accepted = valid .AND. free_energy <= store%dm_trial_f_input + store%dm_trial_free_f_slack
             IF (accepted) EXIT
             lambda = 0.5_dp*lambda
          END DO

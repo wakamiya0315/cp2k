@@ -117,6 +117,7 @@ MODULE qs_density_mixing_types
       LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
       LOGICAL :: dm_trial_free_energy = .FALSE., dm_trial_free_validate = .FALSE.
       LOGICAL :: dm_trial_free_precision_compare = .FALSE.
+      REAL(KIND=dp) :: dm_trial_free_f_slack = 0.0_dp
       INTEGER :: dm_trial_free_backtracks = 12, dm_trial_free_evaluations = 0
       INTEGER :: dm_trial_free_diag_level = 0
       CHARACTER(LEN=default_path_length) :: dm_trial_free_diag_file = ""
@@ -258,6 +259,11 @@ CONTAINS
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_DIAG_FILE", c_val=mixing_store%dm_trial_free_diag_file)
       CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_PRECISION_COMPARE", &
                                 l_val=mixing_store%dm_trial_free_precision_compare)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_F_SLACK", r_val=mixing_store%dm_trial_free_f_slack)
+      IF (mixing_store%dm_trial_free_f_slack < 0.0_dp) &
+         CALL cp_abort(__LOCATION__, "PULAY_P_FREE_F_SLACK must not be negative")
+      IF (mixing_store%dm_trial_free_f_slack > 0.0_dp .AND. .NOT. mixing_store%dm_trial_free_energy) &
+         CALL cp_abort(__LOCATION__, "PULAY_P_FREE_F_SLACK requires PULAY_P_FREE_ENERGY")
       IF (mixing_store%dm_trial_free_precision_compare .AND. .NOT. mixing_store%dm_trial_free_validate) &
          CALL cp_abort(__LOCATION__, "PULAY_P_FREE_PRECISION_COMPARE requires PULAY_P_FREE_VALIDATE")
       IF (mixing_store%dm_trial_free_diag_level > 0) THEN
@@ -1066,6 +1072,15 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAG_FILE", &
                           description="Private new stream export prefix for independent P/S/KS/entropy checks.", &
                           type_of_var=lchar_t, default_lc_val="")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_F_SLACK", &
+                          description="Fixed tolerance for the free-energy acceptance: a trial is accepted if "// &
+                          "F(trial) <= F(input) + slack. Meant to cover the rounding resolution of F near "// &
+                          "convergence; the raw-residual convergence test and all state certificates are unchanged. "// &
+                          "The default 0 keeps strict non-increasing F.", &
+                          usage="PULAY_P_FREE_F_SLACK 2.0E-12", unit_str="hartree", &
+                          default_r_val=0.0_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_PRECISION_COMPARE", &
