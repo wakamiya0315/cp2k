@@ -855,6 +855,70 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="DIAGNOSTICS", &
+                          description="Print the unpreconditioned OT product-gradient block norms"// &
+                          " and measured line-search energies and slopes. This does not change"// &
+                          " the minimizer or its convergence criterion.", &
+                          usage="DIAGNOSTICS ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="DIAGNOSTICS_STATE", &
+                          description="Write native binary C/S/H and fixed-chart derivative snapshots"// &
+                          " at current Mermin OT states, without modifying the solver.", &
+                          usage="DIAGNOSTICS_STATE ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="DIAGNOSTICS_STATE_INTERVAL", &
+                          description="Current-state diagnostic interval in accepted gradient evaluations.", &
+                          usage="DIAGNOSTICS_STATE_INTERVAL 1", default_i_val=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="REFRESH_KEEP_STATE", &
+                          description="At a k-point OT reference-chart refresh, keep the current orbitals,"// &
+                          " occupations and auxiliary MO labels and reset only the chart and its history."// &
+                          " By default the refresh replaces them by a full Kohn-Sham diagonalization of H[P].", &
+                          usage="REFRESH_KEEP_STATE ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CHECK_INTERPOLATED_ENERGY", &
+                          description="In the three-point line search of occupation-preconditioned complex"// &
+                          " Mermin OT, evaluate the actual free energy at the interpolated point before the"// &
+                          " search ends. An uphill point is replaced by the lowest evaluated sample on the"// &
+                          " same direction, or the step is halved (at most 12 evaluations).", &
+                          usage="CHECK_INTERPOLATED_ENERGY ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COUNT_FULL_GRADIENTS", &
+                          description="Count only SCF steps with a full Kohn-Sham build towards the SCF step"// &
+                          " count used by the convergence test, and do not accept convergence on an"// &
+                          " energy-only line-search trial, which carries the residual of its origin.", &
+                          usage="COUNT_FULL_GRADIENTS ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PROJECT_STRICT_DIRECTION", &
+                          description="For occupation-preconditioned complex STRICT (ALGORITHM STRICT)"// &
+                          " Mermin OT, project each new search direction onto the tangent space of the"// &
+                          " reference orbitals C0 in the overlap metric and recompute its slope; a"// &
+                          " direction that is then not downhill is replaced by the projected"// &
+                          " preconditioned gradient.", &
+                          usage="PROJECT_STRICT_DIRECTION ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="REFRESH_SUBSPACE_RITZ", &
+                          description="At a k-point OT reference-chart refresh, rotate all current orbitals"// &
+                          " (occupied and added) to Ritz vectors of the Hamiltonian within their span and"// &
+                          " reassign the smeared occupations from the Ritz values, instead of replacing the"// &
+                          " orbitals by a full Kohn-Sham diagonalization. Exclusive with REFRESH_KEEP_STATE.", &
+                          usage="REFRESH_SUBSPACE_RITZ ON", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create( &
          keyword, __LOCATION__, name="STEPSIZE", &
          description="Initial stepsize used for the line search, sometimes this parameter can be reduced to stabilize DIIS"// &

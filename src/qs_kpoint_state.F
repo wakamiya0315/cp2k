@@ -14,6 +14,7 @@ MODULE qs_kpoint_state
    USE cp_cfm_diag,                     ONLY: cp_cfm_geeig,&
                                               cp_cfm_heevd
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+                                              cp_cfm_get_info,&
                                               cp_cfm_release,&
                                               cp_cfm_set_all,&
                                               cp_cfm_to_cfm,&
@@ -59,8 +60,8 @@ MODULE qs_kpoint_state
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_kpoint_state'
 
    PUBLIC :: qs_kpoint_copy_spin_mos, qs_kpoint_mos_initialized, qs_kpoint_set_fixed_occupations, &
-             qs_kpoint_state_canonicalize_fixed, qs_kpoint_state_commit, &
-             qs_kpoint_state_prepare_fixed_density
+             qs_kpoint_ritz_rotate_span, qs_kpoint_state_canonicalize_fixed, qs_kpoint_state_commit, &
+             qs_kpoint_state_prepare_fixed_density, qs_kpoint_state_ritz_span
 
 CONTAINS
 
@@ -233,6 +234,102 @@ CONTAINS
       END DO
 
    END SUBROUTINE qs_kpoint_state_canonicalize_fixed
+
+! **************************************************************************************************
+!> \brief Rotates orbitals to Ritz vectors of H within their span in the overlap metric.
+!>        Solves C^H H C V = C^H S C V e and replaces C by C V. The span of C is unchanged, the
+!>        rotated orbitals are S-orthonormal and e is returned in ascending order. Unlike a
+!>        diagonalization of H in the full basis, no direction outside span(C) enters.
+!> \param coeff orbitals (nao x nmo), replaced by the Ritz vectors
+!> \param matrix_h Hermitian Hamiltonian (nao x nao)
+!> \param matrix_s Hermitian positive definite overlap (nao x nao)
+!> \param ritz_values Ritz values, one per column of coeff
+! **************************************************************************************************
+   SUBROUTINE qs_kpoint_ritz_rotate_span(coeff, matrix_h, matrix_s, ritz_values)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: coeff, matrix_h, matrix_s
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: ritz_values
+
+      INTEGER                                            :: nao, nmo
+      TYPE(cp_cfm_type)                                  :: hblock, product, rotated, sblock, &
+                                                            vectors, work
+
+      CALL cp_cfm_get_info(coeff, nrow_global=nao, ncol_global=nmo)
+      CPASSERT(SIZE(ritz_values) == nmo)
+      CALL cp_cfm_create(product, coeff%matrix_struct, name="Ritz span product")
+      CALL cp_cfm_create(rotated, coeff%matrix_struct, name="Ritz span orbitals")
+      CALL cp_cfm_create(hblock, coeff%matrix_struct, nrow=nmo, ncol=nmo, name="Ritz span H")
+      CALL cp_cfm_create(sblock, coeff%matrix_struct, nrow=nmo, ncol=nmo, name="Ritz span S")
+      CALL cp_cfm_create(vectors, coeff%matrix_struct, nrow=nmo, ncol=nmo, name="Ritz span vectors")
+      CALL cp_cfm_create(work, coeff%matrix_struct, nrow=nmo, ncol=nmo, name="Ritz span work")
+
+      CALL parallel_gemm('N', 'N', nao, nmo, nao, z_one, matrix_h, coeff, z_zero, product)
+      CALL parallel_gemm('C', 'N', nmo, nmo, nao, z_one, coeff, product, z_zero, hblock)
+      CALL parallel_gemm('N', 'N', nao, nmo, nao, z_one, matrix_s, coeff, z_zero, product)
+      CALL parallel_gemm('C', 'N', nmo, nmo, nao, z_one, coeff, product, z_zero, sblock)
+      CALL cp_cfm_geeig(hblock, sblock, vectors, ritz_values, work)
+      CALL parallel_gemm('N', 'N', nao, nmo, nmo, z_one, coeff, vectors, z_zero, rotated)
+      CALL cp_cfm_to_cfm(rotated, coeff)
+
+      CALL cp_cfm_release(work)
+      CALL cp_cfm_release(vectors)
+      CALL cp_cfm_release(sblock)
+      CALL cp_cfm_release(hblock)
+      CALL cp_cfm_release(rotated)
+      CALL cp_cfm_release(product)
+
+   END SUBROUTINE qs_kpoint_ritz_rotate_span
+
+! **************************************************************************************************
+!> \brief Rotates all orbitals (occupied and added) of every local k-point channel to Ritz vectors
+!>        of the current Hamiltonian within their span and stores the Ritz values as MO energies.
+!>        Used at a k-point OT chart refresh with REFRESH_SUBSPACE_RITZ. H and S must first be
+!>        transferred to kp%ot_hmat and kp%ot_smat; occupations and density are reassigned
+!>        afterwards by qs_kpoint_state_commit.
+!> \param kpoints K-point environment containing the orbitals and transferred operators.
+! **************************************************************************************************
+   SUBROUTINE qs_kpoint_state_ritz_span(kpoints)
+      TYPE(kpoint_type), POINTER                         :: kpoints
+
+      INTEGER                                            :: ikpoint_local, ispin, nmo
+      LOGICAL                                            :: use_real_wfn
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
+      TYPE(cp_cfm_type)                                  :: matrix_h, matrix_s
+      TYPE(cp_cfm_type), POINTER                         :: cmo_coeff
+      TYPE(cp_fm_struct_type), POINTER                   :: square_struct
+      TYPE(kpoint_env_type), POINTER                     :: kp
+
+      NULLIFY (cmo_coeff, eigenvalues, kp, square_struct)
+      CPASSERT(ASSOCIATED(kpoints))
+      CPASSERT(ASSOCIATED(kpoints%kp_env))
+      CALL get_kpoint_info(kpoints, use_real_wfn=use_real_wfn)
+      IF (use_real_wfn) CPABORT("REFRESH_SUBSPACE_RITZ requires complex k-point wavefunctions.")
+
+      DO ikpoint_local = 1, SIZE(kpoints%kp_env)
+         kp => kpoints%kp_env(ikpoint_local)%kpoint_env
+         CPASSERT(ASSOCIATED(kp%mos))
+         CPASSERT(ASSOCIATED(kp%ot_hmat))
+         CPASSERT(ASSOCIATED(kp%ot_smat))
+         CPASSERT(SIZE(kp%ot_hmat, 1) >= 2)
+         CPASSERT(SIZE(kp%ot_hmat, 2) >= SIZE(kp%mos))
+         CPASSERT(SIZE(kp%ot_smat) >= 2)
+         CALL cp_fm_get_info(kp%ot_hmat(1, 1), matrix_struct=square_struct)
+         CALL cp_cfm_create(matrix_h, square_struct, name="Ritz refresh Hamiltonian")
+         CALL cp_cfm_create(matrix_s, square_struct, name="Ritz refresh overlap")
+         CALL cp_fm_to_cfm(kp%ot_smat(1), kp%ot_smat(2), matrix_s)
+         DO ispin = 1, SIZE(kp%mos)
+            CALL get_mo_set(kp%mos(ispin), cmo_coeff=cmo_coeff, nmo=nmo, eigenvalues=eigenvalues)
+            CPASSERT(ASSOCIATED(cmo_coeff))
+            CPASSERT(ASSOCIATED(eigenvalues))
+            CPASSERT(SIZE(eigenvalues) >= nmo)
+            CALL cp_fm_to_cfm(kp%ot_hmat(1, ispin), kp%ot_hmat(2, ispin), matrix_h)
+            IF (ALLOCATED(kpoints%lowdin_v)) CALL lowdin_kp_apply(kp, kpoints%lowdin_v(:, ispin), cmat=matrix_h)
+            CALL qs_kpoint_ritz_rotate_span(cmo_coeff, matrix_h, matrix_s, eigenvalues(1:nmo))
+         END DO
+         CALL cp_cfm_release(matrix_s)
+         CALL cp_cfm_release(matrix_h)
+      END DO
+
+   END SUBROUTINE qs_kpoint_state_ritz_span
 
 ! **************************************************************************************************
 !> \brief Rebuilds the physical density from the current k-point orbitals and occupations.

@@ -46,6 +46,7 @@ PROGRAM qs_ot_complex_ref_unittest
         ot_precond_solver_default, ot_precond_solver_direct, ot_precond_solver_inv_chol
    USE kinds,                           ONLY: dp
    USE kpoint_methods,                  ONLY: kpoint_ot_energy_weighted_density
+   USE qs_kpoint_state,                 ONLY: qs_kpoint_ritz_rotate_span
    USE machine,                         ONLY: default_output_unit
    USE mathlib,                         ONLY: diag_complex
    USE message_passing,                 ONLY: mp_comm_self,&
@@ -73,8 +74,11 @@ PROGRAM qs_ot_complex_ref_unittest
         qs_ot_fixed_n_energy_hessian, qs_ot_fixed_n_multigroup_schur_block, &
         qs_ot_fixed_n_projector_frechet, qs_ot_fixed_n_schur_block, qs_ot_generate_rotation, &
         qs_ot_get_derivative_complex, qs_ot_get_derivative_ref_complex, &
-        qs_ot_get_orbitals_ref_complex, qs_ot_get_p_complex, qs_ot_projected_response_update, &
-        qs_ot_rot_mat_derivative, qs_ot_symmetric_abs_solve, qs_ot_symmetric_sr1_update
+        qs_ot_get_orbitals_ref_complex, qs_ot_get_p_complex, qs_ot_project_complex_tangent, &
+        qs_ot_projected_response_update, qs_ot_rot_mat_derivative, qs_ot_symmetric_abs_solve, &
+        qs_ot_symmetric_sr1_update
+   USE qs_ot_minimizer,                 ONLY: do_line_search_3pnt,&
+                                              ot_project_strict_direction
    USE qs_ot_types,                     ONLY: qs_ot_kpoint_preconditioner_scale,&
                                               qs_ot_kpoint_preconditioner_solver_supported,&
                                               qs_ot_kpoint_preconditioner_supported,&
@@ -140,6 +144,7 @@ PROGRAM qs_ot_complex_ref_unittest
    CALL test_complex_preconditioner_gauge(para_env, nfail)
    CALL test_complex_occupation_block_preconditioner(para_env, nfail)
    CALL test_kpoint_ot_energy_weighted_density(para_env, io_unit, nfail)
+   CALL test_ritz_span_rotation(para_env, io_unit, nfail)
 
    x(:, 1) = [CMPLX(1.10_dp, 0.10_dp, KIND=dp), CMPLX(0.20_dp, -0.30_dp, KIND=dp), &
               CMPLX(-0.10_dp, 0.20_dp, KIND=dp)]
@@ -177,6 +182,8 @@ PROGRAM qs_ot_complex_ref_unittest
    CALL dbcsr_distribution_new(dist_kk, group=mp_comm_self%get_handle(), pgrid=pgrid, &
                                row_dist=row_dist, col_dist=col_dist)
    CALL test_complex_strict_derivative(dist_nk, dist_kk, row_n, row_k, col_k, para_env, nfail)
+   CALL test_mermin_line_search_rollback(dist_nk, dist_kk, row_n, row_k, col_k, nfail)
+   CALL test_strict_direction_projection(dist_nk, dist_kk, row_n, row_k, col_k, io_unit, nfail)
 
    CALL create_one_block(x_re, "complex_ref_x_re", dist_nk, row_n, col_k)
    CALL create_one_block(x_im, "complex_ref_x_im", dist_nk, row_n, col_k)
@@ -273,6 +280,385 @@ PROGRAM qs_ot_complex_ref_unittest
 CONTAINS
 
 ! **************************************************************************************************
+!> \brief Exercise actual search/take_step rejection on every complex product block.
+!> \param dist_nk Orbital matrix distribution.
+!> \param dist_kk Rotation matrix distribution.
+!> \param row_n Orbital row block size.
+!> \param row_k Rotation row block size.
+!> \param col_k Product column block size.
+!> \param nfail Failure count.
+! **************************************************************************************************
+   SUBROUTINE test_mermin_line_search_rollback(dist_nk, dist_kk, row_n, row_k, col_k, nfail)
+      TYPE(dbcsr_distribution_type), INTENT(IN)          :: dist_nk, dist_kk
+      INTEGER, DIMENSION(:), POINTER, INTENT(INOUT)      :: row_n, row_k, col_k
+      INTEGER, INTENT(INOUT)                             :: nfail
+
+      COMPLEX(KIND=dp), DIMENSION(n, k, 2)               :: actual_c, actual_x, base_x, dx, expected_c
+      COMPLEX(KIND=dp), DIMENSION(k, k, 2)               :: actual_a, base_a, da
+      COMPLEX(KIND=dp), DIMENSION(n, n)                  :: actual_p, expected_p
+      INTEGER                                            :: channel, component, nsample, sample, &
+                                                            scenario
+      REAL(KIND=dp)                                      :: actual_kts, actual_state_f, expected_kts, &
+                                                            expected_state_f, position
+      REAL(KIND=dp), DIMENSION(4)                       :: actual_f, actual_labels, base_labels, &
+                                                            de, expected_f
+      REAL(KIND=dp), DIMENSION(4), PARAMETER             :: energy_samples = &
+                                                            [-2.0_dp, -2.03_dp, -2.04_dp, -1.9_dp]
+      TYPE(dbcsr_type), TARGET                           :: coordinate(2, 2), direction(2, 2), &
+                                                            rotation(2, 2), rotation_direction(2, 2)
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: search
+
+      ALLOCATE (search(2))
+      base_x(:, 1, 1) = [CMPLX(1.0_dp, 0.1_dp, dp), CMPLX(0.1_dp, -0.2_dp, dp), &
+                         CMPLX(0.2_dp, 0.1_dp, dp)]
+      base_x(:, 2, 1) = [CMPLX(0.1_dp, 0.2_dp, dp), CMPLX(1.0_dp, 0.1_dp, dp), &
+                         CMPLX(-0.1_dp, 0.2_dp, dp)]
+      base_x(:, :, 2) = CONJG(base_x(:, :, 1))
+      dx = 0.2_dp*CONJG(base_x)
+      base_a = CMPLX(0.0_dp, 0.0_dp, dp)
+      base_a(1, 2, :) = CMPLX(0.02_dp, 0.03_dp, dp)
+      base_a(2, 1, :) = -CONJG(base_a(1, 2, :))
+      da = 2.0_dp*base_a
+      base_labels = [-0.2_dp, 0.1_dp, -0.1_dp, 0.15_dp]
+      de = [0.1_dp, -0.08_dp, 0.06_dp, -0.12_dp]
+      DO channel = 1, 2
+         DO component = 1, 2
+            CALL create_one_block(coordinate(component, channel), 'search_coordinate', dist_nk, row_n, col_k)
+            CALL create_one_block(direction(component, channel), 'search_direction', dist_nk, row_n, col_k)
+            CALL create_one_block(rotation(component, channel), 'search_rotation', dist_kk, row_k, col_k)
+            CALL create_one_block(rotation_direction(component, channel), 'search_rotation_direction', &
+                                   dist_kk, row_k, col_k)
+         END DO
+         search(channel)%settings%ks = .TRUE.
+         search(channel)%settings%do_ener = .TRUE.
+         search(channel)%settings%do_rotation = .TRUE.
+         search(channel)%settings%occupation_preconditioner = .TRUE.
+         search(channel)%has_complex_kpoint_state = .TRUE.
+         search(channel)%use_dx = .TRUE.
+         search(channel)%matrix_x => coordinate(1, channel)
+         search(channel)%matrix_x_im => coordinate(2, channel)
+         search(channel)%matrix_dx => direction(1, channel)
+         search(channel)%matrix_dx_im => direction(2, channel)
+         search(channel)%rot_mat_x => rotation(1, channel)
+         search(channel)%rot_mat_x_im => rotation(2, channel)
+         search(channel)%rot_mat_dx => rotation_direction(1, channel)
+         search(channel)%rot_mat_dx_im => rotation_direction(2, channel)
+         ALLOCATE (search(channel)%ener_x(k), search(channel)%ener_dx(k))
+         search(channel)%ener_dx = de((channel - 1)*k + 1:channel*k)
+         CALL put_complex_pair(direction(1, channel), direction(2, channel), dx(:, :, channel))
+         CALL put_complex_pair(rotation_direction(1, channel), rotation_direction(2, channel), da(:, :, channel))
+      END DO
+
+      DO scenario = 1, 4
+         search(1)%line_search_count = 0
+         search(1)%ds_min = 0.15_dp
+         DO channel = 1, 2
+            ! Scenario 3 keeps the Mermin preconditioner with the actual-F check at its
+            ! default (off), which must leave the upstream three-point search unchanged.
+            search(channel)%settings%check_interpolated_energy = scenario /= 3
+            CALL put_complex_pair(coordinate(1, channel), coordinate(2, channel), base_x(:, :, channel))
+            CALL put_complex_pair(rotation(1, channel), rotation(2, channel), base_a(:, :, channel))
+            search(channel)%ener_x = base_labels((channel - 1)*k + 1:channel*k)
+         END DO
+         nsample = MERGE(3, 4, scenario == 3)
+         ! Scenario 4 stays uphill through the 12-evaluation bound and must return to the origin.
+         IF (scenario == 4) nsample = 12
+         DO sample = 1, nsample
+            IF (scenario /= 2 .AND. scenario /= 4) THEN
+               ! The actual fourth-point F is above two already evaluated lower samples.
+               search(1)%etotal = energy_samples(sample)
+            ELSE
+               ! No positive sample lowers actual F; retain the direction and backtrack.
+               search(1)%etotal = -2.0_dp + 0.01_dp*REAL(sample - 1, dp)
+            END IF
+            CALL do_line_search_3pnt(search)
+            IF (sample == 3) THEN
+               IF (scenario == 3) THEN
+                  ! Without the check the three-point path keeps its original gradient request.
+                  IF (search(1)%energy_only .OR. .NOT. search(1)%line_search_might_be_done) nfail = nfail + 1
+               ELSE
+                  IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done) nfail = nfail + 1
+               END IF
+            END IF
+         END DO
+         IF (scenario == 1) THEN
+            position = search(1)%ot_pos(3)
+            IF (ABS(search(1)%ot_pos(5) - position) > 1.0E-14_dp) nfail = nfail + 1
+         ELSE IF (scenario == 2) THEN
+            position = 0.03_dp
+            IF (.NOT. search(1)%energy_only .OR. search(1)%line_search_might_be_done .OR. &
+                ABS(search(1)%ot_pos(5) - position) > 1.0E-14_dp) nfail = nfail + 1
+            search(1)%etotal = -2.001_dp
+            CALL do_line_search_3pnt(search)
+         ELSE IF (scenario == 4) THEN
+            ! Back at the evaluated origin with a full-gradient request and no abort; the next
+            ! search starts again from the initial step, not from a zero step.
+            position = 0.0_dp
+            IF (ABS(search(1)%ds_min - 0.15_dp) > 1.0E-14_dp) nfail = nfail + 1
+         ELSE
+            position = search(1)%ot_pos(4)
+         END IF
+         IF (search(1)%energy_only .OR. .NOT. search(1)%line_search_might_be_done) nfail = nfail + 1
+         DO channel = 1, 2
+            CALL get_complex_pair(coordinate(1, channel), coordinate(2, channel), actual_x(:, :, channel))
+            CALL get_complex_pair(rotation(1, channel), rotation(2, channel), actual_a(:, :, channel))
+            actual_labels((channel - 1)*k + 1:channel*k) = search(channel)%ener_x
+         END DO
+         IF (MAXVAL(ABS(actual_x - base_x - position*dx)) > 1.0E-13_dp .OR. &
+             MAXVAL(ABS(actual_a - base_a - position*da)) > 1.0E-13_dp .OR. &
+             MAXVAL(ABS(actual_labels - base_labels - position*de)) > 1.0E-13_dp) nfail = nfail + 1
+         CALL mermin_test_state(actual_x, actual_a, actual_labels, actual_c, actual_f, actual_p, actual_kts)
+         CALL mermin_test_state(base_x + position*dx, base_a + position*da, base_labels + position*de, &
+                                 expected_c, expected_f, expected_p, expected_kts)
+         ! Recompute a nonlinear density functional plus entropy at the restored state.
+         actual_state_f = REAL(actual_p(1, 1) + 2.0_dp*actual_p(2, 2) + 3.0_dp*actual_p(3, 3) + &
+                               0.25_dp*SUM(CONJG(actual_p)*actual_p), dp) + actual_kts
+         expected_state_f = REAL(expected_p(1, 1) + 2.0_dp*expected_p(2, 2) + 3.0_dp*expected_p(3, 3) + &
+                                 0.25_dp*SUM(CONJG(expected_p)*expected_p), dp) + expected_kts
+         IF (MAXVAL(ABS(actual_c - expected_c)) > 1.0E-12_dp .OR. &
+             MAXVAL(ABS(actual_f - expected_f)) > 1.0E-12_dp .OR. &
+             ABS(DOT_PRODUCT([0.4_dp, 0.4_dp, 0.6_dp, 0.6_dp], actual_f) - 1.7_dp) > 1.0E-12_dp .OR. &
+             MAXVAL(ABS(actual_p - expected_p)) > 1.0E-12_dp .OR. &
+             ABS(actual_kts - expected_kts) > 1.0E-13_dp .OR. &
+             ABS(actual_state_f - expected_state_f) > 1.0E-12_dp) nfail = nfail + 1
+      END DO
+
+      DO channel = 1, 2
+         DEALLOCATE (search(channel)%ener_x, search(channel)%ener_dx)
+         DO component = 1, 2
+            CALL dbcsr_release(coordinate(component, channel))
+            CALL dbcsr_release(direction(component, channel))
+            CALL dbcsr_release(rotation(component, channel))
+            CALL dbcsr_release(rotation_direction(component, channel))
+         END DO
+      END DO
+      DEALLOCATE (search)
+
+   END SUBROUTINE test_mermin_line_search_rollback
+
+! **************************************************************************************************
+!> \brief R05: explicit STRICT tangent projection of a search direction, its slope and fallback.
+!> \param dist_nk Orbital matrix distribution.
+!> \param dist_kk k-by-k matrix distribution.
+!> \param row_n Orbital row block size.
+!> \param row_k k-by-k row block size.
+!> \param col_k Column block size.
+!> \param io_unit Output unit.
+!> \param nfail Failure count.
+! **************************************************************************************************
+   SUBROUTINE test_strict_direction_projection(dist_nk, dist_kk, row_n, row_k, col_k, io_unit, nfail)
+      TYPE(dbcsr_distribution_type), INTENT(IN)          :: dist_nk, dist_kk
+      INTEGER, DIMENSION(:), INTENT(INOUT), POINTER      :: row_n, row_k, col_k
+      INTEGER, INTENT(IN)                                :: io_unit
+      INTEGER, INTENT(INOUT)                             :: nfail
+
+      CHARACTER(LEN=32)                                  :: name
+      COMPLEX(KIND=dp), DIMENSION(k, k)                  :: identity, inverse_sqrt, normal
+      COMPLEX(KIND=dp), DIMENSION(n, k)                  :: actual, c0, c0_after, contaminated, &
+                                                            expected, gradient, orbitals, tangent, x
+      COMPLEX(KIND=dp), DIMENSION(n, n)                  :: overlap
+      INTEGER                                            :: i
+      REAL(KIND=dp)                                      :: after, before, contaminated_error, &
+                                                            dense_before, projected_error, slope
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+      TYPE(dbcsr_type), DIMENSION(10), TARGET            :: nk
+      TYPE(dbcsr_type), DIMENSION(4), TARGET             :: kk
+      TYPE(mp_para_env_type), POINTER                    :: strict_para_env
+      TYPE(qs_ot_type), DIMENSION(:), POINTER            :: search
+
+      NULLIFY (blacs_env, strict_para_env, search)
+      ALLOCATE (strict_para_env)
+      CALL strict_para_env%from_dup(mp_comm_self)
+      CALL cp_blacs_env_create(blacs_env=blacs_env, para_env=strict_para_env)
+      DO i = 1, SIZE(nk)
+         WRITE (name, '(A,I0)') 'strict_projection_nk_', i
+         CALL create_one_block(nk(i), TRIM(name), dist_nk, row_n, col_k)
+      END DO
+      DO i = 1, SIZE(kk)
+         WRITE (name, '(A,I0)') 'strict_projection_kk_', i
+         CALL create_one_block(kk(i), TRIM(name), dist_kk, row_k, col_k)
+      END DO
+
+      ! Nontrivial complex overlap and S-orthonormal reference orbitals.
+      overlap(:, :) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      overlap(1, 1) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+      overlap(2, 2) = CMPLX(1.2_dp, 0.0_dp, KIND=dp)
+      overlap(3, 3) = CMPLX(1.4_dp, 0.0_dp, KIND=dp)
+      overlap(1, 2) = CMPLX(0.06_dp, 0.03_dp, KIND=dp)
+      overlap(2, 1) = CONJG(overlap(1, 2))
+      overlap(1, 3) = CMPLX(-0.04_dp, 0.02_dp, KIND=dp)
+      overlap(3, 1) = CONJG(overlap(1, 3))
+      overlap(2, 3) = CMPLX(0.05_dp, -0.01_dp, KIND=dp)
+      overlap(3, 2) = CONJG(overlap(2, 3))
+      c0(:, 1) = [CMPLX(1.0_dp, 0.10_dp, KIND=dp), CMPLX(0.12_dp, -0.08_dp, KIND=dp), &
+                  CMPLX(-0.07_dp, 0.04_dp, KIND=dp)]
+      c0(:, 2) = [CMPLX(0.09_dp, 0.05_dp, KIND=dp), CMPLX(0.85_dp, -0.12_dp, KIND=dp), &
+                  CMPLX(0.11_dp, 0.06_dp, KIND=dp)]
+      CALL dense_inverse_sqrt(MATMUL(CONJG(TRANSPOSE(c0)), MATMUL(overlap, c0)), inverse_sqrt)
+      c0 = MATMUL(c0, inverse_sqrt)
+      identity(:, :) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      DO i = 1, k
+         identity(i, i) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+      END DO
+
+      ! A tangent coordinate, a tangent direction and a deliberate normal contamination C0*M.
+      x(:, :) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      x(3, 1) = CMPLX(0.23_dp, 0.17_dp, KIND=dp)
+      x(3, 2) = CMPLX(-0.14_dp, 0.21_dp, KIND=dp)
+      x = x - MATMUL(c0, MATMUL(CONJG(TRANSPOSE(c0)), MATMUL(overlap, x)))
+      tangent(:, :) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+      tangent(3, 1) = CMPLX(0.11_dp, -0.09_dp, KIND=dp)
+      tangent(3, 2) = CMPLX(0.07_dp, 0.13_dp, KIND=dp)
+      tangent(1, 2) = CMPLX(-0.02_dp, 0.05_dp, KIND=dp)
+      tangent = tangent - MATMUL(c0, MATMUL(CONJG(TRANSPOSE(c0)), MATMUL(overlap, tangent)))
+      normal(1, 1) = CMPLX(0.03_dp, -0.02_dp, KIND=dp)
+      normal(2, 1) = CMPLX(0.01_dp, 0.04_dp, KIND=dp)
+      normal(1, 2) = CMPLX(-0.05_dp, 0.01_dp, KIND=dp)
+      normal(2, 2) = CMPLX(0.02_dp, 0.02_dp, KIND=dp)
+      contaminated = tangent + MATMUL(c0, normal)
+
+      ALLOCATE (search(1))
+      search(1)%has_complex_kpoint_state = .TRUE.
+      search(1)%settings%ot_algorithm = 'TOD'
+      search(1)%settings%ks = .TRUE.
+      search(1)%settings%occupation_preconditioner = .TRUE.
+      search(1)%settings%project_strict_direction = .TRUE.
+      search(1)%settings%do_rotation = .FALSE.
+      search(1)%settings%do_ener = .FALSE.
+      search(1)%para_env => strict_para_env
+      search(1)%blacs_env => blacs_env
+      search(1)%matrix_x => nk(1)
+      search(1)%matrix_x_im => nk(2)
+      search(1)%matrix_dx => nk(3)
+      search(1)%matrix_dx_im => nk(4)
+      search(1)%matrix_gx => nk(5)
+      search(1)%matrix_gx_im => nk(6)
+      search(1)%matrix_c0 => nk(7)
+      search(1)%matrix_c0_im => nk(8)
+      search(1)%matrix_sc0 => nk(9)
+      search(1)%matrix_sc0_im => nk(10)
+      search(1)%matrix_os => kk(1)
+      search(1)%matrix_os_im => kk(2)
+      search(1)%matrix_buf1_ortho => kk(3)
+      search(1)%matrix_buf1_ortho_im => kk(4)
+      CALL put_complex_pair(nk(1), nk(2), x)
+      CALL put_complex_pair(nk(7), nk(8), c0)
+      CALL put_complex_pair(nk(9), nk(10), MATMUL(overlap, c0))
+
+      ! 1. A downhill direction is projected; its slope is recomputed and no fallback occurs.
+      gradient = -1.3_dp*tangent + MATMUL(c0, normal)
+      CALL put_complex_pair(nk(3), nk(4), contaminated)
+      CALL put_complex_pair(nk(5), nk(6), gradient)
+      search(1)%gradient = 1.0_dp
+      CALL ot_project_strict_direction(search)
+      CALL get_complex_pair(nk(3), nk(4), actual)
+      expected = contaminated - MATMUL(c0, MATMUL(CONJG(TRANSPOSE(c0)), MATMUL(overlap, contaminated)))
+      slope = REAL(SUM(CONJG(gradient)*expected), KIND=dp)
+      CALL get_complex_pair(nk(7), nk(8), c0_after)
+      IF (MAXVAL(ABS(actual - expected)) > 1.0E-13_dp .OR. &
+          MAXVAL(ABS(MATMUL(CONJG(TRANSPOSE(c0)), MATMUL(overlap, actual)))) > 1.0E-13_dp .OR. &
+          ABS(search(1)%gradient - slope) > 1.0E-13_dp .OR. slope >= 0.0_dp .OR. &
+          search(1)%OT_METHOD_FULL == "OT P-SD" .OR. &
+          MAXVAL(ABS(c0_after - c0)) > 0.0_dp) nfail = nfail + 1
+
+      ! The finite STRICT orbitals stay S-orthonormal along the projected direction only.
+      CALL strict_orbitals(c0, x + 0.3_dp*actual, overlap, orbitals)
+      projected_error = MAXVAL(ABS(MATMUL(CONJG(TRANSPOSE(orbitals)), MATMUL(overlap, orbitals)) - identity))
+      CALL strict_orbitals(c0, x + 0.3_dp*contaminated, overlap, orbitals)
+      contaminated_error = MAXVAL(ABS(MATMUL(CONJG(TRANSPOSE(orbitals)), MATMUL(overlap, orbitals)) - &
+                                      identity))
+      IF (projected_error > 1.0E-13_dp .OR. contaminated_error < 1.0E-4_dp) nfail = nfail + 1
+
+      ! 2. An uphill direction falls back to the projected negative gradient and restarts history.
+      gradient = 0.8_dp*tangent + MATMUL(c0, normal)
+      CALL put_complex_pair(nk(3), nk(4), gradient)
+      CALL put_complex_pair(nk(5), nk(6), gradient)
+      search(1)%diis_iter = 5
+      CALL ot_project_strict_direction(search)
+      CALL get_complex_pair(nk(3), nk(4), actual)
+      expected = -(gradient - MATMUL(c0, MATMUL(CONJG(TRANSPOSE(c0)), MATMUL(overlap, gradient))))
+      slope = REAL(SUM(CONJG(gradient)*expected), KIND=dp)
+      IF (MAXVAL(ABS(actual - expected)) > 1.0E-13_dp .OR. slope >= 0.0_dp .OR. &
+          ABS(search(1)%gradient - slope) > 1.0E-13_dp .OR. &
+          search(1)%OT_METHOD_FULL /= "OT P-SD" .OR. search(1)%diis_iter /= 1) nfail = nfail + 1
+
+      ! 3. Switched off (the default), the direction and its slope are left as they are.
+      search(1)%settings%project_strict_direction = .FALSE.
+      CALL put_complex_pair(nk(3), nk(4), contaminated)
+      search(1)%gradient = 1.0_dp
+      CALL ot_project_strict_direction(search)
+      CALL get_complex_pair(nk(3), nk(4), actual)
+      IF (MAXVAL(ABS(actual - contaminated)) > 0.0_dp .OR. search(1)%gradient /= 1.0_dp) nfail = nfail + 1
+
+      ! 4. The channel routine reports the contamination before and after.
+      CALL put_complex_pair(nk(3), nk(4), contaminated)
+      CALL qs_ot_project_complex_tangent(search(1), before, after)
+      dense_before = SQRT(SUM(ABS(MATMUL(CONJG(TRANSPOSE(c0)), MATMUL(overlap, contaminated)))**2))
+      IF (ABS(before - dense_before) > 1.0E-13_dp .OR. after > 1.0E-13_dp) nfail = nfail + 1
+
+      IF (io_unit > 0) THEN
+         WRITE (io_unit, '(A,4(1X,ES13.6))') &
+            "STRICT direction projection |C0^H S D| before/after, C^H S C error projected/contaminated", &
+            before, after, projected_error, contaminated_error
+      END IF
+
+      DEALLOCATE (search)
+      DO i = 1, SIZE(kk)
+         CALL dbcsr_release(kk(i))
+      END DO
+      DO i = 1, SIZE(nk)
+         CALL dbcsr_release(nk(i))
+      END DO
+      CALL cp_blacs_env_release(blacs_env)
+      CALL mp_para_env_release(strict_para_env)
+
+   END SUBROUTINE test_strict_direction_projection
+
+! **************************************************************************************************
+!> \brief Independent dense C/f/P/entropy reconstruction for the rollback regression.
+!> \param coordinate Orbital coordinates.
+!> \param generator Rotation generators.
+!> \param labels Fixed-N auxiliary labels.
+!> \param c Physical orbitals.
+!> \param occupation Physical occupations.
+!> \param density Weighted density.
+!> \param kts Negative entropy contribution.
+! **************************************************************************************************
+   SUBROUTINE mermin_test_state(coordinate, generator, labels, c, occupation, density, kts)
+      COMPLEX(KIND=dp), DIMENSION(n, k, 2), INTENT(IN)    :: coordinate
+      COMPLEX(KIND=dp), DIMENSION(k, k, 2), INTENT(IN)    :: generator
+      REAL(KIND=dp), DIMENSION(4), INTENT(IN)             :: labels
+      COMPLEX(KIND=dp), DIMENSION(n, k, 2), INTENT(OUT)   :: c
+      REAL(KIND=dp), DIMENSION(4), INTENT(OUT)            :: occupation
+      COMPLEX(KIND=dp), DIMENSION(n, n), INTENT(OUT)      :: density
+      REAL(KIND=dp), INTENT(OUT)                         :: kts
+
+      COMPLEX(KIND=dp), DIMENSION(k, k)                  :: inverse_sqrt
+      INTEGER                                            :: channel, orbital, offset
+      REAL(KIND=dp)                                      :: mu, probability
+      REAL(KIND=dp), DIMENSION(4), PARAMETER             :: weights = [0.4_dp, 0.4_dp, 0.6_dp, 0.6_dp]
+
+      CALL fixed_n_fermi_occupations(labels, weights, 1.7_dp, 0.12_dp, 2.0_dp, occupation, mu)
+      density = CMPLX(0.0_dp, 0.0_dp, dp)
+      kts = 0.0_dp
+      DO channel = 1, 2
+         CALL dense_inverse_sqrt(MATMUL(CONJG(TRANSPOSE(coordinate(:, :, channel))), &
+                                        coordinate(:, :, channel)), inverse_sqrt)
+         c(:, :, channel) = MATMUL(MATMUL(coordinate(:, :, channel), inverse_sqrt), &
+                                     dense_antihermitian_exp(generator(:, :, channel)))
+         DO orbital = 1, k
+            offset = (channel - 1)*k + orbital
+            density = density + weights(offset)*occupation(offset)* &
+                      MATMUL(RESHAPE(c(:, orbital, channel), [n, 1]), &
+                             RESHAPE(CONJG(c(:, orbital, channel)), [1, n]))
+            probability = occupation(offset)/2.0_dp
+            kts = kts + weights(offset)*0.12_dp*2.0_dp* &
+                  (probability*LOG(probability) + (1.0_dp - probability)*LOG(1.0_dp - probability))
+         END DO
+      END DO
+   END SUBROUTINE mermin_test_state
+
+! **************************************************************************************************
 !> \brief Check split-complex full-matrix multiplication including adjoints.
 !> \param para_env parallel environment
 !> \param io_unit output unit
@@ -353,6 +739,95 @@ CONTAINS
       CALL cp_blacs_env_release(blacs_env)
 
    END SUBROUTINE test_split_complex_fm_gemm
+
+! **************************************************************************************************
+!> \brief R06: Ritz rotation of non-orthonormal orbitals within their span in the overlap metric.
+!> \param para_env Parallel environment.
+!> \param io_unit Output unit.
+!> \param nfail Failure count.
+! **************************************************************************************************
+   SUBROUTINE test_ritz_span_rotation(para_env, io_unit, nfail)
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      INTEGER, INTENT(IN)                                :: io_unit
+      INTEGER, INTENT(INOUT)                             :: nfail
+
+      INTEGER, PARAMETER                                 :: nao = 4, nmo = 3
+
+      COMPLEX(KIND=dp), DIMENSION(nao, nao)              :: hamiltonian, overlap, projector_new, &
+                                                            projector_old
+      COMPLEX(KIND=dp), DIMENSION(nao, nmo)              :: orbitals, rotated
+      COMPLEX(KIND=dp), DIMENSION(nmo, nmo)              :: gram_inverse, inverse_sqrt, projected
+      INTEGER                                            :: i, j
+      REAL(KIND=dp)                                      :: error_h, error_order, error_s, error_span
+      REAL(KIND=dp), DIMENSION(nmo)                      :: ritz_values
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+      TYPE(cp_cfm_type)                                  :: coeff, matrix_h, matrix_s
+      TYPE(cp_fm_struct_type), POINTER                   :: struct_nn, struct_nm
+
+      NULLIFY (blacs_env, struct_nn, struct_nm)
+      DO j = 1, nao
+         DO i = 1, nao
+            overlap(i, j) = CMPLX(0.03_dp*(i + j), 0.02_dp*(i - j), KIND=dp)
+            hamiltonian(i, j) = CMPLX(0.11_dp*i*j - 0.2_dp, 0.05_dp*(i - j), KIND=dp)
+         END DO
+         overlap(j, j) = CMPLX(1.0_dp + 0.1_dp*j, 0.0_dp, KIND=dp)
+         hamiltonian(j, j) = CMPLX(-0.5_dp + 0.4_dp*j, 0.0_dp, KIND=dp)
+      END DO
+      DO j = 1, nmo
+         DO i = 1, nao
+            orbitals(i, j) = CMPLX(0.2_dp*i - 0.1_dp*j + MERGE(1.0_dp, 0.0_dp, i == j), &
+                                   0.07_dp*i*j - 0.03_dp, KIND=dp)
+         END DO
+      END DO
+
+      CALL cp_blacs_env_create(blacs_env=blacs_env, para_env=para_env)
+      CALL cp_fm_struct_create(struct_nn, nrow_global=nao, ncol_global=nao, &
+                               context=blacs_env, para_env=para_env)
+      CALL cp_fm_struct_create(struct_nm, nrow_global=nao, ncol_global=nmo, &
+                               context=blacs_env, para_env=para_env)
+      CALL cp_cfm_create(matrix_h, struct_nn)
+      CALL cp_cfm_create(matrix_s, struct_nn)
+      CALL cp_cfm_create(coeff, struct_nm)
+      CALL cp_cfm_set_submatrix(matrix_h, hamiltonian)
+      CALL cp_cfm_set_submatrix(matrix_s, overlap)
+      CALL cp_cfm_set_submatrix(coeff, orbitals)
+
+      CALL qs_kpoint_ritz_rotate_span(coeff, matrix_h, matrix_s, ritz_values)
+      CALL cp_cfm_get_submatrix(coeff, rotated)
+
+      ! S-orthonormal Ritz vectors, diagonal projected H with ascending values, same span.
+      projected = MATMUL(CONJG(TRANSPOSE(rotated)), MATMUL(overlap, rotated))
+      error_s = 0.0_dp
+      DO i = 1, nmo
+         projected(i, i) = projected(i, i) - 1.0_dp
+      END DO
+      error_s = MAXVAL(ABS(projected))
+      projected = MATMUL(CONJG(TRANSPOSE(rotated)), MATMUL(hamiltonian, rotated))
+      DO i = 1, nmo
+         projected(i, i) = projected(i, i) - ritz_values(i)
+      END DO
+      error_h = MAXVAL(ABS(projected))
+      error_order = 0.0_dp
+      DO i = 2, nmo
+         error_order = MAX(error_order, ritz_values(i - 1) - ritz_values(i))
+      END DO
+      CALL dense_inverse_sqrt(MATMUL(CONJG(TRANSPOSE(orbitals)), MATMUL(overlap, orbitals)), inverse_sqrt)
+      gram_inverse = MATMUL(inverse_sqrt, inverse_sqrt)
+      projector_old = MATMUL(orbitals, MATMUL(gram_inverse, CONJG(TRANSPOSE(orbitals))))
+      projector_new = MATMUL(rotated, CONJG(TRANSPOSE(rotated)))
+      error_span = MAXVAL(ABS(projector_new - projector_old))
+      IF (MAX(error_s, error_h, error_span) > 1.0E-12_dp .OR. error_order > 0.0_dp) nfail = nfail + 1
+      IF (io_unit >= 0) WRITE (io_unit, '(A,3(1X,ES13.6))') &
+         'Ritz span rotation S-orthonormality/projected-H/span errors:', error_s, error_h, error_span
+
+      CALL cp_cfm_release(coeff)
+      CALL cp_cfm_release(matrix_s)
+      CALL cp_cfm_release(matrix_h)
+      CALL cp_fm_struct_release(struct_nm)
+      CALL cp_fm_struct_release(struct_nn)
+      CALL cp_blacs_env_release(blacs_env)
+
+   END SUBROUTINE test_ritz_span_rotation
 
 ! **************************************************************************************************
 !> \brief Check the noncanonical complex OT energy-weighted density and its gauge covariance.
