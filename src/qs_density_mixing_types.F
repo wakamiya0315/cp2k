@@ -115,6 +115,13 @@ MODULE qs_density_mixing_types
       ! the spin density matrix, which then shares the coefficients)
       LOGICAL                                           :: dm_pulay = .FALSE.
       LOGICAL :: dm_trial_diagnostics = .FALSE., dm_trial_reject = .FALSE., dm_trial_fallback = .FALSE.
+      LOGICAL :: dm_trial_free_energy = .FALSE., dm_trial_free_validate = .FALSE.
+      LOGICAL :: dm_trial_free_precision_compare = .FALSE.
+      REAL(KIND=dp) :: dm_trial_free_f_slack = 0.0_dp
+      INTEGER :: dm_trial_free_backtracks = 12, dm_trial_free_evaluations = 0
+      INTEGER :: dm_trial_free_diag_level = 0
+      CHARACTER(LEN=default_path_length) :: dm_trial_free_diag_file = ""
+      REAL(KIND=dp) :: dm_trial_f_input = 0.0_dp, dm_trial_eks_input = 0.0_dp, dm_trial_raw_kts = 0.0_dp
       REAL(KIND=dp) :: dm_trial_occ_tol = 1.0E-6_dp, dm_trial_charge_tol = 1.0E-6_dp, dm_trial_step_limit = 0.0_dp
       ! Full Bloch companion: the same affine Pulay candidate, before real-space truncation.
       ! Allocated only for opt-in one-rank diagnostics; never Fourier-invert a density as an operator.
@@ -138,6 +145,8 @@ MODULE qs_density_mixing_types
       CLASS(mixer_type), ALLOCATABLE                    :: tb_scc_mixer
 #endif
    END TYPE mixing_storage_type
+
+   PUBLIC :: mixing_free_energy_active
 
 CONTAINS
 
@@ -243,7 +252,37 @@ CONTAINS
       END IF
       CALL section_vals_val_get(mixing_section, "PULAY_P_DIAGNOSTICS", l_val=mixing_store%dm_trial_diagnostics)
       CALL section_vals_val_get(mixing_section, "PULAY_P_REJECT", l_val=mixing_store%dm_trial_reject)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_ENERGY", l_val=mixing_store%dm_trial_free_energy)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_VALIDATE", l_val=mixing_store%dm_trial_free_validate)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_BACKTRACKS", i_val=mixing_store%dm_trial_free_backtracks)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_DIAGNOSTICS", i_val=mixing_store%dm_trial_free_diag_level)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_DIAG_FILE", c_val=mixing_store%dm_trial_free_diag_file)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_PRECISION_COMPARE", &
+                                l_val=mixing_store%dm_trial_free_precision_compare)
+      CALL section_vals_val_get(mixing_section, "PULAY_P_FREE_F_SLACK", r_val=mixing_store%dm_trial_free_f_slack)
+      IF (mixing_store%dm_trial_free_f_slack < 0.0_dp) &
+         CALL cp_abort(__LOCATION__, "PULAY_P_FREE_F_SLACK must not be negative")
+      IF (mixing_store%dm_trial_free_f_slack > 0.0_dp .AND. .NOT. mixing_store%dm_trial_free_energy) &
+         CALL cp_abort(__LOCATION__, "PULAY_P_FREE_F_SLACK requires PULAY_P_FREE_ENERGY")
+      IF (mixing_store%dm_trial_free_precision_compare .AND. .NOT. mixing_store%dm_trial_free_validate) &
+         CALL cp_abort(__LOCATION__, "PULAY_P_FREE_PRECISION_COMPARE requires PULAY_P_FREE_VALIDATE")
+      IF (mixing_store%dm_trial_free_diag_level > 0) THEN
+         IF (.NOT. mixing_store%dm_trial_free_validate .OR. &
+             LEN_TRIM(mixing_store%dm_trial_free_diag_file) == 0) &
+            CALL cp_abort(__LOCATION__, &
+                          "F diagnostics require FREE_VALIDATE and a new private DIAG_FILE prefix")
+      END IF
+
+      IF (mixing_store%dm_trial_free_energy) mixing_store%dm_trial_reject = .TRUE.
+      IF (mixing_store%dm_trial_free_validate .AND. .NOT. mixing_store%dm_trial_free_energy) &
+         CALL cp_abort(__LOCATION__, &
+                       "PULAY_P_FREE_VALIDATE requires PULAY_P_FREE_ENERGY")
+      CPASSERT(mixing_store%dm_trial_free_backtracks >= 0)
+      CPASSERT(mixing_store%dm_trial_free_backtracks <= 30)
       CALL section_vals_val_get(mixing_section, "PULAY_P_OCC_TOL", r_val=mixing_store%dm_trial_occ_tol)
+      ! Entropy is defined only on physical ensembles: the validated dense-kernel noise floor
+      ! may round logarithm endpoints, but a broad diagnostic tolerance cannot justify clipping.
+      IF (mixing_store%dm_trial_free_energy) mixing_store%dm_trial_occ_tol = MIN(mixing_store%dm_trial_occ_tol, 1.0E-12_dp)
       CALL section_vals_val_get(mixing_section, "PULAY_P_CHARGE_TOL", r_val=mixing_store%dm_trial_charge_tol)
       CALL section_vals_val_get(mixing_section, "PULAY_P_STEP_LIMIT", r_val=mixing_store%dm_trial_step_limit)
       CALL section_vals_val_get(mixing_section, "PULAY_P_K_STATE_READ", c_val=mixing_store%dm_trial_k_read)
@@ -266,6 +305,10 @@ CONTAINS
          CPASSERT(mixing_store%dm_trial_step_limit >= 0.0_dp)
          CPASSERT(mixing_store%alpha > 0.0_dp .AND. mixing_store%alpha <= 1.0_dp)
       END IF
+      IF (mixing_store%dm_trial_free_energy .AND. LEN_TRIM(mixing_store%dm_trial_k_read) == 0) &
+         CALL cp_abort(__LOCATION__, &
+                       "Trial free energy requires a paired complete Bloch initial checkpoint")
+      mixing_store%dm_trial_free_evaluations = 0
       mixing_store%dm_trial_fallback = .FALSE.
       mixing_store%dm_pulay_joint_active = .FALSE.
 
@@ -994,6 +1037,62 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_ENERGY", &
+                          description="Accept only non-increasing same-density finite-temperature free energy. "// &
+                          "Rebuild rho, tau and KS state for each physical full-Bloch trial. Requires "// &
+                          "Fermi-Dirac smearing, a paired initial checkpoint and one MPI rank. "// &
+                          "Enables domain rejection with occupation tolerance capped at 1e-12; "// &
+                          "preserves the raw residual convergence test.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_BACKTRACKS", &
+                          description="Maximum halvings for each of the Pulay and common raw-map directions. "// &
+                          "Exhaustion restores the input and stops with failure rather than zero-step convergence.", &
+                          default_i_val=12)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_VALIDATE", &
+                          description="On the first step, repeat the input energy/KS state and compare "// &
+                          "the KS directional derivative with two forward energy differences.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAGNOSTICS", &
+                          description="First-step repeated same-density probes, component energies and Bloch contractions. "// &
+                          "PILOT uses original forward points and midpoint central differences; SERIES adds six h values. "// &
+                          "INPUT_ONLY stops after one same-input snapshot. Does not relax F/physical/SCF gates. "// &
+                          "Requires FREE_VALIDATE and a new private export prefix.", &
+                          default_i_val=0, enum_c_vals=s2a("NONE", "PILOT", "SERIES", "INPUT_ONLY"), &
+                          enum_desc=s2a("Disabled", "Registered pilot", "Registered series", "Input-only proof"), &
+                          enum_i_vals=[0, 1, 2, 3])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_DIAG_FILE", &
+                          description="Private new stream export prefix for independent P/S/KS/entropy checks.", &
+                          type_of_var=lchar_t, default_lc_val="")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_F_SLACK", &
+                          description="Fixed tolerance for the free-energy acceptance: a trial is accepted if "// &
+                          "F(trial) <= F(input) + slack. Meant to cover the rounding resolution of F near "// &
+                          "convergence; the raw-residual convergence test and all state certificates are unchanged. "// &
+                          "The default 0 keeps strict non-increasing F.", &
+                          usage="PULAY_P_FREE_F_SLACK 2.0E-12", unit_str="hartree", &
+                          default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_FREE_PRECISION_COMPARE", &
+                          description="Diagnostic only: re-evaluate each FREE_VALIDATE state (input and both "// &
+                          "forward probes) with the other native SKALA model precision and print the energy "// &
+                          "decomposition and KS directional contraction of both. The density matrix is the "// &
+                          "same for both evaluations; the following evaluation restores the input precision. "// &
+                          "Requires FREE_VALIDATE.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_K_STATE_READ", &
                 description="Read a certified paired full Bloch/real-space density before the first KS evaluation; one MPI rank.", &
                           type_of_var=lchar_t, default_lc_val="")
@@ -1039,5 +1138,14 @@ CONTAINS
       mixing_store%dm_pulay_ncall = 0
 
    END SUBROUTINE dm_pulay_storage_release
+
+! **************************************************************************************************
+!> \brief Default-safe opt-in query, including methods without a mixing store.
+   LOGICAL FUNCTION mixing_free_energy_active(store) RESULT(active)
+      TYPE(mixing_storage_type), POINTER                 :: store
+
+      active = .FALSE.
+      IF (ASSOCIATED(store)) active = store%dm_trial_free_energy
+   END FUNCTION mixing_free_energy_active
 
 END MODULE qs_density_mixing_types
