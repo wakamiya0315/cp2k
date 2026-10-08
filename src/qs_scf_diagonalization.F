@@ -38,6 +38,9 @@ MODULE qs_scf_diagonalization
       dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
       dbcsr_get_readonly_block_p, dbcsr_init_p, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
       dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry, dbcsr_type_symmetric
+   USE cp_dbcsr_api, ONLY: dbcsr_get_info, dbcsr_has_symmetry, dbcsr_iterator_blocks_left, &
+                           dbcsr_iterator_next_block, dbcsr_iterator_readonly_start, dbcsr_iterator_stop, &
+                           dbcsr_iterator_type
    USE cp_dbcsr_contrib, ONLY: dbcsr_dot, &
                                dbcsr_maxabs
    USE cp_dbcsr_cp2k_link, ONLY: cp_dbcsr_alloc_block_from_nbl
@@ -106,6 +109,7 @@ MODULE qs_scf_diagonalization
                              rskp_transform_grid_release
    USE kpoint_types, ONLY: get_kpoint_info, &
                            kpoint_env_type, &
+                           kpoint_sym_type, &
                            kpoint_type
    USE local_gemm_api, ONLY: LOCAL_GEMM_PU_GPU, &
                              local_gemm_ctxt_type
@@ -200,13 +204,16 @@ MODULE qs_scf_diagonalization
       COMPLEX(KIND=dp), ALLOCATABLE :: phase(:, :)
    END TYPE kp_diag_workspace_type
 
-   PUBLIC :: qs_scf_full_bloch_initialize, qs_scf_full_bloch_save
+   PUBLIC :: qs_scf_full_bloch_initialize, qs_scf_full_bloch_save, qs_scf_bloch_entropy
    PUBLIC :: do_general_diag, do_general_diag_kp, do_roks_diag, &
              do_special_diag, do_ot_diag, do_ot_diag_kp, do_block_davidson_diag, &
              do_block_davidson_diag_kp, &
              do_block_krylov_diag, do_scf_diag_subspace, diag_subspace_allocate, &
              general_eigenproblem, diag_kp_smat, diag_kp_basic, &
              qs_scf_pulay_trial_check
+
+   PUBLIC :: qs_scf_free_operator_snapshot
+   PUBLIC :: qs_scf_free_symmetry_snapshot
 
 CONTAINS
 
@@ -3953,6 +3960,94 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Apply the exact real-space Pulay coefficients and normalization to full Bloch densities.
+
+! **************************************************************************************************
+!> \brief Entropy of a certified complete ensemble and its actual real-space image.
+!> \param bloch full density, not an inverse transform of truncated real-space images
+!> \param entropy dimensionless S/k_B including spin normalization and k weights
+!> \param valid finite, physical bounds, Hermiticity, forward map and charge/spin certificate
+   SUBROUTINE qs_scf_bloch_entropy(qs_env, scf_env, bloch, entropy, valid)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      COMPLEX(KIND=dp), INTENT(IN)                       :: bloch(:, :, :, :)
+      REAL(KIND=dp), INTENT(OUT)                         :: entropy
+      LOGICAL, INTENT(OUT)                               :: valid
+
+      INTEGER                                            :: ic, ik, ispin, nao, ne_a, ne_b, nel, &
+                                                            nkp, nspin
+      INTEGER, POINTER                                   :: cell_to_index(:, :, :)
+      LOGICAL                                            :: do_kpoints, finite
+      REAL(KIND=dp)                                      :: dot, error, herm, hi, lo, maxocc, &
+                                                            partial, targets(2), trace
+      REAL(KIND=dp), ALLOCATABLE                         :: counts(:, :)
+      REAL(KIND=dp), POINTER                             :: wkp(:), xkp(:, :)
+      TYPE(cp_cfm_type)                                  :: sk
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(dbcsr_p_type), POINTER                        :: overlap(:, :), real_density(:, :)
+      TYPE(kp_transform_plan_type)                       :: plan
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+      TYPE(scf_control_type), POINTER                    :: control
+
+      store => scf_env%mixing_store
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_s_kp=overlap, para_env=para_env, &
+                      do_kpoints=do_kpoints, nelectron_total=nel, scf_control=control)
+      valid = do_kpoints .AND. para_env%num_pe == 1
+      entropy = 0.0_dp
+      IF (.NOT. valid) RETURN
+      real_density => scf_env%p_mix_new
+      CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      nao = fmstruct%nrow_global; nspin = SIZE(real_density, 1)
+      valid = ALL(SHAPE(bloch) == [nao, nao, nspin, nkp])
+      IF (.NOT. valid) RETURN
+      CALL trial_bloch_roundtrip(qs_env, scf_env, real_density, bloch, error)
+      valid = ieee_is_finite(error) .AND. error <= 1.0E-8_dp
+      CALL cp_cfm_create(sk, fmstruct)
+      CALL kp_transform_plan_create(plan, sab_nl, cell_to_index, SIZE(overlap, 2), overlap(1, 1)%matrix)
+      ALLOCATE (counts(nspin, 2)); counts = 0.0_dp
+      maxocc = MERGE(2.0_dp, 1.0_dp, nspin == 1)
+      DO ik = 1, nkp
+         CALL kp_build_cfm(overlap, 1, xkp(:, ik), plan, sk)
+         DO ispin = 1, nspin
+            CALL trial_occupation_bounds(bloch(:, :, ispin, ik), sk%local_data(1:nao, 1:nao), &
+                                         scf_env%cholesky_method == cholesky_off, control%eps_eigval, maxocc, &
+                                         lo, hi, trace, herm, finite, partial)
+            valid = valid .AND. finite .AND. lo >= -store%dm_trial_occ_tol .AND. &
+                    hi <= 1.0_dp + store%dm_trial_occ_tol .AND. herm <= 1.0E-10_dp
+            entropy = entropy + wkp(ik)*partial
+            counts(ispin, 1) = counts(ispin, 1) + wkp(ik)*trace
+         END DO
+      END DO
+      DO ic = 1, SIZE(real_density, 2)
+         DO ispin = 1, nspin
+            CALL dbcsr_dot(real_density(ispin, ic)%matrix, overlap(1, ic)%matrix, dot)
+            counts(ispin, 2) = counts(ispin, 2) + dot
+         END DO
+      END DO
+      valid = valid .AND. ALL(ieee_is_finite(counts)) .AND. ieee_is_finite(entropy) .AND. &
+              MAXVAL(ABS(counts(:, 1) - counts(:, 2))) <= store%dm_trial_charge_tol .AND. &
+              ABS(SUM(counts(:, 1)) - REAL(nel, KIND=dp)) <= store%dm_trial_charge_tol
+      IF (nspin == 2) THEN
+         IF (control%smear%fixed_mag_mom >= 0.0_dp .OR. control%smear%fixed_mag_mom == -1.0_dp) THEN
+            IF (control%smear%fixed_mag_mom >= 0.0_dp) THEN
+               targets = 0.5_dp*[REAL(nel, KIND=dp) + control%smear%fixed_mag_mom, &
+                                 REAL(nel, KIND=dp) - control%smear%fixed_mag_mom]
+            ELSE
+               kp => kpoints%kp_env(1)%kpoint_env
+               CALL get_mo_set(kp%mos(1), nelectron=ne_a)
+               CALL get_mo_set(kp%mos(2), nelectron=ne_b)
+               targets = REAL([ne_a, ne_b], KIND=dp)
+            END IF
+            valid = valid .AND. MAXVAL(ABS(counts(:, 1) - targets)) <= store%dm_trial_charge_tol
+         END IF
+      END IF
+      CALL cp_cfm_release(sk); DEALLOCATE (counts)
+   END SUBROUTINE qs_scf_bloch_entropy
+
    SUBROUTINE trial_bloch_mix(store, raw, mixed, full_step)
       TYPE(mixing_storage_type), POINTER                 :: store
       COMPLEX(KIND=dp), INTENT(IN)                       :: raw(:, :, :, :)
@@ -4077,13 +4172,15 @@ CONTAINS
 !> \param hermitian_error ...
 !> \param finite ...
    SUBROUTINE trial_occupation_bounds(p, s, canonical, eps_eigval, maxocc, &
-                                      occmin, occmax, trace, hermitian_error, finite)
+                                      occmin, occmax, trace, hermitian_error, finite, entropy)
       COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: p, s
       LOGICAL, INTENT(IN)                                :: canonical
       REAL(KIND=dp), INTENT(IN)                          :: eps_eigval, maxocc
       REAL(KIND=dp), INTENT(OUT)                         :: occmin, occmax, trace, hermitian_error
       LOGICAL, INTENT(OUT)                               :: finite
+      REAL(KIND=dp), OPTIONAL, INTENT(OUT)                :: entropy
 
+      REAL(KIND=dp)                                      :: occupation
       COMPLEX(KIND=dp), ALLOCATABLE                      :: basis(:, :), metric(:, :), &
                                                             physical(:, :), work(:)
       INTEGER                                            :: first, i, info, j, n, nr
@@ -4092,6 +4189,7 @@ CONTAINS
 #if defined(__HAS_IEEE_EXCEPTIONS)
       TYPE(ieee_status_type) :: saved_status
 #endif
+      IF (PRESENT(entropy)) entropy = 0.0_dp
       n = SIZE(p, 1)
       occmin = 0.0_dp
       occmax = 0.0_dp
@@ -4150,6 +4248,15 @@ CONTAINS
                occmin = MINVAL(eig(1:nr))
                occmax = MAXVAL(eig(1:nr))
                trace = SUM(eig(1:nr))*maxocc
+               IF (PRESENT(entropy)) THEN
+                  ! The caller certifies bounds first; clamp eigensolver rounding only for log(0).
+                  ! This does not project, clip or otherwise change P or any physical feature.
+                  DO i = 1, nr
+                     occupation = MAX(0.0_dp, MIN(1.0_dp, eig(i)))
+                     IF (occupation > 0.0_dp .AND. occupation < 1.0_dp) entropy = entropy - maxocc* &
+                                                       (occupation*LOG(occupation) + (1.0_dp - occupation)*LOG(1.0_dp - occupation))
+                  END DO
+               END IF
             END IF
          END IF
       END IF
@@ -4241,5 +4348,340 @@ CONTAINS
       END DO
 
    END SUBROUTINE kp_build_cfm
+
+! **************************************************************************************************
+!> \brief Independent weighted Bloch contractions; private full-state export for external checks.
+   SUBROUTINE qs_scf_free_operator_snapshot(qs_env, scf_env, initial, proposal, initial_rs, proposal_rs, &
+                                            direction_rs, lambda, derivative, filename)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      COMPLEX(dp), INTENT(IN)                            :: initial(:, :, :, :), proposal(:, :, :, :)
+      REAL(dp), INTENT(IN)                               :: lambda
+      REAL(dp), INTENT(OUT)                              :: derivative(3)
+      CHARACTER(LEN=*), INTENT(IN)                       :: filename
+
+      TYPE(dbcsr_p_type), POINTER                        :: initial_rs(:, :), proposal_rs(:, :), direction_rs(:, :)
+
+      CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_STATE_V1"
+
+      INTEGER                                            :: ik, ispin, nao, nkp, nspin, unit
+      INTEGER, POINTER                                   :: cell_to_index(:, :, :)
+      REAL(dp), POINTER                                  :: wkp(:), xkp(:, :)
+      TYPE(cp_cfm_type)                                  :: matrix
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(dbcsr_p_type), POINTER                        :: core(:, :), kinetic(:, :), ks(:, :), &
+                                                            overlap(:, :)
+      TYPE(kp_transform_plan_type)                       :: plan
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+      TYPE(scf_control_type), POINTER                    :: control
+
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_ks_kp=ks, matrix_h_kp=core, &
+                      kinetic_kp=kinetic, matrix_s_kp=overlap, scf_control=control)
+      CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, &
+                           cell_to_index=cell_to_index, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      nao = SIZE(initial, 1); nspin = SIZE(initial, 3)
+      CPASSERT(nkp == SIZE(initial, 4))
+      CPASSERT(ASSOCIATED(kinetic))
+      CALL cp_cfm_create(matrix, fmstruct)
+      CALL kp_transform_plan_create(plan, sab_nl, cell_to_index, SIZE(overlap, 2), overlap(1, 1)%matrix)
+      derivative = 0.0_dp
+      OPEN (NEWUNIT=unit, FILE=filename, ACCESS="STREAM", FORM="UNFORMATTED", STATUS="NEW", ACTION="WRITE")
+      WRITE (unit) magic, 1, nao, nspin, nkp
+      WRITE (unit) lambda, control%smear%electronic_temperature, control%eps_eigval, &
+         scf_env%mixing_store%dm_trial_occ_tol
+      WRITE (unit) wkp, initial, proposal
+      DO ik = 1, nkp
+         CALL kp_build_cfm(overlap, 1, xkp(:, ik), plan, matrix)
+         WRITE (unit) matrix%local_data(1:nao, 1:nao)
+         CALL kp_build_cfm(core, 1, xkp(:, ik), plan, matrix)
+         WRITE (unit) matrix%local_data(1:nao, 1:nao)
+         DO ispin = 1, nspin
+            derivative(2) = derivative(2) + wkp(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                   initial(:, :, ispin, ik))*matrix%local_data(1:nao, 1:nao)), dp)
+         END DO
+         CALL kp_build_cfm(kinetic, 1, xkp(:, ik), plan, matrix)
+         WRITE (unit) matrix%local_data(1:nao, 1:nao)
+         DO ispin = 1, nspin
+            derivative(3) = derivative(3) + wkp(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                   initial(:, :, ispin, ik))*matrix%local_data(1:nao, 1:nao)), dp)
+         END DO
+         DO ispin = 1, nspin
+            CALL kp_build_cfm(ks, ispin, xkp(:, ik), plan, matrix)
+            WRITE (unit) matrix%local_data(1:nao, 1:nao)
+            derivative(1) = derivative(1) + wkp(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                   initial(:, :, ispin, ik))*matrix%local_data(1:nao, 1:nao)), dp)
+         END DO
+      END DO
+      CLOSE (unit)
+      CALL qs_scf_free_linear_snapshot(qs_env, scf_env, initial, proposal, initial_rs, proposal_rs, &
+                                       direction_rs, ks, overlap, plan, wkp, xkp, TRIM(filename)//".linear")
+      CALL cp_cfm_release(matrix)
+   END SUBROUTINE qs_scf_free_operator_snapshot
+
+! **************************************************************************************************
+!> \brief Read-only sparse captures and linear density-transform replay; no additional energy evaluation.
+   SUBROUTINE qs_scf_free_linear_snapshot(qs_env, scf_env, initial, proposal, initial_rs, proposal_rs, &
+                                          direction_rs, ks, overlap, plan, weights, xkp, filename)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      COMPLEX(dp), INTENT(IN)                            :: initial(:, :, :, :), proposal(:, :, :, :)
+      TYPE(dbcsr_p_type), POINTER                        :: initial_rs(:, :), proposal_rs(:, :), direction_rs(:, :), &
+                                                            ks(:, :), overlap(:, :)
+      TYPE(kp_transform_plan_type), INTENT(IN)            :: plan
+      REAL(dp), INTENT(IN)                               :: weights(:), xkp(:, :)
+      CHARACTER(LEN=*), INTENT(IN)                       :: filename
+
+      CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_REAL_V1"
+      INTEGER                                            :: ic, ik, ispin, nao, nkp, nspin, unit
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(cp_fm_type), ALLOCATABLE                      :: ext(:, :, :)
+      TYPE(dbcsr_p_type), POINTER                        :: reconstructed(:, :)
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+
+      nao = SIZE(initial, 1); nspin = SIZE(initial, 3); nkp = SIZE(initial, 4)
+      CALL get_qs_env(qs_env, kpoints=kpoints)
+      CALL get_kpoint_info(kpoints, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      OPEN (NEWUNIT=unit, FILE=filename, ACCESS="STREAM", FORM="UNFORMATTED", STATUS="NEW", ACTION="WRITE")
+      WRITE (unit) magic, 1, nao, nspin, nkp, SIZE(initial_rs, 2), plan%nentry, &
+         MERGE(1, 0, plan%symmetric), 7 + nkp
+      WRITE (unit) weights, xkp
+      DO ik = 1, nkp
+         WRITE (unit) MERGE(1, 0, kpoints%kp_sym(ik)%kpoint_sym%apply_symmetry), &
+            kpoints%kp_sym(ik)%kpoint_sym%nwght
+      END DO
+      WRITE (unit) plan%row, plan%col, plan%image, plan%row_offset, plan%col_offset, &
+         plan%cell, plan%symmetry_sign
+      CALL free_diag_write_sparse_set(unit, initial_rs, 1)
+      CALL free_diag_write_sparse_set(unit, proposal_rs, 2)
+      CALL free_diag_write_sparse_set(unit, direction_rs, 3)
+      CALL free_diag_write_sparse_set(unit, ks, 4)
+
+      ALLOCATE (ext(nkp, 2, nspin), reconstructed(nspin, SIZE(initial_rs, 2)))
+      DO ispin = 1, nspin
+         DO ik = 1, nkp
+            DO ic = 1, 2
+               CALL cp_fm_create(ext(ik, ic, ispin), fmstruct)
+            END DO
+         END DO
+         DO ic = 1, SIZE(initial_rs, 2)
+            ALLOCATE (reconstructed(ispin, ic)%matrix)
+            CALL dbcsr_create(reconstructed(ispin, ic)%matrix, template=initial_rs(ispin, ic)%matrix)
+            CALL dbcsr_copy(reconstructed(ispin, ic)%matrix, initial_rs(ispin, ic)%matrix)
+         END DO
+      END DO
+      CALL replay(initial, 5, 0)
+      CALL replay(proposal, 6, 0)
+      CALL replay(proposal - initial, 7, 0)
+      DO ik = 1, nkp
+         CALL replay(proposal - initial, 7 + ik, ik)
+      END DO
+      CLOSE (unit)
+      DO ispin = 1, nspin
+         DO ik = 1, nkp
+            DO ic = 1, 2
+               CALL cp_fm_release(ext(ik, ic, ispin))
+            END DO
+         END DO
+         DO ic = 1, SIZE(initial_rs, 2)
+            CALL dbcsr_deallocate_matrix(reconstructed(ispin, ic)%matrix)
+         END DO
+      END DO
+      DEALLOCATE (ext, reconstructed)
+
+   CONTAINS
+
+      SUBROUTINE replay(value, id, only_k)
+         COMPLEX(dp), INTENT(IN)                         :: value(:, :, :, :)
+         INTEGER, INTENT(IN)                             :: id, only_k
+
+         INTEGER                                         :: component, image, k, spin
+
+         DO spin = 1, nspin
+            DO k = 1, nkp
+               DO component = 1, 2
+                  ext(k, component, spin)%local_data = 0.0_dp
+               END DO
+               IF (only_k > 0 .AND. only_k /= k) CYCLE
+               ext(k, 1, spin)%local_data(1:nao, 1:nao) = REAL(value(:, :, spin, k), dp)
+               ext(k, 2, spin)%local_data(1:nao, 1:nao) = AIMAG(value(:, :, spin, k))
+            END DO
+            DO image = 1, SIZE(initial_rs, 2)
+               CALL dbcsr_copy(reconstructed(spin, image)%matrix, initial_rs(spin, image)%matrix)
+            END DO
+         END DO
+         ! Symmetry phases were certified by the preceding evaluator. Do not recalibrate them here.
+         CALL kpoint_density_transform(kpoints, reconstructed, .FALSE., overlap(1, 1)%matrix, &
+                                       sab_nl, scf_env%scf_work1, pmat_ext=ext)
+         CALL free_diag_write_sparse_set(unit, reconstructed, id)
+      END SUBROUTINE replay
+
+   END SUBROUTINE qs_scf_free_linear_snapshot
+
+   SUBROUTINE free_diag_write_sparse_set(unit, matrices, id)
+      TYPE(dbcsr_p_type), POINTER                     :: matrices(:, :)
+      INTEGER, INTENT(IN)                             :: unit, id
+
+      INTEGER                                         :: col, col_offset, image, nblock, row, row_offset, spin
+      REAL(dp), POINTER                               :: block(:, :)
+      TYPE(dbcsr_iterator_type)                       :: iterator
+
+      DO image = 1, SIZE(matrices, 2)
+         DO spin = 1, SIZE(matrices, 1)
+            nblock = 0
+            CALL dbcsr_iterator_readonly_start(iterator, matrices(spin, image)%matrix)
+            DO WHILE (dbcsr_iterator_blocks_left(iterator))
+               CALL dbcsr_iterator_next_block(iterator, row, col, block)
+               nblock = nblock + 1
+            END DO
+            CALL dbcsr_iterator_stop(iterator)
+            WRITE (unit) id, spin, image, MERGE(1, 0, dbcsr_has_symmetry(matrices(spin, image)%matrix)), nblock
+            CALL dbcsr_iterator_readonly_start(iterator, matrices(spin, image)%matrix)
+            DO WHILE (dbcsr_iterator_blocks_left(iterator))
+               CALL dbcsr_iterator_next_block(iterator, row, col, block, &
+                                              row_offset=row_offset, col_offset=col_offset)
+               WRITE (unit) row, col, row_offset, col_offset, SIZE(block, 1), SIZE(block, 2)
+               WRITE (unit) block
+            END DO
+            CALL dbcsr_iterator_stop(iterator)
+         END DO
+      END DO
+   END SUBROUTINE free_diag_write_sparse_set
+
+! **************************************************************************************************
+!> \brief Capture the complete adjoint of the original symmetry-expanded density map.
+   SUBROUTINE qs_scf_free_symmetry_snapshot(qs_env, scf_env, initial, proposal, derivative, filename)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      COMPLEX(dp), INTENT(IN)                            :: initial(:, :, :, :), proposal(:, :, :, :)
+      REAL(dp), INTENT(OUT)                              :: derivative(3)
+      CHARACTER(LEN=*), INTENT(IN)                       :: filename
+
+      CHARACTER(LEN=16), PARAMETER                       :: magic = "F_DIAG_ADJ_V2"
+      COMPLEX(dp), ALLOCATABLE                           :: basis_map(:, :), gradient(:, :, :), &
+                                                            physical_gradient(:, :, :), work(:, :)
+      COMPLEX(dp)                                        :: phase
+      INTEGER                                            :: atom, col, ENTRY, ik, ir, ira, is, ispin, &
+                                                            jr, nao, natom, nkp, nspin, nstar, row, slot, unit
+      INTEGER, POINTER                                   :: cell_to_index(:, :, :), offsets(:)
+      INTEGER, ALLOCATABLE                               :: block_size(:)
+      LOGICAL, ALLOCATABLE                               :: mask(:, :)
+      LOGICAL                                            :: time_reversal
+      REAL(dp)                                           :: angle, fraction, star_k(3)
+      REAL(dp), POINTER                                  :: rotation(:, :), weights(:), xkp(:, :)
+      TYPE(cp_cfm_type)                                  :: matrix
+      TYPE(cp_fm_struct_type), POINTER                   :: fmstruct
+      TYPE(dbcsr_p_type), POINTER                        :: core(:, :), kinetic(:, :), ks(:, :), overlap(:, :)
+      TYPE(kp_transform_plan_type)                       :: plan
+      TYPE(kpoint_sym_type), POINTER                     :: symmetry
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(neighbor_list_set_p_type), POINTER            :: sab_nl(:)
+
+      CALL get_qs_env(qs_env, kpoints=kpoints, matrix_ks_kp=ks, matrix_h_kp=core, &
+                      kinetic_kp=kinetic, matrix_s_kp=overlap)
+      CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=weights, &
+                           cell_to_index=cell_to_index, sab_nl=sab_nl)
+      CALL cp_fm_get_info(scf_env%scf_work1(1), matrix_struct=fmstruct)
+      CALL dbcsr_get_info(overlap(1, 1)%matrix, row_blk_offset=offsets)
+      nao = SIZE(initial, 1); nspin = SIZE(initial, 3); natom = SIZE(kpoints%atype)
+      ALLOCATE (basis_map(nao, nao), gradient(nao, nao, nspin + 2), &
+                physical_gradient(nao, nao, nspin + 2), work(nao, nao), &
+                mask(nao, nao), block_size(natom))
+      DO atom = 1, natom - 1
+         block_size(atom) = offsets(atom + 1) - offsets(atom)
+      END DO
+      block_size(natom) = nao + 1 - offsets(natom)
+      mask = .FALSE.
+      CALL kp_transform_plan_create(plan, sab_nl, cell_to_index, SIZE(overlap, 2), overlap(1, 1)%matrix)
+      DO ENTRY = 1, plan%nentry
+         row = plan%row(ENTRY); col = plan%col(ENTRY)
+         mask(offsets(row):offsets(row) + block_size(row) - 1, &
+              offsets(col):offsets(col) + block_size(col) - 1) = .TRUE.
+         IF (plan%symmetric) mask(offsets(col):offsets(col) + block_size(col) - 1, &
+                                  offsets(row):offsets(row) + block_size(row) - 1) = .TRUE.
+      END DO
+      CALL cp_cfm_create(matrix, fmstruct)
+      OPEN (NEWUNIT=unit, FILE=filename, ACCESS="STREAM", FORM="UNFORMATTED", STATUS="NEW", ACTION="WRITE")
+      WRITE (unit) magic, 2, nao, nspin, nkp
+      WRITE (unit) weights, xkp
+      derivative = 0.0_dp
+      DO ik = 1, nkp
+         symmetry => kpoints%kp_sym(ik)%kpoint_sym
+         nstar = 1
+         IF (symmetry%apply_symmetry) nstar = symmetry%nwght
+         CPASSERT(nstar > 0)
+         WRITE (unit) nstar, MERGE(1, 0, symmetry%apply_symmetry)
+         gradient = z_zero
+         DO is = 1, nstar
+            basis_map = z_zero
+            time_reversal = .FALSE.
+            star_k = xkp(:, ik)
+            IF (symmetry%apply_symmetry) THEN
+               star_k = symmetry%xkp(:, is)
+               time_reversal = symmetry%rotp(is) < 0
+               ir = ABS(symmetry%rotp(is)); ira = 0
+               DO jr = 1, SIZE(kpoints%ibrot)
+                  IF (ir == kpoints%ibrot(jr)) ira = jr
+               END DO
+               CPASSERT(ira > 0)
+               DO atom = 1, natom
+                  rotation => kpoints%kind_rotmat(ira, kpoints%atype(atom))%rmat
+                  row = offsets(symmetry%f0(atom, is)); col = offsets(atom)
+                  angle = twopi*DOT_PRODUCT(REAL(symmetry%fcell_gauge(:, atom, is), dp), star_k)
+                  IF (symmetry%phase_mode(is) == 2) angle = -angle
+                  phase = CMPLX(COS(angle), SIN(angle), dp)
+                  CPASSERT(SIZE(rotation, 1) == block_size(symmetry%f0(atom, is)))
+                  CPASSERT(SIZE(rotation, 2) == block_size(atom))
+                  basis_map(row:row + SIZE(rotation, 1) - 1, col:col + SIZE(rotation, 2) - 1) = phase*rotation
+               END DO
+            ELSE
+               DO row = 1, nao
+                  basis_map(row, row) = z_one
+               END DO
+            END IF
+            fraction = 1.0_dp/REAL(nstar, dp)
+            WRITE (unit) MERGE(1, 0, time_reversal), star_k, fraction, basis_map
+            DO slot = 1, nspin + 2
+               SELECT CASE (slot)
+               CASE (1)
+                  CALL kp_build_cfm(core, 1, star_k, plan, matrix)
+               CASE (2)
+                  CALL kp_build_cfm(kinetic, 1, star_k, plan, matrix)
+               CASE DEFAULT
+                  CALL kp_build_cfm(ks, slot - 2, star_k, plan, matrix)
+               END SELECT
+               work = MATMUL(CONJG(TRANSPOSE(basis_map)), MATMUL(matrix%local_data(1:nao, 1:nao), basis_map))
+               IF (time_reversal) work = CONJG(work)
+               WHERE (.NOT. mask) work = z_zero
+               gradient(:, :, slot) = gradient(:, :, slot) + fraction*work
+            END DO
+         END DO
+         WRITE (unit) gradient
+         ! The density domain is Hermitian. Keep the raw covector as diagnostic history.
+         DO slot = 1, nspin + 2
+            physical_gradient(:, :, slot) = 0.5_dp*(gradient(:, :, slot) + &
+                                                    CONJG(TRANSPOSE(gradient(:, :, slot))))
+         END DO
+         WRITE (unit) physical_gradient
+         DO ispin = 1, nspin
+            derivative(1) = derivative(1) + weights(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                  initial(:, :, ispin, ik))*physical_gradient(:, :, ispin + 2)), dp)
+            derivative(2) = derivative(2) + weights(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                       initial(:, :, ispin, ik))*physical_gradient(:, :, 1)), dp)
+            derivative(3) = derivative(3) + weights(ik)*REAL(SUM(CONJG(proposal(:, :, ispin, ik) - &
+                                                                       initial(:, :, ispin, ik))*physical_gradient(:, :, 2)), dp)
+         END DO
+      END DO
+      WRITE (unit) SIZE(core, 1), SIZE(core, 2)
+      CALL free_diag_write_sparse_set(unit, core, 1)
+      WRITE (unit) SIZE(kinetic, 1), SIZE(kinetic, 2)
+      CALL free_diag_write_sparse_set(unit, kinetic, 2)
+      CLOSE (unit)
+      CALL cp_cfm_release(matrix)
+      DEALLOCATE (basis_map, gradient, physical_gradient, work, mask, block_size)
+   END SUBROUTINE qs_scf_free_symmetry_snapshot
 
 END MODULE qs_scf_diagonalization

@@ -57,13 +57,15 @@ MODULE qs_scf
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_get_info, &
         dbcsr_init_p, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
-        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_release_p, &
-        dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
-   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot
+        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_release, &
+        dbcsr_release_p, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot,&
+                                              dbcsr_maxabs
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
                                               copy_fm_to_dbcsr_bc,&
                                               cp_dbcsr_m_by_n_from_row_template,&
+                                              dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
    USE cp_files,                        ONLY: close_file, open_file
    USE cp2k_info,                       ONLY: compile_revision
@@ -108,6 +110,7 @@ MODULE qs_scf
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get,&
+                                              section_vals_val_set,&
                                               section_vals_write
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
@@ -147,7 +150,10 @@ MODULE qs_scf
    USE qs_charge_mixing,                ONLY: charge_mixing_scc_error
    USE qs_charges_types,                ONLY: qs_charges_type
    USE qs_density_matrices,             ONLY: calculate_density_matrix
-   USE qs_density_mixing_types,         ONLY: gspace_mixing_nr
+   USE qs_density_mixing_types,         ONLY: dm_pulay_storage_release,&
+                                              gspace_mixing_nr,&
+                                              mixing_free_energy_active,&
+                                              mixing_storage_type
    USE qs_diis,                         ONLY: qs_diis_b_clear,&
                                               qs_diis_b_clear_kp,&
                                               qs_diis_b_create,&
@@ -217,6 +223,9 @@ MODULE qs_scf
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
    USE qs_scf_diagonalization,          ONLY: do_general_diag_kp,&
+                                              qs_scf_bloch_entropy,&
+                                              qs_scf_free_operator_snapshot,&
+                                              qs_scf_free_symmetry_snapshot,&
                                               qs_scf_full_bloch_initialize,&
                                               qs_scf_full_bloch_save,&
                                               qs_scf_pulay_trial_check
@@ -249,6 +258,7 @@ MODULE qs_scf
    USE qs_wf_history_methods,           ONLY: wfi_purge_history,&
                                               wfi_update
    USE scf_control_types,               ONLY: scf_control_type
+   USE skala_gpw_functional,            ONLY: get_gauxc_section
    USE smeagol_interface,               ONLY: run_smeagol_bulktrans,&
                                               run_smeagol_emtrans
    USE tblite_interface,                ONLY: tb_get_energy,&
@@ -655,9 +665,11 @@ CONTAINS
             END IF
             CALL torch_skala_feature_begin()
             IF (LEN_TRIM(skala_feature_dir) > 0) CALL skala_feature_occupations(qs_env)
+            IF (mixing_free_energy_active(scf_env%mixing_store)) CALL evaluate_core_matrix_traces(qs_env)
             CALL qs_ks_update_qs_env(qs_env, just_energy=just_energy, &
                                      calculate_forces=.FALSE.)
             CALL qs_scf_trial_finite_probe(qs_env, scf_env, "KS")
+            CALL qs_scf_free_input(qs_env, scf_env, scf_control, output_unit)
 
             scf_env%raw_map_delta = 0.0_dp
             scf_env%raw_map_delta_valid = .FALSE.
@@ -870,6 +882,9 @@ CONTAINS
                density_full_step = diis_step .OR. tblite_native_mixer .OR. internal_tblite_density_full_step
                CALL qs_scf_density_mixing(scf_env, rho, para_env, density_full_step, kpoints)
                CALL qs_scf_pulay_trial_check(qs_env, scf_env, scf_control, output_unit, density_full_step)
+               CALL qs_scf_free_accept(qs_env, scf_env, scf_control, output_unit, density_full_step)
+               ! Keep the normal end-of-step rho invalidation. ODA's separate evaluated-energy
+               ! snapshot is not populated by this path and must never overwrite the accepted F.
             END IF
             IF (dft_control%qs_control%xtb_control%do_tblite .AND. &
                 .NOT. (dft_control%qs_control%do_ls_scf .OR. scf_control%use_ot)) THEN
@@ -3568,10 +3583,11 @@ CONTAINS
 !> \param qs_env ...
 !> \param scf_env ...
 !> \param phase ...
-   SUBROUTINE qs_scf_trial_finite_probe(qs_env, scf_env, phase)
+   SUBROUTINE qs_scf_trial_finite_probe(qs_env, scf_env, phase, finite_result)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       CHARACTER(len=*), INTENT(IN)                       :: phase
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: finite_result
 
       INTEGER                                            :: col, ic, ik, ispin, iw, row
       LOGICAL                                            :: do_kpoints, finite
@@ -3582,12 +3598,14 @@ CONTAINS
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
       TYPE(qs_energy_type), POINTER                      :: energy
 
+      IF (PRESENT(finite_result)) finite_result = .TRUE.
       IF (.NOT. ASSOCIATED(scf_env%mixing_store)) RETURN
       IF (.NOT. scf_env%mixing_store%dm_trial_diagnostics) RETURN
       CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks, energy=energy, kpoints=kpoints, &
                       do_kpoints=do_kpoints, mos=mos)
       iw = cp_logger_get_default_io_unit()
-      IF (phase == "KS") THEN
+      IF (phase == "KS" .OR. phase == "FREE_ENERGY") THEN
+         IF (PRESENT(finite_result)) finite_result = ieee_is_finite(energy%total)
          IF (.NOT. ieee_is_finite(energy%total) .AND. iw > 0) &
             WRITE (iw, '(T2,A,I6)') "SCF_TRIAL| NONFINITE total KS energy, step ", scf_env%iter_count
          DO ic = 1, SIZE(matrix_ks, 2)
@@ -3596,6 +3614,7 @@ CONTAINS
                DO WHILE (dbcsr_iterator_blocks_left(iterator))
                   CALL dbcsr_iterator_next_block(iterator, row, col, block)
                   IF (.NOT. ALL(ieee_is_finite(block))) THEN
+                     IF (PRESENT(finite_result)) finite_result = .FALSE.
                      IF (iw > 0) WRITE (iw, '(T2,A,5I6)') &
                         "SCF_TRIAL| NONFINITE KS matrix step,spin,image,row,col ", scf_env%iter_count, ispin, ic, row, col
                      EXIT
@@ -3630,5 +3649,547 @@ CONTAINS
          END IF
       END IF
    END SUBROUTINE qs_scf_trial_finite_probe
+
+! **************************************************************************************************
+!> \brief Capture F[P_in] before the raw diagonalization replaces the occupation entropy.
+   SUBROUTINE qs_scf_free_input(qs_env, scf_env, control, iw)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: control
+      INTEGER, INTENT(IN)                                :: iw
+
+      LOGICAL                                            :: do_kpoints, valid
+      REAL(KIND=dp)                                      :: entropy, sigma
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (.NOT. store%dm_trial_free_energy) RETURN
+      CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control, do_kpoints=do_kpoints)
+      IF (.NOT. do_kpoints .OR. scf_env%method /= general_diag_method_nr .OR. &
+          .NOT. control%smear%do_smear .OR. control%smear%method /= smear_fermi_dirac .OR. &
+          .NOT. store%dm_trial_k_loaded .OR. dft_control%do_admm .OR. dft_control%hairy_probes .OR. &
+          control%diagonalization%update_method == diag_update_method_adiis) &
+         CALL cp_abort(__LOCATION__, &
+                       "Trial free energy needs complete-state k-point diagonalization with Fermi-Dirac smearing")
+      sigma = control%smear%electronic_temperature
+      CPASSERT(control%max_scf >= 2)
+      CPASSERT(sigma > 0.0_dp)
+      CALL qs_scf_bloch_entropy(qs_env, scf_env, store%dm_trial_k_input, entropy, valid)
+      IF (.NOT. valid .OR. .NOT. ieee_is_finite(energy%total)) &
+         CALL cp_abort(__LOCATION__, &
+                       "No certified physical input state for trial free energy")
+      store%dm_trial_eks_input = energy%total - energy%kTS
+      store%dm_trial_f_input = store%dm_trial_eks_input - sigma*entropy
+      energy%kTS = -sigma*entropy; energy%total = store%dm_trial_f_input
+      IF (iw > 0) WRITE (iw, '(T2,A,I6,3ES24.14E3)') &
+         "SCF_FREE_ENERGY| input step,F,EKS,kTS ", scf_env%iter_count, energy%total, store%dm_trial_eks_input, energy%kTS
+   END SUBROUTINE qs_scf_free_input
+
+! **************************************************************************************************
+!> \brief Build every field, core trace and KS matrix from this same physical P; no shallow rollback.
+   SUBROUTINE qs_scf_free_evaluate(qs_env, scf_env, control, bloch, free_energy, eks, valid)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: control
+      COMPLEX(KIND=dp), INTENT(IN)                       :: bloch(:, :, :, :)
+      REAL(KIND=dp), INTENT(OUT)                         :: free_energy, eks
+      LOGICAL, INTENT(OUT)                               :: valid
+
+      REAL(KIND=dp)                                      :: entropy
+      TYPE(qs_energy_type), POINTER                      :: energy
+      TYPE(qs_ks_env_type), POINTER                      :: ks_env
+      TYPE(qs_rho_type), POINTER                         :: rho
+
+      free_energy = HUGE(1.0_dp); eks = HUGE(1.0_dp)
+      CALL qs_scf_bloch_entropy(qs_env, scf_env, bloch, entropy, valid)
+      IF (.NOT. valid) RETURN
+      CALL get_qs_env(qs_env, rho=rho, ks_env=ks_env, energy=energy)
+      CALL qs_scf_commit_density_candidate(scf_env, rho)
+      CALL qs_scf_rho_update(rho, qs_env, scf_env, ks_env, mix_rho=.FALSE.)
+      CALL evaluate_core_matrix_traces(qs_env)
+      energy%kTS = -control%smear%electronic_temperature*entropy
+      CALL qs_ks_update_qs_env(qs_env, just_energy=.FALSE., calculate_forces=.FALSE., print_active=.FALSE.)
+      CALL qs_scf_trial_finite_probe(qs_env, scf_env, "FREE_ENERGY", valid)
+      scf_env%mixing_store%dm_trial_free_evaluations = scf_env%mixing_store%dm_trial_free_evaluations + 1
+      free_energy = energy%total; eks = energy%total - energy%kTS
+      valid = valid .AND. ieee_is_finite(free_energy) .AND. ieee_is_finite(eks)
+   END SUBROUTINE qs_scf_free_evaluate
+
+! **************************************************************************************************
+!> \brief Strict non-increasing F acceptance, then a common raw-map direction if Pulay is not descent.
+!>
+!> \note iter_delta is never replaced by the shortened step. Exhaustion is explicit failure.
+   SUBROUTINE qs_scf_free_accept(qs_env, scf_env, control, iw, density_full_step)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: control
+      INTEGER, INTENT(IN)                                :: iw
+      LOGICAL, INTENT(INOUT)                             :: density_full_step
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: candidate_k(:, :, :, :), &
+                                                            initial_k(:, :, :, :), &
+                                                            proposal_k(:, :, :, :)
+      INTEGER                                            :: backtrack, direction, &
+                                                            evaluations_before, ic, ispin, nimg, &
+                                                            nspin
+      LOGICAL                                            :: accepted, valid
+      REAL(KIND=dp)                                      :: eks, free_energy, lambda, raw_residual
+      TYPE(dbcsr_p_type), POINTER                        :: current(:, :), initial(:, :), &
+                                                            proposal(:, :)
+      TYPE(mixing_storage_type), POINTER                 :: store
+      TYPE(qs_energy_type), POINTER                      :: energy
+      TYPE(qs_rho_type), POINTER                         :: rho
+
+      store => scf_env%mixing_store
+      IF (.NOT. ASSOCIATED(store)) RETURN
+      IF (.NOT. store%dm_trial_free_energy) RETURN
+      CALL get_qs_env(qs_env, rho=rho, energy=energy)
+      store%dm_trial_raw_kts = energy%kTS
+      CALL qs_rho_get(rho, rho_ao_kp=current)
+      nspin = SIZE(current, 1); nimg = SIZE(current, 2)
+      NULLIFY (initial, proposal)
+      CALL dbcsr_allocate_matrix_set(initial, nspin, nimg)
+      CALL dbcsr_allocate_matrix_set(proposal, nspin, nimg)
+      DO ic = 1, nimg
+         DO ispin = 1, nspin
+            ALLOCATE (initial(ispin, ic)%matrix, proposal(ispin, ic)%matrix)
+            CALL dbcsr_create(initial(ispin, ic)%matrix, template=current(ispin, ic)%matrix)
+            CALL dbcsr_create(proposal(ispin, ic)%matrix, template=current(ispin, ic)%matrix)
+            CALL dbcsr_copy(initial(ispin, ic)%matrix, current(ispin, ic)%matrix)
+            CALL dbcsr_copy(proposal(ispin, ic)%matrix, scf_env%p_mix_new(ispin, ic)%matrix)
+         END DO
+      END DO
+      initial_k = store%dm_trial_k_last; proposal_k = store%dm_trial_k_input
+      ! A skipped/full step must also retain raw P_out for the final undo operation.
+      IF (density_full_step) THEN
+         CALL dm_pulay_storage_release(store)
+         CALL dbcsr_allocate_matrix_set(store%dm_pulay_p_last, nspin, nimg)
+         CALL dbcsr_allocate_matrix_set(store%dm_pulay_res_last, nspin, nimg)
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               ALLOCATE (store%dm_pulay_p_last(ispin, ic)%matrix, store%dm_pulay_res_last(ispin, ic)%matrix)
+               CALL dbcsr_create(store%dm_pulay_p_last(ispin, ic)%matrix, template=initial(ispin, ic)%matrix)
+               CALL dbcsr_create(store%dm_pulay_res_last(ispin, ic)%matrix, template=initial(ispin, ic)%matrix)
+               CALL dbcsr_copy(store%dm_pulay_p_last(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+               CALL dbcsr_copy(store%dm_pulay_res_last(ispin, ic)%matrix, proposal(ispin, ic)%matrix)
+               CALL dbcsr_add(store%dm_pulay_res_last(ispin, ic)%matrix, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            END DO
+         END DO
+      END IF
+      density_full_step = .FALSE.
+      raw_residual = scf_env%iter_delta; evaluations_before = store%dm_trial_free_evaluations
+      IF (iw > 0 .AND. scf_env%iter_count == 1 .AND. store%dm_trial_free_f_slack > 0.0_dp) &
+         WRITE (iw, '(T2,A,ES24.14E3)') "SCF_FREE_ENERGY| accepted F rise slack [hartree] ", store%dm_trial_free_f_slack
+      IF (store%dm_trial_free_validate .AND. scf_env%iter_count == 1) &
+         CALL qs_scf_free_validate(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
+      accepted = .FALSE.
+      DO direction = 1, 2
+         lambda = 1.0_dp
+         IF (direction == 2) THEN
+            lambda = store%alpha
+            IF (store%dm_trial_step_limit > 0.0_dp) lambda = MIN(lambda, store%dm_trial_step_limit)
+         END IF
+         DO backtrack = 0, store%dm_trial_free_backtracks
+            IF (direction == 1) THEN
+               candidate_k = initial_k + lambda*(proposal_k - initial_k)
+            ELSE
+               candidate_k = initial_k + lambda*store%dm_trial_k_reslast
+            END IF
+            DO ic = 1, nimg
+               DO ispin = 1, nspin
+                  CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+                  IF (direction == 1) THEN
+                     CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, proposal(ispin, ic)%matrix, &
+                                    1.0_dp - lambda, lambda)
+                  ELSE
+                     CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, store%dm_pulay_res_last(ispin, ic)%matrix, &
+                                    1.0_dp, lambda)
+                  END IF
+               END DO
+            END DO
+            CALL qs_scf_free_evaluate(qs_env, scf_env, control, candidate_k, free_energy, eks, valid)
+            IF (iw > 0) WRITE (iw, '(T2,A,3I6,4ES24.14E3,L3)') &
+               "SCF_FREE_ENERGY| trial step,direction,halvings,lambda,F,deltaF,EKS,valid ", &
+               scf_env%iter_count, direction, backtrack, lambda, free_energy, free_energy - store%dm_trial_f_input, eks, valid
+            accepted = valid .AND. free_energy <= store%dm_trial_f_input + store%dm_trial_free_f_slack
+            IF (accepted) EXIT
+            lambda = 0.5_dp*lambda
+         END DO
+         IF (accepted) EXIT
+      END DO
+      IF (accepted) THEN
+         store%dm_trial_k_input = candidate_k
+         IF (direction == 2 .OR. lambda < 1.0_dp) THEN
+            store%dm_pulay_ncall = 0; store%dm_trial_fallback = .TRUE.
+         END IF
+         IF (iw > 0) WRITE (iw, '(T2,A,I6,3ES24.14E3,I6)') &
+            "SCF_FREE_ENERGY| accepted step,lambda,F,raw-residual,KS-evaluations ", &
+            scf_env%iter_count, lambda, free_energy, raw_residual, store%dm_trial_free_evaluations - evaluations_before
+      ELSE
+         DO ic = 1, nimg
+            DO ispin = 1, nspin
+               CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+            END DO
+         END DO
+         CALL qs_scf_free_evaluate(qs_env, scf_env, control, initial_k, free_energy, eks, valid)
+         store%dm_trial_k_input = initial_k
+         IF (iw > 0) WRITE (iw, '(T2,A,I6,2ES24.14E3)') &
+            "SCF_FREE_ENERGY| exhausted step,restored-input-F,raw-residual ", scf_env%iter_count, free_energy, raw_residual
+      END IF
+      CPASSERT(scf_env%iter_delta == raw_residual)
+      CALL dbcsr_deallocate_matrix_set(initial); CALL dbcsr_deallocate_matrix_set(proposal)
+      DEALLOCATE (initial_k, proposal_k, candidate_k)
+      IF (.NOT. accepted) CALL cp_abort(__LOCATION__, &
+                                        "Same-density free-energy line search exhausted; input restored; not SCF convergence")
+   END SUBROUTINE qs_scf_free_accept
+
+! **************************************************************************************************
+!> \brief Fixed-P rebuild and forward energy derivatives in the certified physical segment.
+   SUBROUTINE qs_scf_free_validate(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: control
+      INTEGER, INTENT(IN)                                :: iw
+      TYPE(dbcsr_p_type), POINTER                        :: initial(:, :), proposal(:, :)
+      COMPLEX(KIND=dp), INTENT(IN)                       :: initial_k(:, :, :, :), &
+                                                            proposal_k(:, :, :, :)
+
+      COMPLEX(KIND=dp), ALLOCATABLE                      :: candidate_k(:, :, :, :)
+      INTEGER                                            :: ic, ispin, probe
+      LOGICAL                                            :: valid
+      REAL(KIND=dp)                                      :: derivative, dot, eks, eks_error, f, &
+                                                            f_error, fd(2), ks_error, lambda
+      TYPE(dbcsr_p_type), POINTER                        :: matrix_ks(:, :), reference_ks(:, :)
+      TYPE(dbcsr_type)                                   :: delta
+
+      ! Form the reference from a fresh evaluation of this P, not an operator that
+      ! diagonalization/KS-DIIS may have temporarily transformed or extrapolated.
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+         END DO
+      END DO
+      CALL qs_scf_free_evaluate(qs_env, scf_env, control, initial_k, f, eks, valid)
+      CPASSERT(valid)
+      IF (iw > 0) WRITE (iw, '(T2,A,2ES24.14E3)') &
+         "SCF_FREE_ENERGY| validation input vs fresh EKS,F errors ", &
+         eks - scf_env%mixing_store%dm_trial_eks_input, f - scf_env%mixing_store%dm_trial_f_input
+      CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks)
+      NULLIFY (reference_ks)
+      CALL dbcsr_allocate_matrix_set(reference_ks, SIZE(initial, 1), SIZE(initial, 2))
+      derivative = 0.0_dp
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            ALLOCATE (reference_ks(ispin, ic)%matrix)
+            CALL dbcsr_create(reference_ks(ispin, ic)%matrix, template=matrix_ks(ispin, ic)%matrix)
+            CALL dbcsr_copy(reference_ks(ispin, ic)%matrix, matrix_ks(ispin, ic)%matrix)
+            CALL dbcsr_create(delta, template=initial(ispin, ic)%matrix)
+            CALL dbcsr_copy(delta, proposal(ispin, ic)%matrix)
+            CALL dbcsr_add(delta, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            CALL dbcsr_dot(delta, matrix_ks(ispin, ic)%matrix, dot)
+            derivative = derivative + dot; CALL dbcsr_release(delta)
+         END DO
+      END DO
+      IF (scf_env%mixing_store%dm_trial_free_precision_compare) &
+         CALL qs_scf_free_precision_compare(qs_env, scf_env, control, iw, initial, proposal, initial_k, 0.0_dp)
+      DO probe = 1, 2
+         lambda = 1.0E-3_dp/(2.0_dp**(probe - 1))
+         candidate_k = initial_k + lambda*(proposal_k - initial_k)
+         DO ic = 1, SIZE(initial, 2)
+            DO ispin = 1, SIZE(initial, 1)
+               CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+               CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, proposal(ispin, ic)%matrix, 1.0_dp - lambda, lambda)
+            END DO
+         END DO
+         CALL qs_scf_free_evaluate(qs_env, scf_env, control, candidate_k, f, eks, valid)
+         IF (.NOT. valid) CALL cp_abort(__LOCATION__, &
+                                        "Free-energy validation segment is not physical")
+         fd(probe) = (eks - scf_env%mixing_store%dm_trial_eks_input)/lambda
+         IF (scf_env%mixing_store%dm_trial_free_precision_compare) &
+            CALL qs_scf_free_precision_compare(qs_env, scf_env, control, iw, initial, proposal, candidate_k, lambda)
+      END DO
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+         END DO
+      END DO
+      CALL qs_scf_free_evaluate(qs_env, scf_env, control, initial_k, f, eks, valid)
+      CPASSERT(valid)
+      eks_error = eks - scf_env%mixing_store%dm_trial_eks_input
+      f_error = f - scf_env%mixing_store%dm_trial_f_input
+      ks_error = 0.0_dp
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            CALL dbcsr_add(reference_ks(ispin, ic)%matrix, matrix_ks(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+            ks_error = MAX(ks_error, dbcsr_maxabs(reference_ks(ispin, ic)%matrix))
+         END DO
+      END DO
+      IF (iw > 0) THEN
+         WRITE (iw, '(T2,A,3ES24.14E3)') "SCF_FREE_ENERGY| validation EKS derivative,FD1e-3,FD5e-4 ", derivative, fd
+         WRITE (iw, '(T2,A,3ES24.14E3)') "SCF_FREE_ENERGY| validation same-P EKS,F,KS errors ", eks_error, f_error, ks_error
+      END IF
+      CALL dbcsr_deallocate_matrix_set(reference_ks); DEALLOCATE (candidate_k)
+      IF (scf_env%mixing_store%dm_trial_free_diag_level > 0) &
+         CALL qs_scf_free_diagnostics(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
+   END SUBROUTINE qs_scf_free_validate
+
+! **************************************************************************************************
+!> \brief Diagnostic only: evaluate the current validation state again with the other native SKALA
+!>        model precision and print the energy decomposition and KS directional contraction of both.
+!> \note The same density matrix P = initial + lambda (proposal - initial) is rebuilt with the same
+!>       operations as the caller, so every difference between the two printed rows comes from the
+!>       model precision. The model keyword is restored before returning; the caller's next
+!>       evaluation (the next probe or the repeat at the input) rebuilds the state at that precision.
+!>       The extra evaluations are counted in dm_trial_free_evaluations.
+   SUBROUTINE qs_scf_free_precision_compare(qs_env, scf_env, control, iw, initial, proposal, candidate_k, lambda)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: control
+      INTEGER, INTENT(IN)                                :: iw
+      TYPE(dbcsr_p_type), POINTER                        :: initial(:, :), proposal(:, :)
+      COMPLEX(KIND=dp), INTENT(IN)                       :: candidate_k(:, :, :, :)
+      REAL(KIND=dp), INTENT(IN)                          :: lambda
+
+      INTEGER                                            :: ic, ispin
+      LOGICAL                                            :: fp64, valid
+      REAL(KIND=dp)                                      :: eks, f
+      TYPE(section_vals_type), POINTER                   :: gauxc_section, input, xc_section
+
+      CALL get_qs_env(qs_env, input=input)
+      xc_section => section_vals_get_subs_vals(input, "DFT%XC")
+      gauxc_section => get_gauxc_section(xc_section)
+      IF (.NOT. ASSOCIATED(gauxc_section)) CALL cp_abort(__LOCATION__, &
+                                                         "PULAY_P_FREE_PRECISION_COMPARE needs the native SKALA functional")
+      CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_MODEL_FP64", l_val=fp64)
+      CALL print_state(fp64)
+      CALL section_vals_val_set(gauxc_section, "NATIVE_GRID_MODEL_FP64", l_val=.NOT. fp64)
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+            IF (lambda /= 0.0_dp) &
+               CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, proposal(ispin, ic)%matrix, 1.0_dp - lambda, lambda)
+         END DO
+      END DO
+      CALL qs_scf_free_evaluate(qs_env, scf_env, control, candidate_k, f, eks, valid)
+      IF (.NOT. valid) CALL cp_abort(__LOCATION__, "Precision comparison state is not physical")
+      CALL print_state(.NOT. fp64)
+      CALL section_vals_val_set(gauxc_section, "NATIVE_GRID_MODEL_FP64", l_val=fp64)
+
+   CONTAINS
+
+      SUBROUTINE print_state(model_fp64)
+      LOGICAL, INTENT(IN)                                :: model_fp64
+
+      REAL(KIND=dp)                                      :: dot, ks_directional, other, values(11)
+      TYPE(dbcsr_p_type), POINTER                        :: ks(:, :)
+      TYPE(dbcsr_type)                                   :: delta
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+         CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control, matrix_ks_kp=ks)
+         ks_directional = 0.0_dp
+         DO ic = 1, SIZE(initial, 2)
+            DO ispin = 1, SIZE(initial, 1)
+               CALL dbcsr_create(delta, template=initial(ispin, ic)%matrix)
+               CALL dbcsr_copy(delta, proposal(ispin, ic)%matrix)
+               CALL dbcsr_add(delta, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               CALL dbcsr_dot(delta, ks(ispin, ic)%matrix, dot)
+               ks_directional = ks_directional + dot
+               CALL dbcsr_release(delta)
+            END DO
+         END DO
+         other = energy%gcp + energy%qmmm_el + energy%mulliken + SUM(energy%ddapc_restraint) + &
+                 energy%s2_restraint + energy%dft_plus_u + energy%efield + energy%efield_core + &
+                 energy%ee + energy%ee_core + energy%exc_aux_fit + energy%image_charge + &
+                 energy%sccs_pol + energy%cdft + energy%exc1_aux_fit
+         IF (dft_control%apply_embed_pot) other = other + energy%embed_corr
+         values = [energy%core, energy%core_overlap + energy%core_self + energy%core_cneo, &
+                   energy%hartree, energy%hartree_1c, energy%exc, energy%exc1, energy%ex, &
+                   energy%dispersion, other, energy%kinetic, energy%kTS]
+         IF (iw > 0) WRITE (iw, '(A,ES26.17E3,L3,2ES26.17E3,12ES26.17E3)') &
+            "F_PRECISION| lambda,fp64,F,EKS,core,constants,H,H1c,XC,XC1,ex,D3,other,kinetic,kTS,KS-direction ", &
+            lambda, model_fp64, energy%total, energy%total - energy%kTS, values, ks_directional
+      END SUBROUTINE print_state
+   END SUBROUTINE qs_scf_free_precision_compare
+
+! **************************************************************************************************
+!> \brief Registered repeated/central probes without changing the F acceptance or SCF criterion.
+   SUBROUTINE qs_scf_free_diagnostics(qs_env, scf_env, control, iw, initial, proposal, initial_k, proposal_k)
+      TYPE(qs_environment_type), POINTER :: qs_env
+      TYPE(qs_scf_env_type), POINTER :: scf_env
+      TYPE(scf_control_type), POINTER :: control
+      INTEGER, INTENT(IN) :: iw
+      TYPE(dbcsr_p_type), POINTER :: initial(:, :), proposal(:, :)
+      COMPLEX(dp), INTENT(IN) :: initial_k(:, :, :, :), proposal_k(:, :, :, :)
+
+      INTEGER :: pass, ih, nh, SEQUENCE, sample, ic, ispin, base, sign_index
+      REAL(dp) :: lambda, h(6), derivative(3), adjoint_derivative(3), real_derivative, dot, f, eks
+      LOGICAL :: valid
+      COMPLEX(dp), ALLOCATABLE :: candidate(:, :, :, :)
+      TYPE(dbcsr_p_type), POINTER :: ks(:, :), ref0(:, :), ref1(:, :), reference(:, :), direction_rs(:, :)
+      TYPE(dbcsr_type) :: delta
+      TYPE(mixing_storage_type), POINTER :: store
+
+      store => scf_env%mixing_store
+      IF (store%dm_trial_free_diag_level == 0) RETURN
+      IF (store%dm_trial_free_diag_level == 1 .OR. store%dm_trial_free_diag_level == 3) THEN
+         nh = 2; h(1:2) = [1.0E-3_dp, 5.0E-4_dp]
+      ELSE
+         nh = 6; h = [8.0E-3_dp, 4.0E-3_dp, 2.0E-3_dp, 1.0E-3_dp, 5.0E-4_dp, 2.5E-4_dp]
+      END IF
+      NULLIFY(ref0, ref1, reference, direction_rs)
+      CALL dbcsr_allocate_matrix_set(direction_rs, SIZE(initial, 1), SIZE(initial, 2))
+      DO ic = 1, SIZE(initial, 2)
+         DO ispin = 1, SIZE(initial, 1)
+            ALLOCATE(direction_rs(ispin, ic)%matrix)
+            CALL dbcsr_create(direction_rs(ispin, ic)%matrix, template=initial(ispin, ic)%matrix)
+            CALL dbcsr_copy(direction_rs(ispin, ic)%matrix, proposal(ispin, ic)%matrix)
+            CALL dbcsr_add(direction_rs(ispin, ic)%matrix, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+         END DO
+      END DO
+      sample = 0
+      ! Both bases belong to the original physical segment. Negative endpoint extrapolation is excluded.
+      DO base = 0, 1
+         lambda = 0.5_dp*REAL(base, dp)
+         CALL evaluate_sample(lambda, 0, 0, base)
+         CALL qs_scf_free_operator_snapshot(qs_env, scf_env, initial_k, proposal_k, initial, proposal, &
+                                             direction_rs, lambda, derivative, &
+                                            TRIM(store%dm_trial_free_diag_file)//MERGE(".midpoint.bin", ".input000.bin", base == 1))
+         real_derivative = 0.0_dp
+         CALL get_qs_env(qs_env, matrix_ks_kp=ks)
+         DO ic = 1, SIZE(initial, 2)
+            DO ispin = 1, SIZE(initial, 1)
+               CALL dbcsr_create(delta, template=initial(ispin, ic)%matrix)
+               CALL dbcsr_copy(delta, proposal(ispin, ic)%matrix)
+               CALL dbcsr_add(delta, initial(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+               CALL dbcsr_dot(delta, ks(ispin, ic)%matrix, dot)
+               real_derivative = real_derivative + dot
+               CALL dbcsr_release(delta)
+            END DO
+         END DO
+         IF (iw > 0) WRITE (iw, '(A,I4,4ES26.17E3)') &
+            "F_DIAG_OPERATOR| base,real_KS,Bloch_KS,Bloch_core,Bloch_kinetic ", base, real_derivative, derivative
+         CALL qs_scf_free_symmetry_snapshot(qs_env, scf_env, initial_k, proposal_k, adjoint_derivative, &
+            TRIM(store%dm_trial_free_diag_file)//MERGE(".midpoint.bin.adjoint", ".input000.bin.adjoint", base == 1))
+         IF (iw > 0) WRITE (iw, '(A,I4,4ES26.17E3)') &
+            "F_DIAG_ADJOINT| base,real_KS,Bloch_symmetry_KS,Bloch_symmetry_core,Bloch_symmetry_kinetic ", &
+            base, real_derivative, adjoint_derivative
+         IF (iw > 0) WRITE (iw, '(A)') "F_DIAG_REPRESENTATION| Hermitian-density symmetry adjoint"
+         IF (ABS(real_derivative - adjoint_derivative(1)) > 1.0E-10_dp) &
+            CALL cp_abort(__LOCATION__, "F diagnostic physical-adjoint contraction mismatch")
+         IF (store%dm_trial_free_diag_level == 3) &
+            CALL cp_abort(__LOCATION__, "F input-only diagnostics complete; no energy reference")
+         DO pass = 1, 2
+            CALL evaluate_sample(lambda, pass, 0, base)
+            DO ih = 1, nh
+               SEQUENCE = MERGE(ih, nh + 1 - ih, pass == 1)
+               IF (base == 0) THEN
+                  CALL evaluate_sample(h(SEQUENCE), pass, SEQUENCE, base)
+               ELSE
+                  DO sign_index = -1, 1, 2
+                     CALL evaluate_sample(0.5_dp + REAL(sign_index, dp)*h(SEQUENCE), pass, &
+                                          sign_index*SEQUENCE, base)
+                  END DO
+               END IF
+            END DO
+            CALL evaluate_sample(0.5_dp*REAL(base, dp), pass, 0, base)
+         END DO
+      END DO
+      CALL evaluate_sample(0.0_dp, 3, 0, 0)
+      IF (ALLOCATED(candidate)) DEALLOCATE (candidate)
+      CALL dbcsr_deallocate_matrix_set(direction_rs)
+      CALL dbcsr_deallocate_matrix_set(ref0)
+      CALL dbcsr_deallocate_matrix_set(ref1)
+
+   CONTAINS
+
+      SUBROUTINE evaluate_sample(fraction, repetition, index, origin)
+      REAL(dp), INTENT(IN)                               :: fraction
+      INTEGER, INTENT(IN)                                :: repetition, index, origin
+
+      REAL(dp)                                           :: component_error, other, values(11)
+      REAL(dp) :: ks_directional, ks_repeat_error
+      TYPE(dbcsr_type) :: difference
+      LOGICAL :: repeat_checked
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(qs_energy_type), POINTER                      :: energy
+
+         sample = sample + 1
+         IF (iw > 0) WRITE (iw, '(A,4I6,ES26.17E3)') &
+            "F_DIAG_BEGIN| sample,base,pass,index,lambda ", sample, origin, repetition, index, fraction
+         candidate = initial_k + fraction*(proposal_k - initial_k)
+         DO ic = 1, SIZE(initial, 2)
+            DO ispin = 1, SIZE(initial, 1)
+               CALL dbcsr_copy(scf_env%p_mix_new(ispin, ic)%matrix, initial(ispin, ic)%matrix)
+               IF (fraction /= 0.0_dp) &
+                  CALL dbcsr_add(scf_env%p_mix_new(ispin, ic)%matrix, proposal(ispin, ic)%matrix, &
+                                 1.0_dp - fraction, fraction)
+            END DO
+         END DO
+         CALL qs_scf_free_evaluate(qs_env, scf_env, control, candidate, f, eks, valid)
+         IF (.NOT. valid) CALL cp_abort(__LOCATION__, &
+                                        "Invalid F diagnostic ensemble/state; no further probes")
+         CALL get_qs_env(qs_env, energy=energy, dft_control=dft_control, matrix_ks_kp=ks)
+         ks_directional = 0.0_dp; ks_repeat_error = 0.0_dp
+         repeat_checked = index == 0 .AND. repetition > 0
+         IF (origin == 0) THEN
+            reference => ref0
+         ELSE
+            reference => ref1
+         END IF
+         IF (index == 0 .AND. repetition == 0 .AND. .NOT. ASSOCIATED(reference)) THEN
+            CALL dbcsr_allocate_matrix_set(reference, SIZE(ks, 1), SIZE(ks, 2))
+            DO ic = 1, SIZE(ks, 2)
+               DO ispin = 1, SIZE(ks, 1)
+                  ALLOCATE(reference(ispin, ic)%matrix)
+                  CALL dbcsr_create(reference(ispin, ic)%matrix, template=ks(ispin, ic)%matrix)
+               END DO
+            END DO
+            IF (origin == 0) THEN
+               ref0 => reference
+            ELSE
+               ref1 => reference
+            END IF
+         END IF
+         DO ic = 1, SIZE(ks, 2)
+            DO ispin = 1, SIZE(ks, 1)
+               CALL dbcsr_dot(direction_rs(ispin, ic)%matrix, ks(ispin, ic)%matrix, dot)
+               ks_directional = ks_directional + dot
+               IF (index == 0 .AND. repetition == 0) THEN
+                  CALL dbcsr_copy(reference(ispin, ic)%matrix, ks(ispin, ic)%matrix)
+               ELSE IF (repeat_checked) THEN
+                  CALL dbcsr_create(difference, template=ks(ispin, ic)%matrix)
+                  CALL dbcsr_copy(difference, reference(ispin, ic)%matrix)
+                  CALL dbcsr_add(difference, ks(ispin, ic)%matrix, 1.0_dp, -1.0_dp)
+                  ks_repeat_error = MAX(ks_repeat_error, dbcsr_maxabs(difference))
+                  CALL dbcsr_release(difference)
+               END IF
+            END DO
+         END DO
+         IF (iw > 0) WRITE(iw, '(A,I6,ES26.17E3,L3,ES26.17E3)') &
+            "F_DIAG_CONTRACTION| sample,KS-direction,repeat-checked,repeat-KS-error ", &
+            sample, ks_directional, repeat_checked, ks_repeat_error
+         CPASSERT(ks_repeat_error <= 1.0E-10_dp)
+
+         other = energy%gcp + energy%qmmm_el + energy%mulliken + SUM(energy%ddapc_restraint) + &
+                 energy%s2_restraint + energy%dft_plus_u + energy%efield + energy%efield_core + &
+                 energy%ee + energy%ee_core + energy%exc_aux_fit + energy%image_charge + &
+                 energy%sccs_pol + energy%cdft + energy%exc1_aux_fit
+         IF (dft_control%apply_embed_pot) other = other + energy%embed_corr
+         component_error = ABS(eks - (energy%core + energy%core_overlap + energy%core_self + energy%core_cneo + &
+                                      energy%hartree + energy%hartree_1c + energy%exc + energy%exc1 + energy%ex + &
+                                      energy%dispersion + other))
+         CPASSERT(component_error <= 1.0E-10_dp)
+         values = [energy%core, energy%core_overlap + energy%core_self + energy%core_cneo, &
+                   energy%hartree, energy%hartree_1c, energy%exc, energy%exc1, energy%ex, &
+                   energy%dispersion, other, energy%kinetic, energy%kTS]
+         IF (iw > 0) WRITE (iw, '(A,I6,ES26.17E3,3ES26.17E3,11ES26.17E3)') &
+            "F_DIAG_SAMPLE| sample,lambda,F,EKS,kTS,core,constants,H,H1c,XC,XC1,ex,D3,other,kinetic,kTS-copy ", &
+            sample, fraction, f, eks, energy%kTS, values
+      END SUBROUTINE evaluate_sample
+   END SUBROUTINE qs_scf_free_diagnostics
 
 END MODULE qs_scf
