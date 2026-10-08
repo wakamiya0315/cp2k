@@ -141,6 +141,13 @@ MODULE qs_density_mixing_types
                                                            dm_pulay_joint_active = .FALSE.
       REAL(KIND=dp)                                     :: dm_pulay_mag_weight = 1.0_dp, &
                                                            dm_pulay_joint_start = 0.0_dp
+      ! PULAY_P_GRAM_CACHE: inner products of the stored residual differences, kept between calls.
+      ! Entry (j, k) is valid while slots j and k hold the same differences and the joint mode
+      ! (dm_pulay_gram_joint) is that of the cached values.
+      LOGICAL                                           :: dm_pulay_gram_cache = .FALSE., &
+                                                           dm_pulay_gram_joint = .FALSE.
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)       :: dm_pulay_gram
+      LOGICAL, ALLOCATABLE, DIMENSION(:, :)             :: dm_pulay_gram_valid
 #if defined(__TBLITE)
       CLASS(mixer_type), ALLOCATABLE                    :: tb_scc_mixer
 #endif
@@ -249,6 +256,8 @@ CONTAINS
                                    r_val=mixing_store%dm_pulay_mag_weight)
          CALL section_vals_val_get(mixing_section, "PULAY_P_JOINT_START", &
                                    r_val=mixing_store%dm_pulay_joint_start)
+         CALL section_vals_val_get(mixing_section, "PULAY_P_GRAM_CACHE", &
+                                   l_val=mixing_store%dm_pulay_gram_cache)
       END IF
       CALL section_vals_val_get(mixing_section, "PULAY_P_DIAGNOSTICS", l_val=mixing_store%dm_trial_diagnostics)
       CALL section_vals_val_get(mixing_section, "PULAY_P_REJECT", l_val=mixing_store%dm_trial_reject)
@@ -961,6 +970,19 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_GRAM_CACHE", &
+                          description="With PULAY_P: keep the inner products of the stored residual "// &
+                          "differences between SCF steps and compute only those of the newest "// &
+                          "difference, instead of all of them over all images at every step. A stored "// &
+                          "difference does not change until its slot is reused, so the cached values "// &
+                          "are those the full computation would give.", &
+                          repeats=.FALSE., &
+                          lone_keyword_l_val=.TRUE., &
+                          default_l_val=.FALSE., &
+                          usage="PULAY_P_GRAM_CACHE")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="PULAY_P_JOINT", &
                           description="With PULAY_P and two spins: keep the differences of the total "// &
                           "and of the spin density matrix in one history and take one set of Pulay "// &
@@ -1135,6 +1157,8 @@ CONTAINS
          END DO
          DEALLOCATE (mixing_store%dm_pulay_dp, mixing_store%dm_pulay_dres)
       END IF
+      IF (ALLOCATED(mixing_store%dm_pulay_gram)) DEALLOCATE (mixing_store%dm_pulay_gram)
+      IF (ALLOCATED(mixing_store%dm_pulay_gram_valid)) DEALLOCATE (mixing_store%dm_pulay_gram_valid)
       mixing_store%dm_pulay_ncall = 0
 
    END SUBROUTINE dm_pulay_storage_release

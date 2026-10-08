@@ -144,6 +144,19 @@ int skala_one_centre_gpu_set_gradients(const int kind, const int ngrid,
 }
 
 /*******************************************************************************
+ * \brief Whether the basis gradients of kind 'kind' (1-based) with these sizes
+ *        are on the device (1) or not (0).
+ ******************************************************************************/
+int skala_one_centre_gpu_has_gradients(const int kind, const int ngrid,
+                                       const int nbas) {
+  if (kind < 1 || kind > MAX_KINDS) {
+    return 0;
+  }
+  const kind_gradients *k = &kinds[kind - 1];
+  return k->grad != NULL && k->ngrid == ngrid && k->nbas == nbas;
+}
+
+/*******************************************************************************
  * \brief tau on all grid points of kind 'kind' for the density matrix
  *        'matrix' (nbas x nbas): product_d = 1/2 grad_d matrix^T, then
  *        tau = sum_d sum_b grad_d .* product_d, as calc_tau_atom.

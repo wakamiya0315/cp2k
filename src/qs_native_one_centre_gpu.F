@@ -33,7 +33,8 @@ MODULE qs_native_one_centre_gpu
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_native_one_centre_gpu'
 
-   PUBLIC :: calc_tau_atom_gpu, dgaVtaudgb_gpu, gaVxcgb_GC_gpu, one_centre_gpu_release
+   PUBLIC :: calc_tau_atom_gpu, dgaVtaudgb_gpu, gaVxcgb_GC_gpu, one_centre_gpu_has_gradients, &
+             one_centre_gpu_release
 
 #if defined(__OFFLOAD_CUDA)
    INTERFACE
@@ -44,6 +45,12 @@ MODULE qs_native_one_centre_gpu
          REAL(KIND=C_DOUBLE), DIMENSION(*), INTENT(IN)     :: grad
          INTEGER(KIND=C_INT)                               :: uploaded
       END FUNCTION set_gradients_c
+      FUNCTION has_gradients_c(kind, ngrid, nbas) RESULT(present) &
+         BIND(C, name="skala_one_centre_gpu_has_gradients")
+         IMPORT :: C_INT
+         INTEGER(KIND=C_INT), VALUE                        :: kind, ngrid, nbas
+         INTEGER(KIND=C_INT)                               :: present
+      END FUNCTION has_gradients_c
       SUBROUTINE tau_c(kind, matrix, tau) BIND(C, name="skala_one_centre_gpu_tau")
          IMPORT :: C_DOUBLE, C_INT
          INTEGER(KIND=C_INT), VALUE                        :: kind
@@ -87,12 +94,16 @@ CONTAINS
       INTEGER(KIND=C_INT)                                :: uploaded
 
       CALL timeset("skala_1c_gpu_gradients", handle)
-      CPASSERT(ALLOCATED(tau_cache%grad))
-      CPASSERT(SIZE(tau_cache%grad, 1) == tau_cache%na*tau_cache%nr)
-      CPASSERT(SIZE(tau_cache%grad, 2) == tau_cache%nsatbas)
-      uploaded = set_gradients_c(INT(kind_index, C_INT), INT(tau_cache%na*tau_cache%nr, C_INT), &
-                                 INT(tau_cache%nsatbas, C_INT), tau_cache%grad)
-      MARK_USED(uploaded)
+      IF (ALLOCATED(tau_cache%grad)) THEN
+         CPASSERT(SIZE(tau_cache%grad, 1) == tau_cache%na*tau_cache%nr)
+         CPASSERT(SIZE(tau_cache%grad, 2) == tau_cache%nsatbas)
+         uploaded = set_gradients_c(INT(kind_index, C_INT), INT(tau_cache%na*tau_cache%nr, C_INT), &
+                                    INT(tau_cache%nsatbas, C_INT), tau_cache%grad)
+         MARK_USED(uploaded)
+      ELSE
+         ! A cache made without gradients: they must already be on the device.
+         CPASSERT(one_centre_gpu_has_gradients(tau_cache, kind_index))
+      END IF
       CALL timestop(handle)
 #else
       MARK_USED(tau_cache)
@@ -100,6 +111,27 @@ CONTAINS
       CPABORT("NATIVE_GRID_GPU_ONE_CENTRE requires a CP2K build with CUDA.")
 #endif
    END SUBROUTINE set_gradients
+
+! **************************************************************************************************
+!> \brief Whether the basis gradients of a kind, with the sizes of tau_cache, are on the device.
+!> \param tau_cache sizes of the kind's grid and basis (gradients need not be present)
+!> \param kind_index ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION one_centre_gpu_has_gradients(tau_cache, kind_index) RESULT(present)
+      TYPE(tau_basis_cache_type), INTENT(IN)             :: tau_cache
+      INTEGER, INTENT(IN)                                :: kind_index
+      LOGICAL                                            :: present
+
+#if defined(__OFFLOAD_CUDA)
+      present = has_gradients_c(INT(kind_index, C_INT), INT(tau_cache%na*tau_cache%nr, C_INT), &
+                                INT(tau_cache%nsatbas, C_INT)) == 1
+#else
+      MARK_USED(tau_cache)
+      MARK_USED(kind_index)
+      present = .FALSE.
+#endif
+   END FUNCTION one_centre_gpu_has_gradients
 
 ! **************************************************************************************************
 !> \brief GPU counterpart of calc_tau_atom: tau = 1/2 sum_ij P_ij grad(phi_i) . grad(phi_j) of the

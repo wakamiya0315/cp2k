@@ -511,13 +511,16 @@ CONTAINS
 !> \param grid_atom atom-centered integration grid
 !> \param basis_1c GAPW one-center basis
 !> \param harmonics spherical harmonics on the atom-centered grid
+!> \param with_gradients compute the basis gradients (default); without them only the sizes and
+!>        index maps are set, for callers that hold the gradients elsewhere
 ! **************************************************************************************************
-   SUBROUTINE create_tau_basis_cache(tau_cache, grid_atom, basis_1c, harmonics)
+   SUBROUTINE create_tau_basis_cache(tau_cache, grid_atom, basis_1c, harmonics, with_gradients)
 
       TYPE(tau_basis_cache_type), INTENT(INOUT)          :: tau_cache
       TYPE(grid_atom_type), POINTER                      :: grid_atom
       TYPE(gto_basis_set_type), POINTER                  :: basis_1c
       TYPE(harmonics_atom_type), POINTER                 :: harmonics
+      LOGICAL, INTENT(IN), OPTIONAL                      :: with_gradients
 
       INTEGER                                            :: dir, ia, igrid, ip, ipgf, ir, iset, iso, &
                                                             l, starti
@@ -539,6 +542,9 @@ CONTAINS
 
       tau_cache%nr = grid_atom%nr
       tau_cache%na = grid_atom%ng_sphere
+      IF (PRESENT(with_gradients)) THEN
+         IF (.NOT. with_gradients) RETURN
+      END IF
       slm => harmonics%slm
       dslm_dxyz => harmonics%dslm_dxyz
 

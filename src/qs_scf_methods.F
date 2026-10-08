@@ -171,6 +171,71 @@ CONTAINS
    END SUBROUTINE scf_env_density_mixing
 
 ! **************************************************************************************************
+!> \brief Make room for the cached inner products of the Pulay history (PULAY_P_GRAM_CACHE) and
+!>        forget those of a slot that was just rewritten, or all of them when the joint mode of
+!>        the spin mixing changed.
+!> \param mixing_store ...
+!> \param nbuffer ...
+!> \param slot the rewritten slot
+!> \param joint whether the products include the spin channel (PULAY_P_JOINT)
+! **************************************************************************************************
+   SUBROUTINE pulay_gram_forget(mixing_store, nbuffer, slot, joint)
+      TYPE(mixing_storage_type), INTENT(INOUT)           :: mixing_store
+      INTEGER, INTENT(IN)                                :: nbuffer, slot
+      LOGICAL, INTENT(IN)                                :: joint
+
+      IF (.NOT. ALLOCATED(mixing_store%dm_pulay_gram)) THEN
+         ALLOCATE (mixing_store%dm_pulay_gram(nbuffer, nbuffer), &
+                   mixing_store%dm_pulay_gram_valid(nbuffer, nbuffer))
+         mixing_store%dm_pulay_gram_valid(:, :) = .FALSE.
+         mixing_store%dm_pulay_gram_joint = joint
+      END IF
+      IF (joint .NEQV. mixing_store%dm_pulay_gram_joint) THEN
+         mixing_store%dm_pulay_gram_valid(:, :) = .FALSE.
+         mixing_store%dm_pulay_gram_joint = joint
+      END IF
+      mixing_store%dm_pulay_gram_valid(slot, :) = .FALSE.
+      mixing_store%dm_pulay_gram_valid(:, slot) = .FALSE.
+   END SUBROUTINE pulay_gram_forget
+
+! **************************************************************************************************
+!> \brief Whether the inner product of the stored differences jb and kb is in the cache
+!>        (PULAY_P_GRAM_CACHE).
+!> \param mixing_store ...
+!> \param jb ...
+!> \param kb ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pulay_gram_cached(mixing_store, jb, kb) RESULT(cached)
+      TYPE(mixing_storage_type), INTENT(IN)              :: mixing_store
+      INTEGER, INTENT(IN)                                :: jb, kb
+      LOGICAL                                            :: cached
+
+      cached = .FALSE.
+      IF (.NOT. mixing_store%dm_pulay_gram_cache) RETURN
+      IF (.NOT. ALLOCATED(mixing_store%dm_pulay_gram_valid)) RETURN
+      cached = mixing_store%dm_pulay_gram_valid(jb, kb)
+   END FUNCTION pulay_gram_cached
+
+! **************************************************************************************************
+!> \brief Keep the inner product of the stored differences jb and kb (PULAY_P_GRAM_CACHE).
+!> \param mixing_store ...
+!> \param jb ...
+!> \param kb ...
+!> \param value the inner product over all spins or channels and images
+! **************************************************************************************************
+   SUBROUTINE pulay_gram_store(mixing_store, jb, kb, value)
+      TYPE(mixing_storage_type), INTENT(INOUT)           :: mixing_store
+      INTEGER, INTENT(IN)                                :: jb, kb
+      REAL(KIND=dp), INTENT(IN)                          :: value
+
+      IF (.NOT. mixing_store%dm_pulay_gram_cache) RETURN
+      IF (.NOT. ALLOCATED(mixing_store%dm_pulay_gram)) RETURN
+      mixing_store%dm_pulay_gram(jb, kb) = value
+      mixing_store%dm_pulay_gram_valid(jb, kb) = .TRUE.
+   END SUBROUTINE pulay_gram_store
+
+! **************************************************************************************************
 !> \brief Pulay (Anderson) mixing of the real-space density matrices (MIXING%PULAY_P)
 !> \param p_mix_new    on entry the output density matrices P_out of the diagonalization, on exit
 !>                     the input density matrices of the next step
@@ -315,6 +380,7 @@ CONTAINS
          ELSE
             nb = 0 ! no new information: mix linearly
          END IF
+         IF (mixing_store%dm_pulay_gram_cache) CALL pulay_gram_forget(mixing_store, nbuffer, ib, .FALSE.)
       END IF
 
       ! coefficients g of the history from the normal equations
@@ -324,13 +390,18 @@ CONTAINS
          c = 0.0_dp
          DO jb = 1, nb
             DO kb = jb, nb
-               DO ic = 1, nimg
-                  DO ispin = 1, nspin
-                     a(jb, kb) = a(jb, kb) + &
-                                 frobenius_dot(mixing_store%dm_pulay_dres(jb, ispin, ic)%matrix, &
-                                               mixing_store%dm_pulay_dres(kb, ispin, ic)%matrix)
+               IF (pulay_gram_cached(mixing_store, jb, kb)) THEN
+                  a(jb, kb) = mixing_store%dm_pulay_gram(jb, kb)
+               ELSE
+                  DO ic = 1, nimg
+                     DO ispin = 1, nspin
+                        a(jb, kb) = a(jb, kb) + &
+                                    frobenius_dot(mixing_store%dm_pulay_dres(jb, ispin, ic)%matrix, &
+                                                  mixing_store%dm_pulay_dres(kb, ispin, ic)%matrix)
+                     END DO
                   END DO
-               END DO
+                  CALL pulay_gram_store(mixing_store, jb, kb, a(jb, kb))
+               END IF
                a(kb, jb) = a(jb, kb)
             END DO
             a(jb, jb) = a(jb, jb) + mixing_store%broy_w0
@@ -555,6 +626,8 @@ CONTAINS
          END IF
       END IF
       joint_step = nch == 2 .AND. mixing_store%dm_pulay_joint_active
+      IF (mixing_store%dm_pulay_gram_cache .AND. mixing_store%dm_pulay_ncall > 1) &
+         CALL pulay_gram_forget(mixing_store, nbuffer, ib, joint_step)
 
       ! keep P_in and R of both spins, then turn p_mix_new into the residuals of the total density
       ! matrix (spin 1) and of the spin density matrix (spin 2)
@@ -574,13 +647,18 @@ CONTAINS
          c = 0.0_dp
          DO jb = 1, nb
             DO kb = jb, nb
-               DO ic = 1, nimg
-                  a(jb, kb) = a(jb, kb) + frobenius_dot(mixing_store%dm_pulay_dres(jb, 1, ic)%matrix, &
-                                                        mixing_store%dm_pulay_dres(kb, 1, ic)%matrix)
-                  IF (joint_step) a(jb, kb) = a(jb, kb) + &
-                                              weight*frobenius_dot(mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
-                                                                   mixing_store%dm_pulay_dres(kb, 2, ic)%matrix)
-               END DO
+               IF (pulay_gram_cached(mixing_store, jb, kb)) THEN
+                  a(jb, kb) = mixing_store%dm_pulay_gram(jb, kb)
+               ELSE
+                  DO ic = 1, nimg
+                     a(jb, kb) = a(jb, kb) + frobenius_dot(mixing_store%dm_pulay_dres(jb, 1, ic)%matrix, &
+                                                           mixing_store%dm_pulay_dres(kb, 1, ic)%matrix)
+                     IF (joint_step) a(jb, kb) = a(jb, kb) + &
+                                                 weight*frobenius_dot(mixing_store%dm_pulay_dres(jb, 2, ic)%matrix, &
+                                                                      mixing_store%dm_pulay_dres(kb, 2, ic)%matrix)
+                  END DO
+                  CALL pulay_gram_store(mixing_store, jb, kb, a(jb, kb))
+               END IF
                a(kb, jb) = a(jb, kb)
             END DO
             DO ic = 1, nimg

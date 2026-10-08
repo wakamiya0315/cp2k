@@ -86,6 +86,7 @@ MODULE qs_vxc_atom
    USE qs_native_one_centre_gpu,        ONLY: calc_tau_atom_gpu,&
                                               dgaVtaudgb_gpu,&
                                               gaVxcgb_GC_gpu,&
+                                              one_centre_gpu_has_gradients,&
                                               one_centre_gpu_release
    USE qs_rho_atom_methods,             ONLY: replicate_rho_atom_radial
    USE qs_rho_atom_types,               ONLY: get_rho_atom,&
@@ -335,7 +336,8 @@ CONTAINS
          composite_row_rank, gapw_density_partition, gapw_representation, handle, ia, iat, iatom, &
          icomponent, idir, ikind, ir, ispin, iw, jdir, myfun, na, natom, nlcc_entry, nlcc_first, &
          nlcc_last, nr, nspins, num_pe, on, section_handle, source_atom, target_atom
-      INTEGER :: one_centre_col_count, xc_deriv_method_id, xc_rho_smooth_id, zatom
+      INTEGER :: cache_handle, one_centre_col_count, xc_deriv_method_id, xc_rho_smooth_id, &
+         zatom
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: composite_atomic_grid_sizes, &
                                                             composite_local_grid_sizes
       INTEGER, ALLOCATABLE, DIMENSION(:) :: adjoint_bin_offsets, adjoint_bin_rows, &
@@ -2227,7 +2229,16 @@ CONTAINS
                   CALL reallocate(vtau_h, 1, na, 1, nr, 1, nspins)
                   CALL reallocate(vtau_s, 1, na, 1, nr, 1, nspins)
                   CALL timeset("skala_vxc_1c_fields", section_handle)
-                  CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics)
+                  CALL timeset("skala_1c_adj_cache", cache_handle)
+                  IF (native_grid_gpu_one_centre) THEN
+                     CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics, &
+                                                 with_gradients=.FALSE.)
+                     IF (.NOT. one_centre_gpu_has_gradients(tau_basis_cache, ikind)) &
+                        CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics)
+                  ELSE
+                     CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics)
+                  END IF
+                  CALL timestop(cache_handle)
                   CALL timestop(section_handle)
 
                   bo = get_limit(natom, para_env%num_pe, para_env%mepos)
@@ -4961,8 +4972,8 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env
       INTEGER, INTENT(IN)                                :: nspins, gapw_representation
 
-      INTEGER                                            :: iat, iatom, ikind, ir, na, natom, nr, &
-                                                            zatom
+      INTEGER                                            :: handle, iat, iatom, ikind, ir, na, &
+                                                            natom, nr, zatom
       INTEGER, DIMENSION(:), POINTER                     :: atom_list
       LOGICAL                                            :: paw_atom
       REAL(dp)                                           :: zeff
@@ -4993,7 +5004,17 @@ CONTAINS
                                         natom, nspins)
          nr = grid_atom%nr
          na = grid_atom%ng_sphere
-         CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics)
+         CALL timeset("skala_1c_fields_cache", handle)
+         IF (gpu_one_centre) THEN
+            ! The GPU keeps the basis gradients of the kind; compute them only if it lacks them.
+            CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics, &
+                                        with_gradients=.FALSE.)
+            IF (.NOT. one_centre_gpu_has_gradients(tau_basis_cache, ikind)) &
+               CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics)
+         ELSE
+            CALL create_tau_basis_cache(tau_basis_cache, grid_atom, basis_1c, harmonics)
+         END IF
+         CALL timestop(handle)
          DO iat = 1, natom
             iatom = atom_list(iat)
             ALLOCATE (fields(iatom)%rho_h(na, nr, nspins), fields(iatom)%rho_s(na, nr, nspins), &
@@ -5016,21 +5037,27 @@ CONTAINS
                CALL calc_tau_atom(fields(iatom)%tau_h, fields(iatom)%tau_s, rho_atom, &
                                   tau_basis_cache, nspins)
             END IF
+            CALL timeset("skala_1c_fields_angular", handle)
             DO ir = 1, nr
                CALL calc_rho_angular(grid_atom, harmonics, nspins, .TRUE., ir, r_h, r_s, &
                                      fields(iatom)%rho_h, fields(iatom)%rho_s, dr_h, dr_s, &
                                      r_h_d, r_s_d, fields(iatom)%drho_h, fields(iatom)%drho_s)
             END DO
+            CALL timestop(handle)
+            CALL timeset("skala_1c_fields_support", handle)
             fields(iatom)%support_radius = gapw_atom_grid_support_radius( &
                                            grid_atom, fields(iatom)%rho_h, fields(iatom)%rho_s, &
                                            fields(iatom)%drho_h, fields(iatom)%drho_s, &
                                            fields(iatom)%tau_h, fields(iatom)%tau_s)
+            CALL timestop(handle)
             IF (fields(iatom)%support_radius <= 0.0_dp) CYCLE
             ALLOCATE (fields(iatom)%projection(harmonics%max_s_harm, nr, 5, nspins))
+            CALL timeset("skala_1c_fields_project", handle)
             CALL project_atom_grid_fields(grid_atom, harmonics, nspins, fields(iatom)%rho_h, &
                                           fields(iatom)%rho_s, fields(iatom)%drho_h, &
                                           fields(iatom)%drho_s, fields(iatom)%tau_h, &
                                           fields(iatom)%tau_s, fields(iatom)%projection)
+            CALL timestop(handle)
          END DO
          CALL release_tau_basis_cache(tau_basis_cache)
       END DO
