@@ -1535,6 +1535,19 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="NATIVE_GRID_GPU_FIELDS", &
+                          description="Assemble the one-centre fields of the experimental "// &
+                          "CP2K-native SKALA atom-composite route on their atom grids and "// &
+                          "interpolate them between atoms (forward and adjoint) on the GPU. The "// &
+                          "host computes the interpolation nodes, weights and harmonics of every "// &
+                          "cross-atom point once per candidate list, as the CPU path does; only "// &
+                          "the order of the sums differs, and no atomic additions are used. "// &
+                          "Requires a CP2K build with CUDA.", &
+                          usage="NATIVE_GRID_GPU_FIELDS T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="NATIVE_GRID_CUDA_DEVICE", &
                           description="CUDA device used by the experimental CP2K-native SKALA GPW "// &
                           "TorchScript path when NATIVE_GRID_USE_CUDA is enabled. A negative value "// &

@@ -77,6 +77,11 @@ MODULE qs_vxc_atom
                                               native_grid_interpolation_stencil_type,&
                                               prepare_native_grid_cache,&
                                               store_native_grid_stencil
+   USE qs_native_fields_gpu,            ONLY: fields_gpu_angular,&
+                                              fields_gpu_cross_adjoint,&
+                                              fields_gpu_cross_forward,&
+                                              fields_gpu_release,&
+                                              fields_gpu_set_cross
    USE qs_native_grid_gpu,              ONLY: native_grid_gpu_adjoint,&
                                               native_grid_gpu_interpolate,&
                                               native_grid_gpu_release,&
@@ -178,6 +183,8 @@ MODULE qs_vxc_atom
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: displacement
       ! First candidate of every row that has candidates, and one past the last
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: row_first
+      ! NATIVE_GRID_GPU_FIELDS: the device holds the interpolation table of this list
+      LOGICAL                                            :: gpu_table_ready = .FALSE.
    END TYPE cross_candidate_list_type
 
    ! Points of the atom grid of one kind relative to its atom, as the atom-composite route builds
@@ -348,8 +355,8 @@ CONTAINS
       LOGICAL :: accint, adjoint_private, atom_composite_active, atom_composite_diagnostic, &
          atom_composite_reference, direct_valence_atom_composite, donlcc, evaluate_hard, &
          evaluate_soft, gradient_f, image_partition_atom_composite, lsd, my_calculate_forces, &
-         native_grid_diagnostics, native_grid_gpu_one_centre, native_grid_gpu_stencil, &
-         native_trial_diagnostics, nlcc, &
+         native_grid_diagnostics, native_grid_gpu_fields, native_grid_gpu_one_centre, &
+         native_grid_gpu_stencil, native_trial_diagnostics, nlcc, &
          one_center_kind, paw_atom, &
          paw_pseudopotentials, requested_atom_composite_grid, reuse_partition, rho_g_valid, &
          skala_atom_grid, source_matrix_local, tau_f, tau_r_valid, use_atom_composite_density, &
@@ -544,6 +551,7 @@ CONTAINS
       native_grid_diagnostics = .FALSE.
       native_grid_gpu_stencil = .FALSE.
       native_grid_gpu_one_centre = .FALSE.
+      native_grid_gpu_fields = .FALSE.
       native_trial_diagnostics = .FALSE.
       atom_composite_components = 1
       feature_vxc_step = 3.0E-3_dp
@@ -584,6 +592,8 @@ CONTAINS
                                    l_val=native_grid_gpu_stencil)
          CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_GPU_ONE_CENTRE", &
                                    l_val=native_grid_gpu_one_centre)
+         CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_GPU_FIELDS", &
+                                   l_val=native_grid_gpu_fields)
       END IF
       atom_composite_reference = atom_composite_reference .OR. &
                                  (gapw_representation == skala_gapw_paw_one_center .AND. &
@@ -953,7 +963,7 @@ CONTAINS
             IF (.NOT. direct_valence_atom_composite) THEN
                CALL timeset("skala_vxc_1c_fields", section_handle)
                ALLOCATE (one_center_fields(SIZE(particle_set)))
-               CALL compute_one_center_fields(native_grid_gpu_one_centre, &
+               CALL compute_one_center_fields(native_grid_gpu_one_centre, native_grid_gpu_fields, &
                                               one_center_fields, my_kind_set, atomic_kind_set, &
                                               my_rho_atom_set, para_env, nspins, &
                                               gapw_representation)
@@ -1457,11 +1467,21 @@ CONTAINS
                         CALL timestop(section_handle)
                      END IF
                      CALL timeset("skala_vxc_cross_fwd", section_handle)
-                     CALL add_cross_atom_fields( &
-                        composite_geometry%cross(source_atom), cross_cutoff, grid_atom, harmonics, &
-                        nspins, lsd, use_atom_composite_density, use_atom_composite_gradient, &
-                        use_atom_composite_tau, one_center_fields(source_atom), &
-                        composite_cross_density, composite_cross_grad, composite_cross_kin)
+                     IF (native_grid_gpu_fields) THEN
+                        CALL gpu_cross_atom_fields( &
+                           composite_geometry%cross(source_atom), source_atom, cross_cutoff, &
+                           grid_atom, harmonics, nspins, lsd, use_atom_composite_density, &
+                           use_atom_composite_gradient, use_atom_composite_tau, &
+                           one_center_fields(source_atom), composite_cross_density, &
+                           composite_cross_grad, composite_cross_kin)
+                     ELSE
+                        CALL add_cross_atom_fields( &
+                           composite_geometry%cross(source_atom), cross_cutoff, grid_atom, &
+                           harmonics, nspins, lsd, use_atom_composite_density, &
+                           use_atom_composite_gradient, use_atom_composite_tau, &
+                           one_center_fields(source_atom), composite_cross_density, &
+                           composite_cross_grad, composite_cross_kin)
+                     END IF
                      CALL timestop(section_handle)
                   END DO
                END DO
@@ -2305,7 +2325,14 @@ CONTAINS
                      END IF
 
                      cross_cutoff = one_center_fields(iatom)%support_radius
-                     IF (cross_cutoff > 0.0_dp) THEN
+                     IF (cross_cutoff > 0.0_dp .AND. native_grid_gpu_fields) THEN
+                        CALL gpu_cross_atom_adjoint( &
+                           composite_geometry%cross(iatom), iatom, cross_cutoff, grid_atom, &
+                           harmonics, nspins, lsd, use_atom_composite_density, &
+                           use_atom_composite_gradient, use_atom_composite_tau, &
+                           composite_density_grad, composite_grad_grad, composite_kin_grad, &
+                           vxc_h, vxc_s, vxg_h, vxg_s, vtau_h, vtau_s)
+                     ELSE IF (cross_cutoff > 0.0_dp) THEN
                         CALL add_cross_atom_adjoint( &
                            composite_geometry%cross(iatom), cross_cutoff, grid_atom, harmonics, &
                            nspins, lsd, use_atom_composite_density, use_atom_composite_gradient, &
@@ -4404,6 +4431,8 @@ CONTAINS
       CALL native_grid_gpu_release()
       ! The basis gradients on the device belong to the kinds' grids, which are part of the key.
       CALL one_centre_gpu_release()
+      ! So do the harmonics and the interpolation tables of NATIVE_GRID_GPU_FIELDS.
+      CALL fields_gpu_release()
    END SUBROUTINE release_composite_geometry
 
 ! **************************************************************************************************
@@ -4654,6 +4683,7 @@ CONTAINS
          next_slot(row) = next_slot(row) + 1
       END DO
       candidates%cutoff = cutoff
+      candidates%gpu_table_ready = .FALSE.
       DEALLOCATE (row_count, next_slot, unsorted_row, unsorted_shift, unsorted_displacement)
    END SUBROUTINE build_cross_candidates
 
@@ -4825,6 +4855,232 @@ CONTAINS
    END SUBROUTINE add_cross_atom_adjoint
 
 ! **************************************************************************************************
+!> \brief Make the interpolation table of the candidate list of one source atom and store it on
+!>        the GPU (NATIVE_GRID_GPU_FIELDS). Per candidate: its distance from the source image, its
+!>        radial nodes and weights and the harmonics in its direction, as
+!>        atom_grid_interpolation_harmonics gives them to the CPU path; per radial shell: the
+!>        candidates that use it, in list order. The table does not depend on the cutoff, which the
+!>        GPU applies at every call with the test of the CPU path, so it is kept until the list is
+!>        rebuilt (build_cross_candidates clears gpu_table_ready).
+!> \param candidates rows near the images of the source atom
+!> \param source_atom ...
+!> \param grid_atom grid of the source atom
+!> \param harmonics spherical harmonics of the source atom
+! **************************************************************************************************
+   SUBROUTINE gpu_cross_table_prepare(candidates, source_atom, grid_atom, harmonics)
+      TYPE(cross_candidate_list_type), INTENT(INOUT)     :: candidates
+      INTEGER, INTENT(IN)                                :: source_atom
+      TYPE(grid_atom_type), POINTER                      :: grid_atom
+      TYPE(harmonics_atom_type), POINTER                 :: harmonics
+
+      INTEGER                                            :: icand, ientry, igroup, inode, ir, &
+                                                            ncand, nentries, ngroups, nharm, nr
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cand_group, entry_cand, next_entry, &
+                                                            nnode, shell_first
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: node
+      LOGICAL                                            :: active
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: entry_weight, radius
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: harm, weight
+
+      IF (candidates%gpu_table_ready) RETURN
+      ncand = SIZE(candidates%row)
+      ngroups = SIZE(candidates%row_first) - 1
+      nharm = harmonics%max_s_harm
+      nr = grid_atom%nr
+      ALLOCATE (cand_group(ncand), nnode(ncand), node(4, ncand), radius(ncand), &
+                weight(4, ncand), harm(nharm, ncand))
+      DO igroup = 1, ngroups
+         cand_group(candidates%row_first(igroup):candidates%row_first(igroup + 1) - 1) = igroup
+      END DO
+!$OMP PARALLEL DO SCHEDULE(STATIC) DEFAULT(NONE) PRIVATE(active, icand) &
+!$OMP SHARED(candidates, grid_atom, harm, harmonics, ncand, nnode, node, radius, weight)
+      DO icand = 1, ncand
+         ! The expression of the cutoff test of add_cross_atom_fields.
+         radius(icand) = SQRT(SUM(candidates%displacement(:, icand)**2))
+         CALL atom_grid_interpolation_harmonics( &
+            grid_atom, harmonics, candidates%displacement(:, icand), HUGE(1.0_dp), &
+            node(:, icand), weight(:, icand), nradial=nnode(icand), &
+            angular_values=harm(:, icand), active=active)
+         IF (.NOT. active) THEN
+            nnode(icand) = 0
+            harm(:, icand) = 0.0_dp
+         END IF
+      END DO
+!$OMP END PARALLEL DO
+      ! Entries of every radial shell, in candidate order (a stable counting sort).
+      ALLOCATE (shell_first(nr + 1), next_entry(nr))
+      shell_first = 0
+      DO icand = 1, ncand
+         DO inode = 1, nnode(icand)
+            ir = node(inode, icand)
+            shell_first(ir + 1) = shell_first(ir + 1) + 1
+         END DO
+      END DO
+      shell_first(1) = 1
+      DO ir = 1, nr
+         shell_first(ir + 1) = shell_first(ir + 1) + shell_first(ir)
+      END DO
+      nentries = shell_first(nr + 1) - 1
+      ALLOCATE (entry_cand(nentries), entry_weight(nentries))
+      next_entry(:) = shell_first(1:nr)
+      DO icand = 1, ncand
+         DO inode = 1, nnode(icand)
+            ir = node(inode, icand)
+            ientry = next_entry(ir)
+            entry_cand(ientry) = icand
+            entry_weight(ientry) = weight(inode, icand)
+            next_entry(ir) = ientry + 1
+         END DO
+      END DO
+      CALL fields_gpu_set_cross(source_atom, nharm, nr, candidates%row_first, cand_group, nnode, &
+                                node, radius, weight, harm, shell_first, entry_cand, entry_weight)
+      candidates%gpu_table_ready = .TRUE.
+      DEALLOCATE (cand_group, nnode, node, radius, weight, harm, shell_first, next_entry, &
+                  entry_cand, entry_weight)
+   END SUBROUTINE gpu_cross_table_prepare
+
+! **************************************************************************************************
+!> \brief GPU counterpart of add_cross_atom_fields (NATIVE_GRID_GPU_FIELDS). The GPU sums the
+!>        interpolated fields of each row's candidates in list order; the row sums are added to the
+!>        composite fields with the rules of add_cross_atom_fields, which adds the single values.
+!> \param candidates rows near the images of the source atom
+!> \param source_atom ...
+!> \param cutoff current cross cutoff of the source atom (bohr)
+!> \param grid_atom grid of the source atom
+!> \param harmonics spherical harmonics of the source atom
+!> \param nspins number of spin channels
+!> \param lsd spin-polarized calculation
+!> \param use_density add the density
+!> \param use_gradient add the density gradient
+!> \param use_tau add the kinetic-energy density
+!> \param fields one-center fields of the source atom
+!> \param cross_density composite density, accumulated
+!> \param cross_grad composite density gradient, accumulated
+!> \param cross_kin composite kinetic-energy density, accumulated
+! **************************************************************************************************
+   SUBROUTINE gpu_cross_atom_fields(candidates, source_atom, cutoff, grid_atom, harmonics, &
+                                    nspins, lsd, use_density, use_gradient, use_tau, fields, &
+                                    cross_density, cross_grad, cross_kin)
+      TYPE(cross_candidate_list_type), INTENT(INOUT)     :: candidates
+      INTEGER, INTENT(IN)                                :: source_atom
+      REAL(dp), INTENT(IN)                               :: cutoff
+      TYPE(grid_atom_type), POINTER                      :: grid_atom
+      TYPE(harmonics_atom_type), POINTER                 :: harmonics
+      INTEGER, INTENT(IN)                                :: nspins
+      LOGICAL, INTENT(IN)                                :: lsd, use_density, use_gradient, use_tau
+      TYPE(one_center_fields_type), INTENT(IN)           :: fields
+      REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: cross_density
+      REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: cross_grad
+      REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: cross_kin
+
+      INTEGER                                            :: idir, igroup, ngroups, row
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: group_fields
+
+      CALL gpu_cross_table_prepare(candidates, source_atom, grid_atom, harmonics)
+      ngroups = SIZE(candidates%row_first) - 1
+      ALLOCATE (group_fields(5, nspins, ngroups))
+      CALL fields_gpu_cross_forward(source_atom, nspins, cutoff, fields%projection, group_fields)
+      DO igroup = 1, ngroups
+         row = candidates%row(candidates%row_first(igroup))
+         IF (lsd) THEN
+            IF (use_density) THEN
+               cross_density(row, 1:2) = cross_density(row, 1:2) + group_fields(1, 1:2, igroup)
+            END IF
+            IF (use_gradient) THEN
+               cross_grad(row, :, 1:2) = cross_grad(row, :, 1:2) + group_fields(2:4, 1:2, igroup)
+            END IF
+            IF (use_tau) THEN
+               cross_kin(row, 1:2) = cross_kin(row, 1:2) + group_fields(5, 1:2, igroup)
+            END IF
+         ELSE
+            IF (use_density) THEN
+               cross_density(row, :) = cross_density(row, :) + 0.5_dp*group_fields(1, 1, igroup)
+            END IF
+            IF (use_gradient) THEN
+               DO idir = 1, 3
+                  cross_grad(row, idir, :) = cross_grad(row, idir, :) + &
+                                             0.5_dp*group_fields(1 + idir, 1, igroup)
+               END DO
+            END IF
+            IF (use_tau) THEN
+               cross_kin(row, :) = cross_kin(row, :) + 0.5_dp*group_fields(5, 1, igroup)
+            END IF
+         END IF
+      END DO
+      DEALLOCATE (group_fields)
+   END SUBROUTINE gpu_cross_atom_fields
+
+! **************************************************************************************************
+!> \brief GPU counterpart of add_cross_atom_adjoint (NATIVE_GRID_GPU_FIELDS). The host forms the
+!>        model derivatives of every row with candidates; the GPU sums them into the adjoint
+!>        projections shell by shell, in candidate order; add_projected_potentials turns them into
+!>        grid potentials as on the CPU path.
+!> \param candidates rows near the images of the source atom
+!> \param source_atom ...
+!> \param cutoff current cross cutoff of the source atom (bohr)
+!> \param grid_atom grid of the source atom
+!> \param harmonics spherical harmonics of the source atom
+!> \param nspins number of spin channels
+!> \param lsd spin-polarized calculation
+!> \param use_density the composite density includes the cross-atom fields
+!> \param use_gradient the composite gradient includes the cross-atom fields
+!> \param use_tau the composite kinetic-energy density includes the cross-atom fields
+!> \param density_grad model derivative with respect to the composite density
+!> \param grad_grad model derivative with respect to the composite gradient
+!> \param kin_grad model derivative with respect to the composite kinetic-energy density
+!> \param vxc_h hard density potential of the source atom, accumulated
+!> \param vxc_s soft density potential of the source atom, accumulated
+!> \param vxg_h hard gradient potential of the source atom, accumulated
+!> \param vxg_s soft gradient potential of the source atom, accumulated
+!> \param vtau_h hard kinetic-energy-density potential of the source atom, accumulated
+!> \param vtau_s soft kinetic-energy-density potential of the source atom, accumulated
+! **************************************************************************************************
+   SUBROUTINE gpu_cross_atom_adjoint(candidates, source_atom, cutoff, grid_atom, harmonics, &
+                                     nspins, lsd, use_density, use_gradient, use_tau, &
+                                     density_grad, grad_grad, kin_grad, vxc_h, vxc_s, vxg_h, &
+                                     vxg_s, vtau_h, vtau_s)
+      TYPE(cross_candidate_list_type), INTENT(INOUT)     :: candidates
+      INTEGER, INTENT(IN)                                :: source_atom
+      REAL(dp), INTENT(IN)                               :: cutoff
+      TYPE(grid_atom_type), POINTER                      :: grid_atom
+      TYPE(harmonics_atom_type), POINTER                 :: harmonics
+      INTEGER, INTENT(IN)                                :: nspins
+      LOGICAL, INTENT(IN)                                :: lsd, use_density, use_gradient, use_tau
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: density_grad
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: grad_grad
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: kin_grad
+      REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: vxc_h, vxc_s
+      REAL(dp), DIMENSION(:, :, :, :), INTENT(INOUT)     :: vxg_h, vxg_s
+      REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: vtau_h, vtau_s
+
+      INTEGER                                            :: igroup, ispin, ngroups
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: group_adjoint
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :, :)       :: adjoint
+      REAL(dp), DIMENSION(2)                             :: density_adjoint, kin_adjoint
+      REAL(dp), DIMENSION(3, 2)                          :: gradient_adjoint
+
+      CALL gpu_cross_table_prepare(candidates, source_atom, grid_atom, harmonics)
+      ngroups = SIZE(candidates%row_first) - 1
+      ALLOCATE (group_adjoint(5, nspins, ngroups), &
+                adjoint(harmonics%max_s_harm, grid_atom%nr, 5, nspins))
+      DO igroup = 1, ngroups
+         CALL composite_row_cross_adjoint(candidates%row(candidates%row_first(igroup)), lsd, &
+                                          use_density, use_gradient, use_tau, density_grad, &
+                                          grad_grad, kin_grad, density_adjoint, &
+                                          gradient_adjoint, kin_adjoint)
+         DO ispin = 1, nspins
+            group_adjoint(1, ispin, igroup) = density_adjoint(ispin)
+            group_adjoint(2:4, ispin, igroup) = gradient_adjoint(:, ispin)
+            group_adjoint(5, ispin, igroup) = kin_adjoint(ispin)
+         END DO
+      END DO
+      CALL fields_gpu_cross_adjoint(source_atom, nspins, cutoff, group_adjoint, adjoint)
+      CALL add_projected_potentials(grid_atom, harmonics, nspins, adjoint, vxc_h, vxc_s, &
+                                    vxg_h, vxg_s, vtau_h, vtau_s)
+      DEALLOCATE (group_adjoint, adjoint)
+   END SUBROUTINE gpu_cross_atom_adjoint
+
+! **************************************************************************************************
 !> \brief Explicit forces and image strain of the cross-atom fields of one source atom: the
 !>        derivative of the energy through the interpolation point relative to each image.
 !> \param candidates rows near the images of the source atom
@@ -4953,6 +5209,8 @@ CONTAINS
 !> \brief Hard and soft one-center fields of every atom whose kind contributes them, with the
 !>        support radius of their difference. All ranks hold the fields of all atoms: the
 !>        cross-atom interpolation reads the fields of every source atom at the local rows.
+!> \param gpu_one_centre kinetic-energy densities on the GPU (NATIVE_GRID_GPU_ONE_CENTRE)
+!> \param gpu_fields angular assembly on the GPU (NATIVE_GRID_GPU_FIELDS)
 !> \param fields one entry per atom; entries of other kinds stay empty
 !> \param kind_set ...
 !> \param atomic_kind_set ...
@@ -4961,9 +5219,10 @@ CONTAINS
 !> \param nspins number of spin channels
 !> \param gapw_representation Skala pseudopotential GAPW representation
 ! **************************************************************************************************
-   SUBROUTINE compute_one_center_fields(gpu_one_centre, fields, kind_set, atomic_kind_set, &
-                                        rho_atom_set, para_env, nspins, gapw_representation)
-      LOGICAL, INTENT(IN)                                :: gpu_one_centre
+   SUBROUTINE compute_one_center_fields(gpu_one_centre, gpu_fields, fields, kind_set, &
+                                        atomic_kind_set, rho_atom_set, para_env, nspins, &
+                                        gapw_representation)
+      LOGICAL, INTENT(IN)                                :: gpu_one_centre, gpu_fields
       TYPE(one_center_fields_type), DIMENSION(:), &
          INTENT(INOUT)                                   :: fields
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: kind_set
@@ -5038,11 +5297,17 @@ CONTAINS
                                   tau_basis_cache, nspins)
             END IF
             CALL timeset("skala_1c_fields_angular", handle)
-            DO ir = 1, nr
-               CALL calc_rho_angular(grid_atom, harmonics, nspins, .TRUE., ir, r_h, r_s, &
-                                     fields(iatom)%rho_h, fields(iatom)%rho_s, dr_h, dr_s, &
-                                     r_h_d, r_s_d, fields(iatom)%drho_h, fields(iatom)%drho_s)
-            END DO
+            IF (gpu_fields) THEN
+               CALL fields_gpu_angular(grid_atom, harmonics, nspins, ikind, r_h, r_s, dr_h, dr_s, &
+                                       r_h_d, r_s_d, fields(iatom)%rho_h, fields(iatom)%rho_s, &
+                                       fields(iatom)%drho_h, fields(iatom)%drho_s)
+            ELSE
+               DO ir = 1, nr
+                  CALL calc_rho_angular(grid_atom, harmonics, nspins, .TRUE., ir, r_h, r_s, &
+                                        fields(iatom)%rho_h, fields(iatom)%rho_s, dr_h, dr_s, &
+                                        r_h_d, r_s_d, fields(iatom)%drho_h, fields(iatom)%drho_s)
+               END DO
+            END IF
             CALL timestop(handle)
             CALL timeset("skala_1c_fields_support", handle)
             fields(iatom)%support_radius = gapw_atom_grid_support_radius( &
