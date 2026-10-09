@@ -341,7 +341,8 @@ CONTAINS
                                    virial, calculate_forces, use_virial, nder, &
                                    qs_kind_set, atomic_kind_set, particle_set, &
                                    sab_orb, sac_ppl, nimages, cell_to_index, my_basis_type, &
-                                   deltaR=deltaR, atcore=atcore)
+                                   deltaR=deltaR, atcore=atcore, &
+                                   threaded_ecp_integrals=dft_control%qs_control%threaded_ecp_integrals)
                IF (debfor) THEN
                   fodeb(1:3) = force(1)%gth_ppl(1:3, 1) - fodeb(1:3)
                   CALL para_env%sum(fodeb)

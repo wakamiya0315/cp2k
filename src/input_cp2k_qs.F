@@ -530,6 +530,16 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="THREADED_ECP_INTEGRALS", &
+                          description="Compute the semi-local ECP integrals of the analytic local "// &
+                          "pseudopotential part (libgrpp) on all OpenMP threads at once. By default "// &
+                          "these calls run one at a time. Every atom pair is still computed by one "// &
+                          "thread in the same order, so the results do not change.", &
+                          usage="THREADED_ECP_INTEGRALS T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="EMBED_RESTART_FILE_NAME", &
                           description="Root of the file name where to read the embedding "// &
                           "potential guess.", &

@@ -93,10 +93,15 @@ CONTAINS
 !> \param basis_type ...
 !> \param deltaR Weighting factors of the derivatives wrt. nuclear positions
 !> \param atcore ...
+!> \param threaded_ecp_integrals Call libgrpp's semi-local ECP integrals outside the critical
+!>        sections, so that the threads compute them at the same time (default: one at a time).
+!>        After its guarded initialisation libgrpp only reads its tables, and each atom pair is
+!>        still computed by one thread into its private hab, so the results are unchanged.
 ! **************************************************************************************************
    SUBROUTINE build_core_ppl(matrix_h, matrix_p, force, virial, calculate_forces, use_virial, nder, &
                              qs_kind_set, atomic_kind_set, particle_set, sab_orb, sac_ppl, &
-                             nimages, cell_to_index, basis_type, deltaR, atcore)
+                             nimages, cell_to_index, basis_type, deltaR, atcore, &
+                             threaded_ecp_integrals)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_h, matrix_p
       TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
@@ -116,6 +121,7 @@ CONTAINS
          OPTIONAL                                        :: deltaR
       REAL(KIND=dp), DIMENSION(:), INTENT(INOUT), &
          OPTIONAL                                        :: atcore
+      LOGICAL, INTENT(IN), OPTIONAL                      :: threaded_ecp_integrals
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_core_ppl'
       INTEGER, PARAMETER                                 :: nexp_max = 30
@@ -136,7 +142,7 @@ CONTAINS
       LOGICAL                                            :: do_dR, do_upf, doat, dokp, ecp_local, &
                                                             ecp_semi_local, found, have_upf, &
                                                             libgrpp_local, lpotextended, &
-                                                            only_gaussians
+                                                            only_gaussians, threaded_ecp
       REAL(KIND=dp)                                      :: alpha, atk0, atk1, dab, dac, dbc, f0, &
                                                             ppl_radius
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: upf_v, work
@@ -181,6 +187,8 @@ CONTAINS
 
       ! Use internal integral routine for local ECP terms or use libgrrp
       libgrpp_local = .FALSE.
+      threaded_ecp = .FALSE.
+      IF (PRESENT(threaded_ecp_integrals)) threaded_ecp = threaded_ecp_integrals
 
       IF (calculate_forces) THEN
          CALL timeset(routineN//"_forces", handle)
@@ -252,7 +260,7 @@ CONTAINS
 !$OMP          matrix_h, matrix_p, atomic_kind_set, qs_kind_set, particle_set, &
 !$OMP          sab_orb, sac_ppl, nthread, ncoset, nkind, cell_to_index, &
 !$OMP          ldsab,  maxnset, maxder, do_dR, deltaR, doat, libgrpp_local, &
-!$OMP          maxlgto, nder, maxco, dokp, locks, natom, have_upf) &
+!$OMP          maxlgto, nder, maxco, dokp, locks, natom, have_upf, threaded_ecp) &
 !$OMP PRIVATE (ikind, jkind, iatom, jatom, rab, basis_set_a, basis_set_b, &
 !$OMP          first_sgfa, la_max, la_min, npgfa, nsgfa, sphi_a, &
 !$OMP          zeta, first_sgfb, lb_max, lb_min, npgfb, nsetb, rpgfb, set_radius_b, sphi_b, &
@@ -546,7 +554,16 @@ CONTAINS
                               force_a, force_b, ppl_fwork)
                         END IF
 
-                        IF (ecp_semi_local) THEN
+                        IF (ecp_semi_local .AND. threaded_ecp) THEN
+                           CALL libgrpp_semilocal_forces_ref(la_max(iset), la_min(iset), npgfa(iset), &
+                                                             rpgfa(:, iset), zeta(:, iset), &
+                                                             lb_max(jset), lb_min(jset), npgfb(jset), &
+                                                             rpgfb(:, jset), zetb(:, jset), &
+                                                             slmax, npot, bpot, apot, nrpot, &
+                                                             ppl_radius, rab, dab, rac, dac, dbc, &
+                                                             hab(:, :, iset, jset), pab(:, :, iset, jset), &
+                                                             force_a, force_b)
+                        ELSE IF (ecp_semi_local) THEN
 
 !$OMP CRITICAL(type2)
                            CALL libgrpp_semilocal_forces_ref(la_max(iset), la_min(iset), npgfa(iset), &
@@ -649,7 +666,16 @@ CONTAINS
                               rab, dab, rac, dac, rbc, dbc, hab(:, :, iset, jset), ppl_work)
                         END IF
 
-                        IF (ecp_semi_local) THEN
+                        IF (ecp_semi_local .AND. threaded_ecp) THEN
+                           ! semi local ECP part, all threads at once
+                           CALL libgrpp_semilocal_integrals(la_max(iset), la_min(iset), npgfa(iset), &
+                                                            rpgfa(:, iset), zeta(:, iset), &
+                                                            lb_max(jset), lb_min(jset), npgfb(jset), &
+                                                            rpgfb(:, jset), zetb(:, jset), &
+                                                            slmax, npot, bpot, apot, nrpot, &
+                                                            ppl_radius, rab, dab, rac, dac, dbc, &
+                                                            hab(:, :, iset, jset))
+                        ELSE IF (ecp_semi_local) THEN
                            ! semi local ECP part
 !$OMP CRITICAL(type2)
                            CALL libgrpp_semilocal_integrals(la_max(iset), la_min(iset), npgfa(iset), &

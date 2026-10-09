@@ -1216,6 +1216,8 @@ CONTAINS
       !   Method for PPL calculation
       CALL section_vals_val_get(qs_section, "CORE_PPL", i_val=itmp)
       qs_control%do_ppl_method = itmp
+      CALL section_vals_val_get(qs_section, "THREADED_ECP_INTEGRALS", &
+                                l_val=qs_control%threaded_ecp_integrals)
 
       CALL section_vals_val_get(qs_section, "PW_GRID_LAYOUT", i_vals=tmplist)
       qs_control%pw_grid_opt%distribution_layout = tmplist

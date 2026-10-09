@@ -556,6 +556,8 @@ MODULE cp_control_types
       LOGICAL                              :: et_coupling_calc = .FALSE.
       LOGICAL                              :: s2_restraint = .FALSE.
       INTEGER                              :: do_ppl_method = 0
+      ! compute the libgrpp ECP integrals of build_core_ppl on all threads (&QS THREADED_ECP_INTEGRALS)
+      LOGICAL                              :: threaded_ecp_integrals = .FALSE.
       INTEGER                              :: wf_interpolation_method_nr = 0
       INTEGER                              :: wf_extrapolation_order = 0
       INTEGER                              :: periodicity = 0
