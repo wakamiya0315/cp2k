@@ -1187,6 +1187,8 @@ CONTAINS
          qs_control%gapw_control%lebedev_rotation = rotation
          qs_control%gapw_control%rotate_lebedev = .TRUE.
       END IF
+      CALL section_vals_val_get(qs_section, "GAPW_THREADED_RHO_ATOM", &
+                                l_val=qs_control%gapw_control%threaded_rho_atom)
       ! GAPW 1c basis
       CALL section_vals_val_get(qs_section, "GAPW_1C_BASIS", i_val=qs_control%gapw_control%basis_1c)
       IF (qs_control%gapw_control%basis_1c /= gapw_1c_orb) THEN

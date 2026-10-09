@@ -101,10 +101,13 @@ CONTAINS
 !> \param rho1_s_spin ...
 !> \param rho1_h_aspin ...
 !> \param rho1_s_aspin ...
+!> \param threaded share the radial densities of every atom and spin among the threads by
+!>        spherical-harmonic component (&QS GAPW_THREADED_RHO_ATOM). Each component receives its
+!>        terms in the serial order, so the results do not depend on the number of threads.
 ! **************************************************************************************************
    SUBROUTINE calculate_rho_atom(para_env, rho_atom_set, qs_kind, atom_list, &
                                  natom, nspins, tot_rho1_h, tot_rho1_s, &
-                                 rho1_h_spin, rho1_s_spin, rho1_h_aspin, rho1_s_aspin)
+                                 rho1_h_spin, rho1_s_spin, rho1_h_aspin, rho1_s_aspin, threaded)
 
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(rho_atom_type), DIMENSION(:), POINTER         :: rho_atom_set
@@ -114,6 +117,7 @@ CONTAINS
       REAL(dp), DIMENSION(:), INTENT(INOUT)              :: tot_rho1_h, tot_rho1_s
       REAL(dp), INTENT(INOUT)                            :: rho1_h_spin, rho1_s_spin, rho1_h_aspin, &
                                                             rho1_s_aspin
+      LOGICAL, INTENT(IN), OPTIONAL                      :: threaded
 
       CHARACTER(len=*), PARAMETER :: routineN = 'calculate_rho_atom'
 
@@ -126,6 +130,7 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: cg_list, dacg_list
       INTEGER, DIMENSION(2)                              :: bo
       INTEGER, DIMENSION(:), POINTER                     :: lmax, lmin, npgf, o2nindex
+      LOGICAL                                            :: use_threads
       LOGICAL, ALLOCATABLE, DIMENSION(:, :)              :: done_vgg
       REAL(dp)                                           :: c1, c2, cpc_h, cpc_s, rfun, rho_h, &
                                                             rho_s, root_zet12, zet12
@@ -140,6 +145,9 @@ CONTAINS
       TYPE(harmonics_atom_type), POINTER                 :: harmonics
 
       CALL timeset(routineN, handle)
+
+      use_threads = .FALSE.
+      IF (PRESENT(threaded)) use_threads = threaded
 
       !Note: tau is taken care of separately in qs_vxc_atom.F
 
@@ -300,6 +308,16 @@ CONTAINS
                      END DO
                   END IF ! lmax_expansion
 
+                  ! The radial arrays are filled column by column (iso). With use_threads the
+                  ! columns are shared among the threads; each column still receives its terms in
+                  ! this order, so the results do not depend on the number of threads. The two
+                  ! column loops write different arrays and need no barrier between them.
+!$OMP PARALLEL IF(use_threads) DEFAULT(NONE) &
+!$OMP SHARED(atom_list, bo, cg_list, cg_n_list, dacg_list, dacg_n_list, dgg, gg, gg_lm1, i1, i2, &
+!$OMP        indso, iso1_first, iso2_first, lmax_expansion, max_iso_not0, max_iso_not0_local, &
+!$OMP        my_CG, my_CG_dxyz, nr, nspins, rho_atom_set, vgg) &
+!$OMP PRIVATE(coeff_h, coeff_s, cpc_h, cpc_s, i, iat, iatom, icg, iso, iso1, iso1_coeff, iso2, &
+!$OMP         iso2_coeff, j, l, l_iso)
                   DO iat = bo(1), bo(2)
                      iatom = atom_list(iat)
 
@@ -307,6 +325,7 @@ CONTAINS
                         coeff_h => rho_atom_set(iatom)%cpc_h(i)%r_coef
                         coeff_s => rho_atom_set(iatom)%cpc_s(i)%r_coef
 
+!$OMP DO SCHEDULE(DYNAMIC)
                         DO iso = 1, max_iso_not0_local
                            l_iso = indso(1, iso)
                            DO icg = 1, cg_n_list(iso)
@@ -347,7 +366,9 @@ CONTAINS
                            END DO ! icg
 
                         END DO ! iso
+!$OMP END DO NOWAIT
 
+!$OMP DO SCHEDULE(DYNAMIC)
                         DO iso = 1, max_iso_not0 !damax_iso_not0_local
                            l_iso = indso(1, iso)
                            DO icg = 1, dacg_n_list(iso)
@@ -371,9 +392,11 @@ CONTAINS
                            END DO ! icg
 
                         END DO ! iso
+!$OMP END DO NOWAIT
 
                      END DO ! i
                   END DO ! iat
+!$OMP END PARALLEL
 
                END DO ! ipgf2
             END DO ! ipgf1

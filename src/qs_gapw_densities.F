@@ -154,7 +154,8 @@ CONTAINS
          IF (paw_atom) THEN
             CALL calculate_rho_atom(para_env, rho_atom_set, my_kind_set(ikind), &
                                     atom_list, natom, nspins, rho1_h_tot, rho1_s_tot, &
-                                    rho1_h_spin, rho1_s_spin, rho1_h_aspin, rho1_s_aspin)
+                                    rho1_h_spin, rho1_s_spin, rho1_h_aspin, rho1_s_aspin, &
+                                    threaded=gapw_control%threaded_rho_atom)
          END IF
 
          !Calculate rho0_h and rho0_s on the radial grids centered on the atomic position

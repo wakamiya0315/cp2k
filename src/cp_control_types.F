@@ -387,6 +387,8 @@ MODULE cp_control_types
       ! rotation u' = R u of the directions of all Lebedev grids (&QS LEBEDEV_GRID_ROTATION)
       LOGICAL                              :: rotate_lebedev = .FALSE.
       REAL(KIND=dp), DIMENSION(3, 3)       :: lebedev_rotation = 0.0_dp
+      ! share the one-centre radial densities among threads (&QS GAPW_THREADED_RHO_ATOM)
+      LOGICAL                              :: threaded_rho_atom = .FALSE.
    END TYPE gapw_control_type
 
 ! **************************************************************************************************

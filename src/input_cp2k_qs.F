@@ -401,6 +401,16 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="GAPW_THREADED_RHO_ATOM", &
+                          description="GAPW: share the one-centre radial densities of every atom "// &
+                          "among the OpenMP threads by spherical-harmonic component. Each "// &
+                          "component receives its terms in the serial order, so the results are "// &
+                          "identical for any number of threads.", &
+                          usage="GAPW_THREADED_RHO_ATOM T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="PW_GRID", &
                           description="What kind of PW_GRID should be employed", &
                           usage="PW_GRID NS-FULLSPACE", &
