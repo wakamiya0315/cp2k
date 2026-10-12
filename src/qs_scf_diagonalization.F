@@ -32,6 +32,7 @@ MODULE qs_scf_diagonalization
                            cp_cfm_to_fm, &
                            cp_cfm_type, &
                            cp_fm_to_cfm
+   USE cp2k_info, ONLY: compile_revision
    USE cp_control_types, ONLY: dft_control_type, &
                                hairy_probes_type
    USE cp_dbcsr_api, ONLY: &
@@ -79,6 +80,7 @@ MODULE qs_scf_diagonalization
                                  cp_print_key_unit_nr, &
                                  debug_print_level
    USE dft_plus_u, ONLY: lowdin_kp_apply
+   USE iso_fortran_env, ONLY: file_storage_size
    USE ieee_arithmetic, ONLY: ieee_is_finite
 #if defined(__HAS_IEEE_EXCEPTIONS)
    USE ieee_exceptions, ONLY: IEEE_ALL, &
@@ -3393,9 +3395,16 @@ CONTAINS
          POINTER                                         :: sab_nl
       TYPE(qs_rho_type), POINTER                         :: rho
 
+      CHARACTER(LEN=1024) :: raw_map_file
+      CHARACTER(LEN=64) :: raw_map_receipt
+      LOGICAL :: raw_map_capture
+      INTEGER :: raw_map_nmo
+      COMPLEX(dp), ALLOCATABLE :: raw_map_metric(:, :, :), raw_map_input(:, :, :, :), raw_map_output(:, :, :, :)
+
       store => scf_env%mixing_store
       IF (.NOT. ASSOCIATED(store)) RETURN
       IF (.NOT. store%dm_trial_diagnostics) RETURN
+      raw_map_capture = raw_map_controls(scf_env, raw_map_file, raw_map_receipt)
       CALL get_qs_env(qs_env, rho=rho, kpoints=kpoints, matrix_s_kp=matrix_s, &
                       do_kpoints=do_kpoints, para_env=para_env, nelectron_total=nelectron_total)
       IF (para_env%num_pe /= 1) CALL cp_abort(__LOCATION__, &
@@ -3489,6 +3498,12 @@ CONTAINS
       IF (do_kpoints) THEN
          CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, wkp=wkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
          ALLOCATE (raw_k(nao, nao, nspin, nkp), mixed_k(nao, nao, nspin, nkp))
+         ! One private metric copy, only for the selected diagnostic frame.
+         raw_map_capture = raw_map_capture .AND. nspin == 1 .AND. .NOT. full_step .AND. &
+                           ASSOCIATED(store%dm_pulay_res_last) .AND. &
+                           48_int_8*nao*nao*nkp + 65536_int_8 <= 8_int_8*1024*1024 .AND. &
+                           16_int_8*nao*nao <= 32768_int_8
+         IF (raw_map_capture) ALLOCATE (raw_map_metric(nao, nao, nkp))
          DO ik = 1, nkp
             kp => kpoints%kp_env(ik)%kpoint_env
             DO ispin = 1, nspin
@@ -3527,6 +3542,13 @@ CONTAINS
             store%dm_trial_k_reslast = z_zero
          END IF
          IF (have_bloch_candidate) THEN
+            IF (raw_map_capture) THEN
+               ! Retain both full complex matrices before the companion history is touched.
+               ALLOCATE (raw_map_input(nao, nao, nspin, nkp), raw_map_output(nao, nao, nspin, nkp))
+               raw_map_input = store%dm_trial_k_input
+               raw_map_output = raw_k
+               CALL get_mo_set(kpoints%kp_env(1)%kpoint_env%mos(1), nmo=raw_map_nmo)
+            END IF
             CALL trial_bloch_mix(store, raw_k, mixed_k, full_step)
             CALL trial_bloch_roundtrip(qs_env, scf_env, trial, mixed_k, roundtrip_error)
             IF (iw > 0) WRITE (iw, '(T2,A,ES22.12E3)') "SCF_TRIAL| full Bloch to real candidate max error ", roundtrip_error
@@ -3540,6 +3562,7 @@ CONTAINS
       DO ik = 1, nkp
          IF (do_kpoints) THEN
             CALL kp_build_cfm(matrix_s, 1, xkp(:, ik), splan, sk)
+            IF (raw_map_capture) raw_map_metric(:, :, ik) = sk%local_data(1:nao, 1:nao)
          ELSE
             CALL copy_dbcsr_to_fm(matrix_s(1, 1)%matrix, monitor_work)
             CALL cp_cfm_scale_and_add_fm(z_zero, sk, z_one, monitor_work)
@@ -3628,6 +3651,13 @@ CONTAINS
                              "Trial Bloch and real-space electron traces disagree")
          END IF
       END IF
+      IF (raw_map_capture .AND. have_bloch_candidate .AND. do_kpoints) THEN
+         CALL raw_map_write(scf_env, scf_control, pin, store%dm_pulay_res_last, matrix_s, &
+                            raw_map_input, raw_map_output, raw_map_metric, xkp, wkp, cell_to_index, &
+                            nelectron_total, raw_map_nmo, full_step, SQRT(rnorm2), raw_map_file, raw_map_receipt, iw)
+      END IF
+      IF (ALLOCATED(raw_map_metric)) DEALLOCATE (raw_map_metric)
+      IF (ALLOCATED(raw_map_input)) DEALLOCATE (raw_map_input, raw_map_output)
       rejected = store%dm_trial_reject .AND. bad
       IF (store%dm_trial_step_limit > 0.0_dp) THEN
          rejected = rejected .OR. .NOT. ieee_is_finite(snorm2) .OR. &
@@ -3727,6 +3757,210 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Load/save a matched full Bloch and real-space density with strict physical bindings.
 !> Default-off, one-rank stream format; paths/hashes and producer inputs are recorded externally.
+   ! Default-off controls belong to this private observer, not to the SCF method.
+   ! Requested outer passes are one-based; the live native outer counter starts at zero.
+   LOGICAL FUNCTION raw_map_controls(scf_env, filename, receipt) RESULT(selected)
+      TYPE(qs_scf_env_type), POINTER :: scf_env
+      CHARACTER(LEN=1024), INTENT(OUT) :: filename
+      CHARACTER(LEN=64), INTENT(OUT) :: receipt
+      CHARACTER(LEN=64) :: value
+      INTEGER :: length, status, step, outer_pass
+
+      selected = .FALSE.
+      filename = ""; receipt = ""
+      CALL get_environment_variable("CP2K_SKALA_RAW_MAP_FILE", filename, LENGTH=length, STATUS=status)
+      IF (status /= 0 .OR. length < 1 .OR. length > LEN(filename)) RETURN
+      CALL get_environment_variable("CP2K_SKALA_RAW_MAP_STEP", value, LENGTH=length, STATUS=status)
+      IF (status /= 0 .OR. length < 1 .OR. length > LEN(value)) RETURN
+      IF (VERIFY(TRIM(ADJUSTL(value)), "0123456789") /= 0) RETURN
+      READ (value, *, IOSTAT=status) step
+      IF (status /= 0) RETURN
+      IF (step < 1 .OR. step /= scf_env%iter_count) RETURN
+      outer_pass = 1
+      CALL get_environment_variable("CP2K_SKALA_RAW_MAP_OUTER", value, LENGTH=length, STATUS=status)
+      IF (status == 0) THEN
+         IF (length < 1 .OR. length > LEN(value)) RETURN
+         IF (VERIFY(TRIM(ADJUSTL(value)), "0123456789") /= 0) RETURN
+         READ (value, *, IOSTAT=status) outer_pass
+         IF (status /= 0) RETURN
+      ELSE IF (status /= 1) THEN
+         RETURN
+      END IF
+      IF (outer_pass < 1 .OR. outer_pass /= scf_env%outer_scf%iter_count + 1) RETURN
+      CALL get_environment_variable("CP2K_SKALA_RAW_MAP_RECEIPT_SHA256", receipt, LENGTH=length, STATUS=status)
+      IF (status /= 0 .OR. length /= 64) RETURN
+      IF (VERIFY(receipt, "0123456789abcdefABCDEF") /= 0) RETURN
+      selected = .TRUE.
+   END FUNCTION raw_map_controls
+
+   ! Serialize the live pair before candidate adoption; never evaluate or rebuild a map here.
+   ! Only the post-close status0 marker completes the dump; the body delimiter is not a commit.
+   ! I/O failures preserve a candidate file and explicit failure, without changing SCF state.
+   SUBROUTINE raw_map_write(scf_env, control, real_input, real_residual, overlap, input, output, &
+                            metric, xkp, weights, mapping, electrons, nmo, full_step, residual_norm, filename, receipt, iw)
+      TYPE(qs_scf_env_type), POINTER :: scf_env
+      TYPE(scf_control_type), POINTER :: control
+      TYPE(dbcsr_p_type), POINTER :: real_input(:, :), real_residual(:, :), overlap(:, :)
+      COMPLEX(dp), INTENT(IN) :: input(:, :, :, :), output(:, :, :, :), metric(:, :, :)
+      REAL(dp), INTENT(IN) :: xkp(:, :), weights(:), residual_norm
+      INTEGER, POINTER :: mapping(:, :, :)
+      INTEGER, INTENT(IN) :: electrons, nmo, iw
+      LOGICAL, INTENT(IN) :: full_step
+      CHARACTER(LEN=*), INTENT(IN) :: filename, receipt
+      CHARACTER(LEN=32), PARAMETER :: magic = "CP2K_RAW_MAP_PAIR_V1", body_end = "CP2K_RAW_MAP_PAIR_BODY_END"
+      CHARACTER(LEN=64) :: source_revision
+      INTEGER :: header(17), lower(3), upper(3), unit, ios, close_status, nao, nkp, nimg, ik
+      INTEGER(int_8) :: bytes, actual, piece
+      REAL(dp) :: scalars(4)
+      TYPE(cp_logger_type), POINTER :: logger
+
+      IF (file_storage_size /= 8 .OR. STORAGE_SIZE(0) /= 32 .OR. STORAGE_SIZE(0.0_dp) /= 64) RETURN
+      IF (STORAGE_SIZE(CMPLX(0.0_dp, 0.0_dp, dp)) /= 128) RETURN
+      nao = SIZE(input, 1); nkp = SIZE(input, 4); nimg = SIZE(real_input, 2)
+      logger => cp_get_default_logger()
+      header = [1, 16909060, nao, nkp, 1, nimg, electrons, scf_env%outer_scf%iter_count, &
+                scf_env%outer_scf%iter_count + 1, scf_env%iter_count, &
+                logger%iter_info%iteration(logger%iter_info%n_rlevel), 4, 8, 16, 3, nmo, MERGE(1, 0, full_step)]
+      source_revision = compile_revision
+      lower = LBOUND(mapping); upper = UBOUND(mapping)
+      scalars = [scf_env%iter_delta, residual_norm, control%eps_scf, control%eps_eigval]
+      bytes = 0
+      INQUIRE (IOLENGTH=bytes) magic, header, source_revision, receipt, bytes, lower, upper, &
+         mapping, xkp, weights, scalars, input, output, metric, body_end, bytes
+      piece = raw_map_sparse_bytes(real_input); bytes = bytes + piece
+      piece = raw_map_sparse_bytes(real_residual); bytes = bytes + piece
+      piece = raw_map_sparse_bytes(overlap); bytes = bytes + piece
+      IF (bytes <= 0 .OR. bytes > 64_int_8*1024*1024) THEN
+         IF (iw > 0) WRITE (iw, '(A)') "RAW_MAP| unavailable: payload exceeds64MiB"
+         RETURN
+      END IF
+      OPEN (NEWUNIT=unit, FILE=filename, ACCESS="STREAM", FORM="UNFORMATTED", STATUS="NEW", &
+            ACTION="WRITE", IOSTAT=ios)
+      IF (ios /= 0) THEN
+         IF (iw > 0) WRITE (iw, '(A)') "RAW_MAP| unavailable: exclusive stream open failed"
+         RETURN
+      END IF
+      INQUIRE (IOLENGTH=piece) magic, header, source_revision, receipt, bytes, lower, upper, &
+         mapping, xkp, weights, scalars
+      ios = raw_map_room(unit, piece)
+      IF (ios == 0) WRITE (unit, IOSTAT=ios) magic, header, source_revision, receipt, bytes, lower, upper, &
+         mapping, xkp, weights, scalars
+      ! Bound section/packing temporaries by writing one contiguous AO matrix at a time.
+      DO ik = 1, nkp
+         INQUIRE (IOLENGTH=piece) input(:, :, 1, ik)
+         IF (ios == 0) ios = raw_map_room(unit, piece)
+         IF (ios == 0) WRITE (unit, IOSTAT=ios) input(:, :, 1, ik)
+      END DO
+      DO ik = 1, nkp
+         IF (ios == 0) ios = raw_map_room(unit, piece)
+         IF (ios == 0) WRITE (unit, IOSTAT=ios) output(:, :, 1, ik)
+      END DO
+      DO ik = 1, nkp
+         IF (ios == 0) ios = raw_map_room(unit, piece)
+         IF (ios == 0) WRITE (unit, IOSTAT=ios) metric(:, :, ik)
+      END DO
+      IF (ios == 0) CALL raw_map_sparse_write(unit, real_input, 1, ios)
+      IF (ios == 0) CALL raw_map_sparse_write(unit, real_residual, 2, ios)
+      IF (ios == 0) CALL raw_map_sparse_write(unit, overlap, 3, ios)
+      IF (ios == 0) THEN
+         FLUSH (unit, IOSTAT=ios)
+      END IF
+      INQUIRE (IOLENGTH=piece) body_end, bytes
+      IF (ios == 0) ios = raw_map_room(unit, piece)
+      IF (ios == 0) WRITE (unit, IOSTAT=ios) body_end, bytes
+      IF (ios == 0) THEN
+         FLUSH (unit, IOSTAT=ios)
+      END IF
+      actual = -1_int_8
+      INQUIRE (UNIT=unit, SIZE=actual, IOSTAT=close_status)
+      IF (close_status /= 0) ios = close_status
+      IF (actual /= bytes) ios = -1
+      CLOSE (unit, IOSTAT=close_status)
+      IF (close_status /= 0) ios = close_status
+      IF (iw > 0) WRITE (iw, '(A,3I8,I20,I8)') "RAW_MAP| raw_outer,outer_pass,inner,bytes,status ", &
+         header(8:10), bytes, ios
+   END SUBROUTINE raw_map_write
+
+   INTEGER FUNCTION raw_map_room(unit, record_bytes) RESULT(status)
+      INTEGER, INTENT(IN) :: unit
+      INTEGER(int_8), INTENT(IN) :: record_bytes
+      INTEGER(int_8) :: position
+
+      status = 0
+      INQUIRE (UNIT=unit, POS=position, IOSTAT=status)
+      IF (status /= 0) RETURN
+      IF (record_bytes < 0 .OR. record_bytes > 64_int_8*1024*1024) THEN
+         status = -1
+      ELSE IF (position < 1 .OR. position - 1 > 64_int_8*1024*1024 - record_bytes) THEN
+         status = -1
+      END IF
+   END FUNCTION raw_map_room
+
+   FUNCTION raw_map_sparse_bytes(matrices) RESULT(bytes)
+      TYPE(dbcsr_p_type), POINTER :: matrices(:, :)
+      INTEGER(int_8) :: bytes, piece
+      INTEGER :: image, spin, row, col, row_offset, col_offset
+      INTEGER :: frame(5), block_header(6)
+      REAL(dp), POINTER :: block(:, :)
+      TYPE(dbcsr_iterator_type) :: iterator
+
+      bytes = 0
+      DO image = 1, SIZE(matrices, 2)
+         DO spin = 1, SIZE(matrices, 1)
+            INQUIRE (IOLENGTH=piece) frame
+            bytes = bytes + piece
+            CALL dbcsr_iterator_readonly_start(iterator, matrices(spin, image)%matrix)
+            DO WHILE (dbcsr_iterator_blocks_left(iterator))
+               CALL dbcsr_iterator_next_block(iterator, row, col, block, row_offset=row_offset, col_offset=col_offset)
+               INQUIRE (IOLENGTH=piece) block_header, block
+               bytes = bytes + piece
+            END DO
+            CALL dbcsr_iterator_stop(iterator)
+         END DO
+      END DO
+   END FUNCTION raw_map_sparse_bytes
+
+   SUBROUTINE raw_map_sparse_write(unit, matrices, id, ios)
+      TYPE(dbcsr_p_type), POINTER :: matrices(:, :)
+      INTEGER, INTENT(IN) :: unit, id
+      INTEGER, INTENT(OUT) :: ios
+      INTEGER :: image, spin, row, col, row_offset, col_offset, nblock
+      INTEGER(int_8) :: piece
+      REAL(dp), POINTER :: block(:, :)
+      TYPE(dbcsr_iterator_type) :: iterator
+
+      ios = 0
+      DO image = 1, SIZE(matrices, 2)
+         DO spin = 1, SIZE(matrices, 1)
+            nblock = 0
+            CALL dbcsr_iterator_readonly_start(iterator, matrices(spin, image)%matrix)
+            DO WHILE (dbcsr_iterator_blocks_left(iterator))
+               CALL dbcsr_iterator_next_block(iterator, row, col, block)
+               nblock = nblock + 1
+            END DO
+            CALL dbcsr_iterator_stop(iterator)
+            INQUIRE (IOLENGTH=piece) id, spin, image, nblock, nblock
+            ios = raw_map_room(unit, piece)
+            IF (ios == 0) WRITE (unit, IOSTAT=ios) &
+               id, spin, image, MERGE(1, 0, dbcsr_has_symmetry(matrices(spin, image)%matrix)), nblock
+            IF (ios /= 0) RETURN
+            CALL dbcsr_iterator_readonly_start(iterator, matrices(spin, image)%matrix)
+            DO WHILE (dbcsr_iterator_blocks_left(iterator))
+               CALL dbcsr_iterator_next_block(iterator, row, col, block, row_offset=row_offset, col_offset=col_offset)
+               INQUIRE (IOLENGTH=piece) row, col, row_offset, col_offset, nblock, nblock
+               ios = raw_map_room(unit, piece)
+               IF (ios == 0) WRITE (unit, IOSTAT=ios) row, col, row_offset, col_offset, SIZE(block, 1), SIZE(block, 2)
+               INQUIRE (IOLENGTH=piece) block
+               IF (ios == 0) ios = raw_map_room(unit, piece)
+               IF (ios == 0) WRITE (unit, IOSTAT=ios) block
+               IF (ios /= 0) EXIT
+            END DO
+            CALL dbcsr_iterator_stop(iterator)
+            IF (ios /= 0) RETURN
+         END DO
+      END DO
+   END SUBROUTINE raw_map_sparse_write
+
    SUBROUTINE qs_scf_full_bloch_initialize(qs_env, scf_env, changed)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
